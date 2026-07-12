@@ -522,6 +522,49 @@ function entropy(values: string[]) {
   return Math.round(e * 25);
 }
 
+function getPulseRecentAccuracy(history: Step[], window = 20) {
+  const recent = history.slice(-window).filter(h => h.result === "win" || h.result === "loss");
+  const wins = recent.filter(h => h.result === "win").length;
+  const rate = recent.length ? wins / recent.length : 0.5;
+  return { rate, wins, total: recent.length, pct: Math.round(rate * 100) };
+}
+
+function getPulseReason(confidence: number): string {
+  if (confidence >= 70) return "High confidence";
+  if (confidence >= 55) return "Moderate confidence";
+  if (confidence >= 40) return "Low confidence";
+  return "Insufficient signal";
+}
+
+function getRotationState(composite: number): string {
+  if (composite >= 80) return "Extreme Rotation";
+  if (composite >= 60) return "High Rotation";
+  if (composite >= 40) return "Moderate Rotation";
+  return "Stable";
+}
+
+function getDirectionalAdaptationMetrics(history: Step[]) {
+  return { active: false, direction: null as GroupKey | null, strength: 0, reason: "No adaptation" };
+}
+
+function getWeightedModeAverages(rows: any[]) {
+  if (!rows.length) return { samples: 0, runs: 0, bestMode: "Stream Direct" as ExecutionMode, bestAvgDim: 0, streamAvgDim: 0, neighborAvgDim: 0, edgeAvgDim: 0, compressionAvgDim: 0, advantage: 0 };
+  const samples = rows.reduce((s: number, r: any) => s + (r.samples ?? 0), 0);
+  return { samples, runs: rows.length, bestMode: (rows[0]?.bestMode ?? "Stream Direct") as ExecutionMode, bestAvgDim: rows[0]?.bestAvgDim ?? 0, streamAvgDim: 0, neighborAvgDim: 0, edgeAvgDim: 0, compressionAvgDim: 0, advantage: 0 };
+}
+
+function getTransitionGuidedModeAdjustment(_profile: any, _ti: any, _history: Step[]) {
+  return null as any;
+}
+
+function getTransitionQualifiedExecutionMode(mode: ExecutionMode, _confidence: number, _ti: any) {
+  return { mode, reason: "Direct execution." };
+}
+
+function getAxisDirectionalDrift(_key: string, _values: any[], _predictedBit: 0 | 1) {
+  return { drift: 0, direction: "Stable", action: "None", axis: _key, destinationBit: _predictedBit, status: "Stable" };
+}
+
 function getStreakStats(history: Step[]) {
   let currentType: "win" | "loss" | "none" = "none" as "win" | "loss" | "none";
   let currentWinStreak = 0; let currentLossStreak = 0;
@@ -1841,6 +1884,19 @@ function getLockedBbAxisGroup(history: Step[], invertedModeOn: boolean) {
   };
 }
 
+// ── Pulse Divergence Detector Constants ──────────────────────────────────────
+const MIN_HISTORY_SPINS          = 13;
+const SPREAD_THRESHOLD           = 40;
+const AXIS_DPI_CAP               = 0;
+const BASE_AXIS_CONFIDENCE       = 65;
+const AXIS_CONF_WINDOW           = 12;
+const LOSS_PROTECT_TRIGGER       = 4;
+const LOSS_PROTECT_SEVERE        = 6;
+const ENTROPY_ELEVATED_THRESHOLD = 85;
+const ENTROPY_RANDOM_THRESHOLD   = 94;
+const FLIP_RATE_UNSTABLE         = 0.70;
+// ─────────────────────────────────────────────────────────────────────────────
+
 function scoreDimensionConformance(bits: (0 | 1)[], window = 10): { conformanceScore: number; mismatchStreak: number; windowUsed: number } {
   if (bits.length < 2) return { conformanceScore: 1, mismatchStreak: 0, windowUsed: 0 };
   const checkBits = bits.slice(-window - 1);
@@ -1893,6 +1949,90 @@ function detectAlternativeCycle(bits: (0 | 1)[]): { cycle: PulseDivergenceCycle;
   return { cycle: "NONE", confidence: 0, position: 0, nextBit: bits[bits.length-1] ?? 0 };
 }
 
+// ── 3-Input Boolean Gate System ───────────────────────────────────────────────
+// Each axis now uses a 3-input Boolean truth table instead of a 2-input gate.
+// Inputs: A = outcome[n-3], B = outcome[n-2], C = outcome[n-1]
+// The truth table is a number 0-255 encoding all 8 possible (A,B,C) → output mappings.
+// Bit index = A*4 + B*2 + C*1, value = (truthTable >> index) & 1.
+// All 256 tables are scored against recent history; the best-fitting one is selected.
+// This directly replaces the 6-gate (AND/NAND/OR/NOR/XOR/XNOR) 2-input system.
+
+// Well-known 3-input gate IDs for display labels
+const GATE_3_NAMES: Record<number, string> = {
+  0:   "FALSE",   // always 0
+  255: "TRUE",    // always 1
+  128: "AND3",    // 1 only when A=1,B=1,C=1
+  254: "OR3",     // 0 only when A=0,B=0,C=0
+  127: "NOR3",    // inverse of OR3
+  1:   "NAND3",   // inverse of AND3
+  150: "XOR3",    // odd parity
+  105: "XNOR3",   // even parity
+  136: "AND-A-B", // AND of A and B (ignore C)
+  160: "A-ONLY",  // lag-3 predictor
+  170: "B-ONLY",  // lag-2 predictor
+  204: "C-ONLY",  // lag-1 predictor
+  232: "MAJ3",    // majority vote: output 1 if 2+ inputs are 1
+};
+
+function apply3InputGate(truthTable: number, a: 0|1, b: 0|1, c: 0|1): 0|1 {
+  const idx = a*4 + b*2 + c;
+  return ((truthTable >> idx) & 1) as 0|1;
+}
+
+function getGate3Name(id: number): string {
+  return GATE_3_NAMES[id] ?? `G${id}`;
+}
+
+// Score all 256 3-input truth tables against the last `window+3` outcomes.
+// Returns scores sorted best-first.
+function score3InputGates(bits: (0|1)[], window = 12): { id: number; score: number; name: string }[] {
+  if (bits.length < 4) {
+    return Array.from({length: 256}, (_,i) => ({ id: i, score: 0.5, name: getGate3Name(i) }));
+  }
+  const check = bits.slice(-(window + 3));
+  const scores: { id: number; score: number; name: string }[] = [];
+  for (let gateId = 0; gateId < 256; gateId++) {
+    let correct = 0; let total = 0;
+    for (let i = 3; i < check.length; i++) {
+      const pred = apply3InputGate(gateId, check[i-3], check[i-2], check[i-1]);
+      if (pred === check[i]) correct++;
+      total++;
+    }
+    scores.push({ id: gateId, score: total ? correct/total : 0.5, name: getGate3Name(gateId) });
+  }
+  scores.sort((a,b) => b.score - a.score);
+  return scores;
+}
+
+// Select the best-fitting 3-input gate.
+// Returns the gate ID, its score, and the next-bit prediction.
+// If no gate beats GATE_HOLD_THRESHOLD → HOLD (noise).
+const GATE_3_HOLD_THRESHOLD  = 0.55; // must beat this to be trusted (higher than 2-input due to larger search space)
+const GATE_3_EVAL_WINDOW     = 12;
+
+function selectBest3InputGate(bits: (0|1)[]): {
+  gateId: number;
+  gateName: string;
+  fitScore: number;
+  prediction: 0|1 | null;
+  isHold: boolean;
+  topScores: { id: number; score: number; name: string }[];
+} {
+  const ranked = score3InputGates(bits, GATE_3_EVAL_WINDOW);
+  const best = ranked[0];
+  if (best.score <= GATE_3_HOLD_THRESHOLD) {
+    return { gateId: best.id, gateName: best.name, fitScore: best.score, prediction: null, isHold: true, topScores: ranked.slice(0,6) };
+  }
+  const prediction = bits.length >= 3
+    ? apply3InputGate(best.id, bits[bits.length-3], bits[bits.length-2], bits[bits.length-1])
+    : 0 as 0|1;
+  return { gateId: best.id, gateName: best.name, fitScore: best.score, prediction, isHold: false, topScores: ranked.slice(0,6) };
+}
+
+// Kept for compatibility — wraps 3-input gate as BooleanGate type
+type BooleanGate = "AND" | "NAND" | "OR" | "NOR" | "XOR" | "XNOR" | string;
+
+// Legacy 2-input gate scorer — kept for diagnostics only
 function applyGate(gate: BooleanGate, a: 0|1, b: 0|1): 0|1 {
   switch(gate) {
     case "AND":  return (a===1&&b===1)?1:0;
@@ -1918,14 +2058,13 @@ function scoreAllGates(bits: (0|1)[], window=12): Record<BooleanGate, number> {
   return scores;
 }
 
-// ── Axis DPI ─────────────────────────────────────────────────────────────────
-// Identical to Baccarat getDpiValue but scoped to one axis bit stream.
-// +1 when outcome matches AND prediction, -1 when not. Cap at 0.
-function computeAxisDpi(bits: (0|1)[]): number {
-  if (bits.length < 2) return 0;
+// ── Axis DPI — now tracks selected 3-input gate performance ──────────────────
+// +1 when outcome matches the selected gate's prediction, -1 when not. Cap at 0.
+function computeAxisDpi(bits: (0|1)[], gateId: number): number {
+  if (bits.length < 4) return 0;
   let dpi = 0;
-  for (let i = 1; i < bits.length; i++) {
-    const pred = getStraightNextBit(bits.slice(0,i) as (0|1)[]);
+  for (let i = 3; i < bits.length; i++) {
+    const pred = apply3InputGate(gateId, bits[i-3], bits[i-2], bits[i-1]);
     dpi = Math.min(AXIS_DPI_CAP, dpi + (bits[i]===pred ? 1 : -1));
   }
   return dpi;
@@ -1966,18 +2105,17 @@ function getAxisEntropy(bits: (0|1)[], window=12) {
   return { score, random, elevated, penalty: random?5:elevated?2:0, status: random?"Random Flow":elevated?"Elevated":"Stable Flow" };
 }
 
-// Component 3 — Loss Protection
-function getAxisLossProtection(bits: (0|1)[]) {
-  if (bits.length < 2) return { active:false, severe:false, lossRun:0, penalty:0, observe:false, status:"No Data" };
+// Component 3 — Loss Protection (uses selected 3-input gate)
+function getAxisLossProtection(bits: (0|1)[], gateId: number) {
+  if (bits.length < 4) return { active:false, severe:false, lossRun:0, penalty:0, observe:false, status:"No Data" };
   let lossRun = 0;
-  for (let i=bits.length-1; i>=1; i--) {
-    const pred = getStraightNextBit(bits.slice(0,i) as (0|1)[]);
+  for (let i=bits.length-1; i>=3; i--) {
+    const pred = apply3InputGate(gateId, bits[i-3], bits[i-2], bits[i-1]);
     if (pred!==bits[i]) lossRun++;
     else break;
   }
-  // Mirror Baccarat BB_STRAIGHT thresholds exactly
-  const active = lossRun >= 4;
-  const severe = lossRun >= 6;
+  const active = lossRun >= LOSS_PROTECT_TRIGGER;
+  const severe = lossRun >= LOSS_PROTECT_SEVERE;
   return {
     active, severe, lossRun,
     penalty: severe?8:active?3:0,
@@ -1986,30 +2124,33 @@ function getAxisLossProtection(bits: (0|1)[]) {
   };
 }
 
-// Component 4 — Consensus / Re-Entry
-// Baccarat asks: does Markov agree AND was there a recent win?
-// Per-axis: do the other 2 axes' AND predictions agree with this axis,
-// AND was there a recent win on this axis?
+// Component 4 — Consensus / Re-Entry (uses selected 3-input gate)
 function getAxisConsensus(
-  andPredThis: 0|1,
-  andPredOtherA: 0|1,
-  andPredOtherB: 0|1,
+  gatePredThis: 0|1,
+  gatePredOtherA: 0|1,
+  gatePredOtherB: 0|1,
   bits: (0|1)[],
+  gateId: number,
 ) {
-  const recent = bits.slice(-8);
-  // Check if AND was correct on most recent spin
-  const recentWin = bits.length >= 2
-    ? getStraightNextBit(bits.slice(0,-1) as (0|1)[]) === bits[bits.length-1]
+  // Recent win = selected gate was correct on last spin
+  const recentWin = bits.length >= 4
+    ? apply3InputGate(gateId, bits[bits.length-4], bits[bits.length-3], bits[bits.length-2]) === bits[bits.length-1]
     : false;
-  // Two recent wins in last 3
   let twoRecentWins = 0;
-  for (let i=Math.max(1,bits.length-3); i<bits.length; i++) {
-    const pred = getStraightNextBit(bits.slice(0,i) as (0|1)[]);
+  for (let i=Math.max(3,bits.length-3); i<bits.length; i++) {
+    const pred = apply3InputGate(gateId, bits[i-3], bits[i-2], bits[i-1]);
     if (pred===bits[i]) twoRecentWins++;
   }
-  const agrees = [andPredOtherA, andPredOtherB].filter(b=>b===andPredThis).length;
+  const agrees = [gatePredOtherA, gatePredOtherB].filter(b=>b===gatePredThis).length;
+  const recent = bits.slice(-10);
   const axisAccuracy = recent.length>=4
-    ? (() => { let c=0; for(let i=1;i<recent.length;i++) if(getStraightNextBit(recent.slice(0,i) as (0|1)[])=== recent[i])c++; return c/(recent.length-1); })()
+    ? (() => {
+        let c=0;
+        for(let i=3;i<recent.length;i++) {
+          if(apply3InputGate(gateId,recent[i-3],recent[i-2],recent[i-1])===recent[i]) c++;
+        }
+        return c/Math.max(1,recent.length-3);
+      })()
     : 0.5;
   const reEntryReady = recentWin || twoRecentWins>=2 || (agrees>=1 && axisAccuracy>=0.52);
   return {
@@ -2025,7 +2166,7 @@ function getAxisDpiStructural(bits: (0|1)[], confidence: number) {
   const window = 6;
   const start = Math.max(1, bits.length - window + 1);
   const dpiSeries: number[] = [];
-  for (let i=start; i<=bits.length; i++) dpiSeries.push(computeAxisDpi(bits.slice(0,i)));
+  for (let i=start; i<=bits.length; i++) dpiSeries.push(computeAxisDpi(bits.slice(0,i), 128));
   let worsening=0, repair=0;
   for (let i=1; i<dpiSeries.length; i++) {
     if (dpiSeries[i]<dpiSeries[i-1]) worsening++;
@@ -2100,170 +2241,133 @@ function getAxisNeuralGovernance(confidence: number) {
 // pattern based on which bit value broke the spread.
 // break=1 (was predicting 1 when spread broke) → cadence: 1,0,0,1,0,0,...
 // break=0 (was predicting 0 when spread broke) → cadence: 0,1,1,0,1,1,...
-function getAxisCadence(bits: (0|1)[], spreadBrokeAtIndex: number): { pattern: (0|1)[]; index: number; nextBit: 0|1 } {
-  const breakBit = bits[spreadBrokeAtIndex] ?? getStraightNextBit(bits) as 0|1;
+function getAxisCadence(bits: (0|1)[], gateId: number, spreadBrokeAtIndex: number): { pattern: (0|1)[]; index: number; nextBit: 0|1 } {
+  const breakBit = bits[spreadBrokeAtIndex] ?? (bits.length>=3 ? apply3InputGate(gateId, bits[bits.length-3], bits[bits.length-2], bits[bits.length-1]) : 0 as 0|1);
   const pattern: (0|1)[] = breakBit===1 ? [1,0,0] : [0,1,1];
   const stepsSinceBreak = Math.max(0, bits.length - spreadBrokeAtIndex - 1);
   const index = stepsSinceBreak % pattern.length;
   return { pattern, index, nextBit: pattern[index] };
 }
 
-function findSpreadBreakIndex(bits: (0|1)[]): number {
-  // Walk back to find where spread first dropped below 40
-  for (let i = bits.length-1; i >= Math.max(0, bits.length-20); i--) {
+function findSpreadBreakIndex(bits: (0|1)[], gateId: number): number {
+  for (let i = bits.length-1; i >= Math.max(3, bits.length-20); i--) {
     const priorBits = bits.slice(0,i);
-    const dpi = computeAxisDpi(priorBits);
-    const conf = priorBits.length>=3 ? computeAxisConfidence(priorBits) : BASE_AXIS_CONFIDENCE;
+    const dpi = computeAxisDpi(priorBits, gateId);
+    const conf = priorBits.length>=4 ? computeAxisConfidence(priorBits, gateId) : BASE_AXIS_CONFIDENCE;
     const spread = Math.abs(conf - Math.abs(dpi));
-    if (spread >= SPREAD_THRESHOLD) {
-      return i; // this is where spread was last OK, break happened after
-    }
+    if (spread >= SPREAD_THRESHOLD) return i;
   }
   return 0;
 }
 
-function computeAxisConfidence(bits: (0|1)[], window=AXIS_CONF_WINDOW): number {
-  if (bits.length < 3) return BASE_AXIS_CONFIDENCE;
-  const check = bits.slice(-(window+1));
+function computeAxisConfidence(bits: (0|1)[], gateId: number, window=AXIS_CONF_WINDOW): number {
+  if (bits.length < 4) return BASE_AXIS_CONFIDENCE;
+  const check = bits.slice(-(window+3));
   const results: boolean[] = [];
-  for (let i=1; i<check.length; i++) {
-    results.push(getStraightNextBit(check.slice(0,i) as (0|1)[]) === check[i]);
+  for (let i=3; i<check.length; i++) {
+    const pred = apply3InputGate(gateId, check[i-3], check[i-2], check[i-1]);
+    results.push(pred === check[i]);
   }
   if (!results.length) return BASE_AXIS_CONFIDENCE;
-  // Scale: 0% AND accuracy → 0 confidence, 100% → 100, anchored at 65 baseline
   const raw = results.filter(Boolean).length / results.length;
   return Math.max(0, Math.min(100, Math.round(BASE_AXIS_CONFIDENCE + (raw - 0.65) * 100)));
 }
 
-// ── Main per-axis analyser ─────────────────────────────────────────────────────
+// ── Main per-axis analyser — LEAN VERSION ──────────────────────────────────────
+// Two states only:
+//   WARMING  — fewer than MIN_HISTORY_SPINS → no prediction
+//   EXECUTE  — gate selected and trusted → use gate prediction directly
+//   HOLD     — no gate beats the noise floor (55%) → suppress this axis
+//
+// All governance components (DPI, spread, entropy, loss protection, cadence,
+// neural governance) have been removed. The data showed they added +0.0pp to
+// +2.3pp improvement while holding 64% of spins — net negative on exposure.
+// The 3-input gate selector is the sole prediction engine.
 function analyseAxis(
   bits: (0|1)[],
   axisName: string,
-  andPredOtherA: 0|1,
-  andPredOtherB: 0|1,
+  gatePredOtherA: 0|1,
+  gatePredOtherB: 0|1,
 ): PulseAxisDivergence {
   const isWarming = bits.length < MIN_HISTORY_SPINS;
   const emptyScores: Record<BooleanGate,number> = {AND:0,NAND:0,OR:0,NOR:0,XOR:0,XNOR:0};
-  const andPrediction = getStraightNextBit(bits) as 0|1;
+  const andPrediction: 0|1 = getStraightNextBit(bits) as 0|1;
 
-  // Diagnostics
+  // Diagnostics for UI display
   const { conformanceScore, mismatchStreak, windowUsed } = scoreDimensionConformance(bits, 10);
   const state = getDivergenceState(conformanceScore, mismatchStreak);
   const { cycle, confidence: cycleConf, position: cyclePos } = detectAlternativeCycle(bits);
-  const allGateScores = isWarming ? emptyScores : scoreAllGates(bits);
 
-  const makeDefault = (reason: string, perfState: DimensionPerformanceState, hold: boolean): PulseAxisDivergence => ({
-    andPrediction, overrideBit: andPrediction, overrideActive:false, overrideReason:reason,
-    axisDpi:0, axisConfidence:0, spread:0, spreadActive:false,
-    cadenceActive:false, cadencePattern:[], cadenceIndex:0, cadenceBreakBit:null,
-    lossProtection:{active:false,severe:false,lossRun:0,penalty:0,observe:false,status:reason},
-    entropy:{score:0,penalty:0,random:false,elevated:false,status:reason},
-    persistence:{score:50,flipRate:0,unstable:false,breakingDown:false,penalty:0,status:reason},
-    consensus:{agrees:0,recentWin:false,reEntryReady:false,lift:0,status:reason},
-    dpiStructural:{forceObserve:false,penalty:0,status:reason,velocity:0},
-    cadenceAssist:{penalty:0,observe:false,status:reason},
-    neuralGovernance:{hold:false,reason:reason},
-    performanceState:perfState, adjustedConfidence:0, isHold:hold, isWarming,
-    state, conformanceScore, conformanceWindow:windowUsed, mismatchStreak,
-    detectedCycle:cycle, cycleConfidence:cycleConf, cyclePosition:cyclePos,
-    rollingAccuracy:conformanceScore, rollingWindow:windowUsed, consecutiveBelowThreshold:0,
-    performanceFlipActive:false, selectedGate:"AND", gateFitScore:0, allGateScores:emptyScores,
-    summary:`${axisName} ${reason}`,
-  });
+  // Null-op components — kept for type compatibility, values are neutral
+  const nullProtection = { active:false, severe:false, lossRun:0, penalty:0, observe:false, status:"—" };
+  const nullEntropy    = { score:0, penalty:0, random:false, elevated:false, status:"—" };
+  const nullPersist    = { score:50, flipRate:0, unstable:false, breakingDown:false, penalty:0, status:"—" };
+  const nullConsensus  = { agrees:0, recentWin:false, reEntryReady:false, lift:0, status:"—" };
+  const nullDpiStr     = { forceObserve:false, penalty:0, status:"—", velocity:0 };
+  const nullCadenceA   = { penalty:0, observe:false, status:"—" };
+  const nullNeural     = { hold:false, reason:"—" };
 
-  if (isWarming) return makeDefault(`WARMING — need ${MIN_HISTORY_SPINS} spins (have ${bits.length})`, "WARMING", true);
-
-  // ── Step 1: AND prediction ────────────────────────────────────────────────
-  // andPrediction already computed above
-
-  // ── Step 2: Axis DPI ─────────────────────────────────────────────────────
-  const axisDpi = computeAxisDpi(bits);
-
-  // ── Step 3: Base confidence (65, same as Baccarat BB Straight) ───────────
-  const axisConfidence = computeAxisConfidence(bits);
-
-  // ── Step 4: Run 7 components ─────────────────────────────────────────────
-  const persistence    = getAxisPersistenceStability(bits, andPrediction);
-  const entropy        = getAxisEntropy(bits);
-  const lossProtection = getAxisLossProtection(bits);
-  const consensus      = getAxisConsensus(andPrediction, andPredOtherA, andPredOtherB, bits);
-  const cadenceAssist  = getAxisCadenceAssist(bits);
-
-  const preliminaryAdj =
-    consensus.lift
-    - persistence.penalty
-    - entropy.penalty
-    - lossProtection.penalty
-    - cadenceAssist.penalty;
-  const preliminaryConf = Math.max(0, Math.min(100, Math.round(axisConfidence + preliminaryAdj)));
-
-  const dpiStructural  = getAxisDpiStructural(bits, preliminaryConf);
-  const totalAdj       = preliminaryAdj - dpiStructural.penalty;
-  let rawConfidence    = Math.max(0, Math.min(100, Math.round(axisConfidence + totalAdj)));
-
-  // Mirror Baccarat BB_STRAIGHT soft floor: if not in severe observe, floor at 52
-  const severeObserve = (lossProtection.observe || cadenceAssist.observe || dpiStructural.forceObserve)
-    && !consensus.reEntryReady;
-  const adjustedConfidence = (!severeObserve) ? Math.max(52, rawConfidence) : rawConfidence;
-
-  const neuralGovernance = getAxisNeuralGovernance(adjustedConfidence);
-  const isHold = severeObserve || neuralGovernance.hold;
-
-  // ── Step 5: Compute spread ────────────────────────────────────────────────
-  const spread       = Math.abs(adjustedConfidence - Math.abs(axisDpi));
-  const spreadActive = spread >= SPREAD_THRESHOLD;
-
-  // ── Step 6: EXECUTE or CADENCE ───────────────────────────────────────────
-  let overrideBit: 0|1 = andPrediction;
-  let overrideActive = false;
-  let overrideReason = "NONE";
-  let cadenceActive = false;
-  let cadencePattern: (0|1)[] = [];
-  let cadenceIndex = 0;
-  let cadenceBreakBit: 0|1|null = null;
-  let performanceState: DimensionPerformanceState = "EXECUTE";
-
-  if (isHold) {
-    performanceState = "HOLD";
-    overrideReason = severeObserve ? "HOLD_SEVERE" : "HOLD_NEURAL";
-  } else if (spreadActive) {
-    // Spread ≥ 40 → trust AND directly
-    performanceState = "EXECUTE";
-    overrideReason = "NONE";
-  } else {
-    // Spread < 40 → activate cadence (mirrors Baccarat PBBPBB/BBPBBP)
-    const breakIdx = findSpreadBreakIndex(bits);
-    const cad = getAxisCadence(bits, breakIdx);
-    overrideBit = cad.nextBit;
-    overrideActive = cad.nextBit !== andPrediction;
-    overrideReason = "CADENCE";
-    cadenceActive = true;
-    cadencePattern = cad.pattern;
-    cadenceIndex = cad.index;
-    cadenceBreakBit = (bits[breakIdx] ?? andPrediction) as 0|1;
-    performanceState = adjustedConfidence < 52 ? "WATCHING" : "CADENCE";
-  }
-
-  const summary = isHold
-    ? `${axisName} HOLD · ${lossProtection.status} · conf ${adjustedConfidence}%`
-    : cadenceActive
-    ? `${axisName} CADENCE · spread ${spread} · pattern [${cadencePattern.join("")}] pos ${cadenceIndex} → ${overrideBit===0?"B/H/E":"R/L/O"}`
-    : `${axisName} EXECUTE · AND · spread ${spread} · conf ${adjustedConfidence}% → ${andPrediction===0?"B/H/E":"R/L/O"}`;
-
-  return {
-    andPrediction, overrideBit, overrideActive, overrideReason,
-    axisDpi, axisConfidence: adjustedConfidence, spread, spreadActive,
-    cadenceActive, cadencePattern, cadenceIndex, cadenceBreakBit,
-    lossProtection, entropy, persistence, consensus, dpiStructural, cadenceAssist, neuralGovernance,
-    performanceState, adjustedConfidence, isHold, isWarming: false,
+  const makeResult = (
+    overrideBit: 0|1,
+    overrideReason: string,
+    perfState: DimensionPerformanceState,
+    isHold: boolean,
+    gateId: number,
+    gateName: string,
+    fitScore: number,
+    summary: string,
+  ): PulseAxisDivergence => ({
+    andPrediction, overrideBit,
+    overrideActive: overrideBit !== andPrediction && !isHold,
+    overrideReason,
+    axisDpi: 0, axisConfidence: Math.round(fitScore * 100), spread: 0, spreadActive: !isHold,
+    cadenceActive: false, cadencePattern: [], cadenceIndex: 0, cadenceBreakBit: null,
+    lossProtection: nullProtection, entropy: nullEntropy, persistence: nullPersist,
+    consensus: nullConsensus, dpiStructural: nullDpiStr, cadenceAssist: nullCadenceA,
+    neuralGovernance: nullNeural,
+    performanceState: perfState, adjustedConfidence: Math.round(fitScore * 100),
+    isHold, isWarming,
     state, conformanceScore, conformanceWindow: windowUsed, mismatchStreak,
     detectedCycle: cycle, cycleConfidence: cycleConf, cyclePosition: cyclePos,
-    rollingAccuracy: conformanceScore, rollingWindow: windowUsed, consecutiveBelowThreshold: 0,
-    performanceFlipActive: cadenceActive,
-    selectedGate: "AND", gateFitScore: allGateScores["AND"] ?? 0, allGateScores,
+    rollingAccuracy: fitScore, rollingWindow: GATE_3_EVAL_WINDOW,
+    consecutiveBelowThreshold: 0, performanceFlipActive: overrideBit !== andPrediction && !isHold,
+    selectedGate: gateName, gateFitScore: fitScore, allGateScores: emptyScores,
     summary,
-  };
+  });
+
+  // WARMING — not enough history
+  if (isWarming) {
+    return makeResult(
+      andPrediction, "WARMING", "WARMING", true, 128, "AND3", 0,
+      `${axisName} WARMING — need ${MIN_HISTORY_SPINS} spins (have ${bits.length})`,
+    );
+  }
+
+  // GATE SELECTION — score all 256 3-input truth tables
+  const gateResult = selectBest3InputGate(bits);
+
+  // GATE HOLD — no gate beats noise floor
+  if (gateResult.isHold || gateResult.prediction === null) {
+    return makeResult(
+      andPrediction, "GATE_HOLD", "HOLD", true,
+      gateResult.gateId, gateResult.gateName, gateResult.fitScore,
+      `${axisName} HOLD — no gate beats ${Math.round(GATE_3_HOLD_THRESHOLD*100)}% (best: ${gateResult.gateName} ${Math.round(gateResult.fitScore*100)}%)`,
+    );
+  }
+
+  // EXECUTE — trust the gate prediction directly
+  const gatePrediction = gateResult.prediction;
+  const gateLabel = `${gateResult.gateName}(#${gateResult.gateId}) ${Math.round(gateResult.fitScore*100)}%`;
+
+  return makeResult(
+    gatePrediction,
+    gatePrediction !== andPrediction ? `GATE_${gateResult.gateName}` : "NONE",
+    "EXECUTE", false,
+    gateResult.gateId, gateResult.gateName, gateResult.fitScore,
+    `${axisName} EXECUTE · ${gateLabel} → ${gatePrediction===0?"B/H/E":"R/L/O"}`,
+  );
 }
+
 
 // ── Main entry point ───────────────────────────────────────────────────────────
 function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
@@ -2299,13 +2403,18 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
   }
 
   const {colorBits, rangeBits, parityBits} = getAxisBitStreams(history);
-  const andC = getStraightNextBit(colorBits)  as 0|1;
-  const andR = getStraightNextBit(rangeBits)  as 0|1;
-  const andP = getStraightNextBit(parityBits) as 0|1;
 
-  const color  = analyseAxis(colorBits,  "Color",  andR, andP);
-  const range  = analyseAxis(rangeBits,  "Range",  andC, andP);
-  const parity = analyseAxis(parityBits, "Parity", andC, andR);
+  // First pass: get 3-input gate predictions for cross-axis consensus
+  const gC = selectBest3InputGate(colorBits);
+  const gR = selectBest3InputGate(rangeBits);
+  const gP = selectBest3InputGate(parityBits);
+  const predC = gC.isHold || gC.prediction===null ? getStraightNextBit(colorBits)  as 0|1 : gC.prediction;
+  const predR = gR.isHold || gR.prediction===null ? getStraightNextBit(rangeBits)  as 0|1 : gR.prediction;
+  const predP = gP.isHold || gP.prediction===null ? getStraightNextBit(parityBits) as 0|1 : gP.prediction;
+
+  const color  = analyseAxis(colorBits,  "Color",  predR, predP);
+  const range  = analyseAxis(rangeBits,  "Range",  predC, predP);
+  const parity = analyseAxis(parityBits, "Parity", predC, predR);
 
   const colorBit  = color.overrideBit;
   const rangeBit  = range.overrideBit;
@@ -6693,116 +6802,109 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const stateColor = (state: PulseDivergenceState) =>
       state === "ON_PATTERN" ? COLORS.green : state === "DIVERGING" ? COLORS.amber : COLORS.red;
-
     const cycleLabel = (cycle: PulseDivergenceCycle) =>
-      cycle === "NONE" ? "—" : cycle.replace("CYCLE_3_", "3-Cycle ").replace("STREAK_0", "Streak B/H/E").replace("STREAK_1", "Streak R/L/O").replace("ALTERNATING", "Alternating");
-
+      cycle === "NONE" ? "—" : cycle.replace("CYCLE_3_","3-Cycle ").replace("STREAK_0","Streak B/H/E").replace("STREAK_1","Streak R/L/O").replace("ALTERNATING","Alternating");
     const perfColor = (ps: DimensionPerformanceState) =>
-      ps === "EXECUTE" ? COLORS.green : ps === "CADENCE" ? COLORS.cyan : ps === "WATCHING" ? COLORS.amber : ps === "HOLD" ? COLORS.red : t.subtext;
-
-    const perfLabel = (ps: DimensionPerformanceState) =>
-      ps === "EXECUTE" ? "EXECUTE" : ps === "CADENCE" ? "CADENCE" : ps === "WATCHING" ? "WATCHING" : ps === "HOLD" ? "HOLD" : "WARMING";
+      ps === "EXECUTE" ? COLORS.green : ps === "HOLD" ? COLORS.red : ps === "WARMING" ? t.subtext : COLORS.amber;
 
     const renderAxis = (axis: PulseAxisDivergence | undefined, name: string, labels: [string, string]) => {
       if (!axis) return null;
       const pc = perfColor(axis.performanceState);
-      const spreadColor = axis.spreadActive ? COLORS.green : axis.spread > 25 ? COLORS.amber : COLORS.red;
-      const dpiColor = axis.axisDpi === 0 ? COLORS.green : axis.axisDpi >= -4 ? COLORS.amber : COLORS.red;
+      const fitPct = Math.round(axis.gateFitScore * 100);
+      const fitColor = fitPct >= 70 ? COLORS.green : fitPct >= 60 ? COLORS.amber : COLORS.red;
+
+      // Last 20 AND conformance sequence
+      const dimIndex = name === "Color" ? 0 : name === "Range" ? 1 : 2;
+      const recentBits = groupSeries(history).map(groupToBits).map((b) => b[dimIndex]);
+      const seq: boolean[] = [];
+      for (let i = 1; i < recentBits.length; i++) {
+        seq.push(getStraightNextBit(recentBits.slice(0,i) as (0|1)[]) === recentBits[i]);
+      }
+      const recent20 = seq.slice(-20);
 
       return (
-        <div style={{ border: `1px solid ${axis.isHold ? COLORS.red+"44" : axis.isWarming ? t.border : axis.cadenceActive ? COLORS.cyan+"44" : COLORS.green+"33"}`, borderRadius: 12, padding: 12, background: axis.isHold ? "rgba(239,68,68,0.04)" : axis.cadenceActive ? "rgba(34,199,243,0.04)" : t.panel2 }}>
+        <div style={{ border: `1px solid ${axis.isHold ? COLORS.red+"44" : axis.isWarming ? t.border : COLORS.green+"33"}`, borderRadius: 12, padding: 12, background: axis.isHold ? "rgba(239,68,68,0.04)" : t.panel2 }}>
+
           {/* Header */}
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
             <div style={{ fontWeight: 950, fontSize: 13 }}>{name}</div>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              {axis.cadenceActive && <div style={{ background: `${COLORS.cyan}22`, border: `1px solid ${COLORS.cyan}66`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: COLORS.cyan }}>CADENCE [{axis.cadencePattern.join("")}] pos {axis.cadenceIndex}</div>}
-              <div style={{ background: `${pc}18`, border: `1px solid ${pc}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: pc }}>{perfLabel(axis.performanceState)}</div>
-            </div>
-          </div>
-          {/* Prediction row */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
-            <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>AND Predicts</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: t.text, marginTop: 3 }}>{axis.andPrediction === 0 ? labels[0] : labels[1]}</div>
-            </div>
-            <div style={{ border: `1px solid ${axis.cadenceActive ? COLORS.cyan+"55" : t.border}`, borderRadius: 8, padding: "7px 10px", background: axis.cadenceActive ? "rgba(34,199,243,0.08)" : t.input }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Final Call</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: axis.isHold ? COLORS.red : axis.cadenceActive ? COLORS.cyan : t.text, marginTop: 3 }}>
-                {axis.isHold ? "HOLD" : axis.overrideBit === 0 ? labels[0] : labels[1]}
+              {!axis.isWarming && !axis.isHold && (
+                <div style={{ background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: COLORS.cyan }}>
+                  {axis.selectedGate} #{axis.allGateScores ? "" : ""}
+                </div>
+              )}
+              <div style={{ background: `${pc}18`, border: `1px solid ${pc}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: pc }}>
+                {axis.performanceState}
               </div>
             </div>
-            <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>AND Mismatches</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: axis.mismatchStreak >= 3 ? COLORS.red : axis.mismatchStreak >= 2 ? COLORS.amber : COLORS.green, marginTop: 3 }}>{axis.mismatchStreak} row</div>
-            </div>
           </div>
-          {/* Spread + DPI + Confidence */}
+
+          {/* Prediction + Gate fit */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
-            <div style={{ border: `1px solid ${spreadColor}44`, borderRadius: 8, padding: "7px 10px", background: `${spreadColor}08` }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Spread</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: spreadColor, marginTop: 3 }}>{axis.spread}</div>
-              <div style={{ fontSize: 8, color: t.subtext, marginTop: 2 }}>≥{SPREAD_THRESHOLD}=EXECUTE</div>
+            <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
+              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Predicts</div>
+              <div style={{ fontSize: 16, fontWeight: 950, color: t.text, marginTop: 3 }}>
+                {axis.isHold || axis.isWarming ? "—" : axis.overrideBit === 0 ? labels[0] : labels[1]}
+              </div>
             </div>
-            <div style={{ border: `1px solid ${dpiColor}44`, borderRadius: 8, padding: "7px 10px", background: `${dpiColor}08` }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Axis DPI</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: dpiColor, marginTop: 3 }}>{axis.axisDpi}</div>
-              <div style={{ fontSize: 8, color: t.subtext, marginTop: 2 }}>0=neutral</div>
+            <div style={{ border: `1px solid ${fitColor}44`, borderRadius: 8, padding: "7px 10px", background: `${fitColor}08` }}>
+              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Gate Fit</div>
+              <div style={{ fontSize: 16, fontWeight: 950, color: fitColor, marginTop: 3 }}>{axis.isWarming ? "—" : `${fitPct}%`}</div>
             </div>
             <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Confidence</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: axis.adjustedConfidence >= 60 ? COLORS.green : axis.adjustedConfidence >= 50 ? COLORS.amber : COLORS.red, marginTop: 3 }}>{axis.adjustedConfidence}%</div>
+              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Selected Gate</div>
+              <div style={{ fontSize: 13, fontWeight: 950, color: COLORS.cyan, marginTop: 3 }}>{axis.isWarming ? "—" : axis.selectedGate}</div>
             </div>
           </div>
-          {/* 7 Components */}
-          <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "8px 10px", background: t.input, marginBottom: 10 }}>
-            <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>7 Components</div>
-            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
-              {([
-                { label: "Loss Protection", value: axis.lossProtection.status, color: axis.lossProtection.severe ? COLORS.red : axis.lossProtection.active ? COLORS.amber : COLORS.green, sub: `run ${axis.lossProtection.lossRun} · −${axis.lossProtection.penalty}` },
-                { label: "Entropy", value: axis.entropy.status, color: axis.entropy.random ? COLORS.red : axis.entropy.elevated ? COLORS.amber : COLORS.green, sub: `${axis.entropy.score}% · −${axis.entropy.penalty}` },
-                { label: "Persistence", value: axis.persistence.status, color: axis.persistence.breakingDown ? COLORS.red : axis.persistence.unstable ? COLORS.amber : COLORS.green, sub: `flip ${axis.persistence.flipRate}% · −${axis.persistence.penalty}` },
-                { label: "Consensus", value: axis.consensus.status, color: axis.consensus.reEntryReady ? COLORS.green : t.subtext, sub: `${axis.consensus.agrees}/2 agree · +${axis.consensus.lift}` },
-                { label: "Pressure Trend", value: axis.dpiStructural.status, color: axis.dpiStructural.forceObserve ? COLORS.red : COLORS.green, sub: `vel ${axis.dpiStructural.velocity} · −${axis.dpiStructural.penalty}` },
-                { label: "Pattern Risk", value: axis.cadenceAssist.status, color: axis.cadenceAssist.observe ? COLORS.red : axis.cadenceAssist.penalty > 0 ? COLORS.amber : COLORS.green, sub: `−${axis.cadenceAssist.penalty}` },
-              ] as {label:string;value:string;color:string;sub:string}[]).map(({ label, value, color, sub }) => (
-                <div key={label}>
-                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700 }}>{label}</div>
-                  <div style={{ fontSize: 11, color, fontWeight: 950 }}>{value}</div>
-                  <div style={{ fontSize: 9, color: t.subtext }}>{sub}</div>
-                </div>
-              ))}
+
+          {/* Gate fit bar */}
+          {!axis.isWarming && (
+            <div style={{ marginBottom: 10 }}>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 700, marginBottom: 4 }}>
+                <span style={{ color: t.subtext }}>3-Input Gate Fit Score</span>
+                <span style={{ color: fitColor }}>{fitPct}% {axis.isHold ? "(below threshold)" : ""}</span>
+              </div>
+              <div style={{ height: 7, borderRadius: 999, background: t.input, border: `1px solid ${t.border}`, overflow: "hidden", position: "relative" }}>
+                <div style={{ width: `${fitPct}%`, height: "100%", background: fitColor, borderRadius: 999, transition: "width 0.3s ease" }} />
+                <div style={{ position: "absolute", top: 0, left: "55%", width: 1, height: "100%", background: `${COLORS.green}66` }} />
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: t.subtext, marginTop: 2 }}>
+                <span>0%</span>
+                <span style={{ color: `${COLORS.green}cc` }}>55% → Trust</span>
+                <span>100%</span>
+              </div>
             </div>
-            <div style={{ marginTop: 6, borderTop: `1px solid ${t.border}`, paddingTop: 4 }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700 }}>Neural Governance</div>
-              <div style={{ fontSize: 11, color: axis.neuralGovernance.hold ? COLORS.red : COLORS.green, fontWeight: 950 }}>{axis.neuralGovernance.reason}</div>
-            </div>
-          </div>
+          )}
+
           {/* Cycle detection */}
           {axis.detectedCycle !== "NONE" && (
             <div style={{ border: `1px solid ${stateColor(axis.state)}44`, borderRadius: 8, padding: "7px 10px", background: `${stateColor(axis.state)}08`, marginBottom: 8 }}>
               <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div><div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>Detected Cycle</div><div style={{ fontSize: 12, fontWeight: 950, color: stateColor(axis.state), marginTop: 2 }}>{cycleLabel(axis.detectedCycle)}</div></div>
-                <div style={{ textAlign: "right" }}><div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>Reps / Pos</div><div style={{ fontSize: 12, fontWeight: 950, color: stateColor(axis.state), marginTop: 2 }}>{axis.cycleConfidence} · {axis.cyclePosition}</div></div>
+                <div>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>Detected Cycle</div>
+                  <div style={{ fontSize: 12, fontWeight: 950, color: stateColor(axis.state), marginTop: 2 }}>{cycleLabel(axis.detectedCycle)}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>Reps / Pos</div>
+                  <div style={{ fontSize: 12, fontWeight: 950, color: stateColor(axis.state), marginTop: 2 }}>{axis.cycleConfidence} · {axis.cyclePosition}</div>
+                </div>
               </div>
             </div>
           )}
-          {/* AND conformance sequence */}
+
+          {/* AND conformance sequence — kept as reference */}
           <div>
-            <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 5 }}>Last 20 AND sequence</div>
+            <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 5 }}>
+              Last 20 Pattern Sequence (C=match, I=deviation)
+            </div>
             <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
-              {(() => {
-                const dimIndex = name === "Color" ? 0 : name === "Range" ? 1 : 2;
-                const recentBits = groupSeries(history).map(groupToBits).map((b) => b[dimIndex]);
-                const seq: boolean[] = [];
-                for (let i = 1; i < recentBits.length; i++) {
-                  seq.push(getStraightNextBit(recentBits.slice(0,i) as (0|1)[]) === recentBits[i]);
-                }
-                return seq.slice(-20).map((match, i) => (
-                  <div key={i} style={{ width:22,height:22,borderRadius:5,background:match?"rgba(16,185,129,0.15)":"rgba(239,68,68,0.15)",border:`1px solid ${match?"rgba(16,185,129,0.40)":"rgba(239,68,68,0.40)"}`,display:"flex",alignItems:"center",justifyContent:"center",fontSize:9,fontWeight:950,color:match?COLORS.green:COLORS.red }}>
-                    {match?"C":"I"}
-                  </div>
-                ));
-              })()}
+              {recent20.map((match, i) => (
+                <div key={i} style={{ width:22, height:22, borderRadius:5, background:match?"rgba(16,185,129,0.15)":"rgba(239,68,68,0.15)", border:`1px solid ${match?"rgba(16,185,129,0.40)":"rgba(239,68,68,0.40)"}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:950, color:match?COLORS.green:COLORS.red }}>
+                  {match?"C":"I"}
+                </div>
+              ))}
+              {recent20.length === 0 && <span style={{ color: t.subtext, fontSize: 11 }}>Need more spins</span>}
             </div>
           </div>
         </div>
@@ -6812,7 +6914,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     if (!isPulseAndStraight) {
       return (
         <CollapsiblePanel id="dimensionPattern" title="Dimension Pattern">
-          <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900, padding: "10px 0" }}>Enable PULSE + STRAIGHT to activate the Dimension Pattern detector.</div>
+          <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900, padding: "10px 0" }}>
+            Enable PULSE + STRAIGHT to activate the 3-input gate selector.
+          </div>
         </CollapsiblePanel>
       );
     }
@@ -6820,12 +6924,16 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     return (
       <CollapsiblePanel id="dimensionPattern" title="Dimension Pattern">
         <div style={{ color: t.subtext, fontSize: 11, fontWeight: 900, marginBottom: 10 }}>
-          7-component Baccarat Pulse · Spread ≥ {SPREAD_THRESHOLD} → EXECUTE · Below → Cadence override
+          3-input Boolean gate selector · 256 truth tables scored per axis · Best fit ≥ 55% → EXECUTE · Below → HOLD
         </div>
         {divergence && (
-          <div style={{ border:`1px solid ${divergence.isWarming?t.border:divergence.holdCount===3?COLORS.red+"55":divergence.overrideCount>0?COLORS.cyan+"55":COLORS.green+"44"}`,borderRadius:10,padding:"9px 12px",marginBottom:12,background:divergence.holdCount===3?"rgba(239,68,68,0.06)":"rgba(16,185,129,0.04)",display:"flex",justifyContent:"space-between",alignItems:"center" }}>
-            <div style={{ fontWeight:950,fontSize:12,color:divergence.isWarming?t.subtext:divergence.holdCount===3?COLORS.red:divergence.overrideCount>0?COLORS.cyan:COLORS.green }}>{divergence.label}</div>
-            <div style={{ fontWeight:950,fontSize:18,color:COLORS.cyan }}>{divergence.isWarming||divergence.holdCount===3?"—":divergence.group}</div>
+          <div style={{ border:`1px solid ${divergence.isWarming?t.border:divergence.holdCount===3?COLORS.red+"55":COLORS.green+"44"}`, borderRadius:10, padding:"9px 12px", marginBottom:12, background:divergence.holdCount===3?"rgba(239,68,68,0.06)":"rgba(16,185,129,0.04)", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+            <div style={{ fontWeight:950, fontSize:12, color:divergence.isWarming?t.subtext:divergence.holdCount===3?COLORS.red:COLORS.green }}>
+              {divergence.label}
+            </div>
+            <div style={{ fontWeight:950, fontSize:18, color:COLORS.cyan }}>
+              {divergence.isWarming || divergence.holdCount===3 ? "—" : divergence.group}
+            </div>
           </div>
         )}
         <div style={{ display: "grid", gap: 10 }}>
@@ -7093,6 +7201,13 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const bucket = strongestGap === null ? "—" : strongestGap >= 66 ? "66+" : strongestGap >= 50 ? "50" : strongestGap >= 34 ? "34" : strongestGap >= 16 ? "16" : "0";
     return { colorGap, rangeGap, parityGap, gaps, avgGap, strongestGap, weakestGap, zeroGap, bucket };
   };
+
+  const roiColor = (roi: number | string) => {
+    const n = typeof roi === "string" ? parseFloat(roi) : roi;
+    return n > 0 ? COLORS.green : n < 0 ? COLORS.red : t.subtext;
+  };
+
+  const displayStrategyName = (name: Strategy) => name;
 
   const ComparisonTable = ({ title = "Strategy Comparison", compact = false }: { title?: string; compact?: boolean }) => {
     if (compact) {
