@@ -93,6 +93,7 @@ type Step = {
   autoRunAudit?: any;
   pulseAudit?: PulseAudit;
   pulseDivergence?: PulseDivergenceResult;
+  pulseSelectedEngine?: string | null;
   // Engine config snapshot — captured at settle time so exports are accurate
   // even when viewed after the config has changed (e.g. post-autorun analysis).
   _pulseEnabled?: boolean;
@@ -2441,20 +2442,25 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
 
 
 function bbStraightForecast(history: Step[]) {
-  if (!history.length) {
-    return { group: "BHE" as GroupKey, numbers: GROUPS.BHE, confidence: 0, tier: "Active · Confirmed", reason: "Locked Straight initial base recommendation." };
+  if (history.length < MIN_HISTORY_SPINS) {
+    return { group: "BHE" as GroupKey, numbers: GROUPS.BHE, confidence: 0, tier: "Hold · No Bet", reason: `Straight warming — need ${MIN_HISTORY_SPINS} spins (have ${history.length})` };
   }
 
-  const locked = getLockedBbAxisGroup(history, false);
-  const group = locked.group;
+  // 3-input gate selector — scores all 256 truth tables per axis
+  const divergence = getPulseBBStraightDivergence(history);
+
+  if (divergence.isWarming || divergence.holdCount === 3) {
+    return { group: null as GroupKey | null, numbers: [] as SpinValue[], confidence: 0, tier: "Hold · No Bet", reason: divergence.label };
+  }
+
+  const group = divergence.group;
   return {
     group,
     numbers: group ? GROUPS[group] : [],
-    confidence: 0,
+    confidence: 65,
     tier: "Active · Confirmed",
-    axisDpi: locked.axisDpi,
-    axisModes: locked.axisModes,
-    reason: "Locked axis assembly recommendation."
+    reason: `3-input gate · ${divergence.label}`,
+    pulseDivergence: divergence,
   };
 }
 
@@ -3641,94 +3647,152 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   const random = randomForecast(history);
   const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
 
-  // ── PULSE + BB STRAIGHT: use the clean divergence detector path ──────────
-  // When Pulse is enabled and BB Straight is the sole active engine,
-  // bypass the existing Pulse spread/DPI/TI/entropy pipeline entirely.
-  // The divergence detector reads only AND-table conformance per dimension
-  // and overrides only dimensions that are confirmed off-pattern.
-  // All other Pulse components remain active for diagnostic reporting only.
-  if (pulseEnabled && bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled) {
-    const divergence = getPulseBBStraightDivergence(history);
+  // ── PULSE: Engine Performance Tracker ────────────────────────────────────
+  // When Pulse is ON, it runs all 4 engines silently every spin, tracks each
+  // engine's rolling win rate over the last 10 spins, and selects the best
+  // performing engine automatically.
+  //
+  // Rules:
+  //   - Warming: fewer than 10 spins → no prediction, no bet
+  //   - First selection (spin 10): pick engine with highest rolling win rate
+  //   - Subsequent spins: only switch if challenger leads by ≥15pp
+  //   - Straight uses 3-input gate selector (256 truth tables per axis)
+  //   - Inverted, Markov, Random use their existing prediction engines
+  if (pulseEnabled) {
+    const PULSE_WARMING     = 10;
+    const PULSE_SWITCH_GAP  = 15; // pp gap required to trigger a switch
+    const PULSE_WINDOW      = 10; // rolling window for win rate
 
-    // WARMING or all-HOLD: suppress prediction — not enough data yet
-    if (divergence.isWarming || divergence.holdCount === 3) {
+    // Not enough history yet — hold
+    if (history.length < PULSE_WARMING) {
       return {
-        ...(straight as any),
-        group: null,
-        numbers: [],
+        group: null as GroupKey | null,
+        numbers: [] as SpinValue[],
         confidence: 0,
-        tier: "Hold · No Bet",
-        reason: divergence.label,
+        tier: "Hold · No Bet" as const,
+        reason: `Pulse warming — need ${PULSE_WARMING} spins (have ${history.length})`,
         source: "PULSE" as const,
         mode,
-        pulseDivergence: divergence,
+        pulseEngineTracker: {
+          selectedEngine: null as string | null,
+          isWarming: true,
+          spinsRemaining: PULSE_WARMING - history.length,
+          engineRates: {} as Record<string, number>,
+        },
       };
     }
 
-    const group = divergence.group;
-    const overrideNote = divergence.label;
-    const dimSummaries = [divergence.color.summary, divergence.range.summary, divergence.parity.summary].join(" | ");
+    // Compute rolling win rate for each engine over last PULSE_WINDOW spins
+    const window = history.slice(-PULSE_WINDOW);
+    void window;
+
+    // Arrow function — avoids function declaration inside block (strict mode)
+    const computeEngineWinRate = (engineName: string): number => {
+      if (history.length < PULSE_WINDOW + 1) return 0;
+      const evalHistory = history.slice(-(PULSE_WINDOW + 1));
+      let wins = 0;
+      for (let i = 1; i < evalHistory.length; i++) {
+        const priorHistory = history.slice(0, history.length - PULSE_WINDOW - 1 + i);
+        if (priorHistory.length < 2) continue;
+        let predicted: GroupKey | null = null;
+        if (engineName === "Straight") {
+          const d = getPulseBBStraightDivergence(priorHistory);
+          predicted = d.isWarming || d.holdCount === 3 ? null : d.group;
+        } else if (engineName === "Inverted") {
+          predicted = bbInvertedForecast(priorHistory).group ?? null;
+        } else if (engineName === "Markov") {
+          predicted = markovForecast(priorHistory).group ?? null;
+        } else if (engineName === "Random") {
+          predicted = randomForecast(priorHistory).group ?? null;
+        }
+        const actual = evalHistory[i].outcomeGroup;
+        if (predicted && actual && predicted === actual) wins++;
+      }
+      return Math.round(wins / Math.max(1, PULSE_WINDOW) * 100);
+    }
+
+    const engineRates: Record<string, number> = {
+      Straight: computeEngineWinRate("Straight"),
+      Inverted: computeEngineWinRate("Inverted"),
+      Markov:   computeEngineWinRate("Markov"),
+      Random:   computeEngineWinRate("Random"),
+    };
+
+    // Find the best engine
+    let bestEngine = "Straight";
+    let bestRate = engineRates["Straight"];
+    for (const [engine, rate] of Object.entries(engineRates)) {
+      if (rate > bestRate) { bestRate = rate; bestEngine = engine; }
+    }
+
+    // Check if current selected engine (from last step) should switch
+    const lastStep = history[history.length - 1];
+    const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
+
+    let selectedEngine = bestEngine;
+    if (currentEngine && currentEngine !== bestEngine) {
+      const currentRate = engineRates[currentEngine] ?? 0;
+      // Only switch if challenger leads by ≥ PULSE_SWITCH_GAP
+      if (bestRate - currentRate < PULSE_SWITCH_GAP) {
+        selectedEngine = currentEngine; // stay with current
+      }
+    }
+
+    // Get prediction from selected engine
+    let engineForecast: any;
+    if (selectedEngine === "Straight") {
+      const divergence = getPulseBBStraightDivergence(history);
+      if (divergence.isWarming || divergence.holdCount === 3) {
+        engineForecast = { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: divergence.label };
+      } else {
+        engineForecast = {
+          ...straight,
+          group: divergence.group,
+          numbers: divergence.group ? GROUPS[divergence.group] : [],
+          confidence: 65,
+          tier: "Active · Confirmed",
+          reason: divergence.label,
+          pulseDivergence: divergence,
+        };
+      }
+    } else if (selectedEngine === "Inverted") {
+      engineForecast = { ...inverted, tier: "Active · Confirmed" };
+    } else if (selectedEngine === "Markov") {
+      engineForecast = { ...markov, tier: "Active · Confirmed" };
+    } else {
+      engineForecast = { ...random, tier: "Active · Confirmed" };
+    }
+
+    const tracker = {
+      selectedEngine,
+      isWarming: false,
+      spinsRemaining: 0,
+      engineRates,
+      switched: currentEngine !== null && currentEngine !== selectedEngine,
+      previousEngine: currentEngine,
+    };
+
     return {
-      ...(straight as any),
-      group,
-      numbers: group ? GROUPS[group] : [],
-      confidence: divergence.overrideCount > 0 ? 72 : 65,
-      tier: divergence.holdCount > 0 ? "Active · Confirmed" : divergence.overrideCount > 0 ? "Active · Confirmed" : "BB Straight",
-      reason: `${overrideNote} · ${dimSummaries}`,
+      ...engineForecast,
       source: "PULSE" as const,
       mode,
-      pulseDivergence: divergence,
+      pulseEngineTracker: tracker,
+      reason: `Pulse · ${selectedEngine} selected (${engineRates[selectedEngine]}% / ${PULSE_WINDOW} spins) · ${Object.entries(engineRates).map(([e,r]) => `${e}:${r}%`).join(" · ")}`,
     };
   }
 
-  // DPI DIMENSION LOCK CORE (existing path — all other engine combinations)
-  // Straight, Inverted, or Markov remains the primary engine.
-  // PULSE final prediction is assembled from the selected engine's primary bits,
-  // then DPI is applied independently to Color / Range / Parity before final group assembly.
-  // If any dimension DPI is at/below -5, that dimension locks to the mode-specific DPI target.
-  // PULSE + Inverted uses mirrored targets: Black / High / Even.
-  if (pulseEnabled) {
-    const scope = getPulseEngineScope(bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
-    const scopedPulse = applyPulseShellGovernance(history, getPulseForecastFromEngineScope(history, scope));
-    const dpiLockedPulse = forceDpiDimensionLockOnDecision(history, scope, scopedPulse);
-    const transitionAwarePulse = applyTransitionIntelligenceToDecision(history, dpiLockedPulse);
-    return {
-      ...transitionAwarePulse,
-      source: "PULSE" as const,
-      mode,
-    };
-  }
-
+  // ── Manual engine selection (Pulse OFF) ───────────────────────────────────
   if (randomEnabled && random.group) {
-    return {
-      ...random,
-      source: "RANDOM" as const,
-      mode,
-    };
+    return { ...random, source: "RANDOM" as const, mode };
   }
-
   if (markovEnabled && markov.group) {
-    return {
-      ...markov,
-      source: "MARKOV" as const,
-      mode,
-    };
+    return { ...markov, source: "MARKOV" as const, mode };
   }
-
   if (bbInvertedEnabled && inverted.group) {
-    return {
-      ...inverted,
-      source: "BB_INVERTED" as const,
-      mode,
-    };
+    return { ...inverted, source: "BB_INVERTED" as const, mode };
   }
-
   if (bbStraightEnabled && straight.group) {
-    return {
-      ...straight,
-      source: "BB_STRAIGHT" as const,
-      mode,
-    };
+    return { ...straight, source: "BB_STRAIGHT" as const, mode };
   }
 
   return {
@@ -5062,8 +5126,8 @@ const active = !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine
     pulseDiagnostics: (f as any).pulseDiagnostics ?? null,
     pulseAudit: buildPulseAuditRecord(f, lockedOutcomeGroup, lockedForecastGroup, result, active),
     pulseDivergence: (f as any).pulseDivergence ?? null,
-    // Snapshot of engine config at time of spin — critical for accurate CSV exports
-    // when session is reviewed after config changes (e.g. post-autorun analysis).
+    pulseSelectedEngine: (f as any).pulseEngineTracker?.selectedEngine ?? null,
+    // Snapshot of engine config at time of spin
     _pulseEnabled: pulseEnabled,
     _bbStraightEnabled: bbStraightEnabled,
     _bbInvertedEnabled: bbInvertedEnabled,
@@ -6707,74 +6771,86 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const pulseStatus = pulseEnabled ? "ENABLED" : "DISABLED";
     const dimensionTDA = (f as any).dimensionTDA;
     const rawDimensionTDABlocked = f.source === "PULSE" && dimensionTDA?.passed === false;
-    // Observe setting controls whether Directional Observe / TDA Hold is shown and held in Signal State.
-    // OFF = do not display OBSERVE as the final prediction; show the live group and allow execution.
     const observeDisplayEnabled = executeObservation === true;
     const dimensionTDABlocked = observeDisplayEnabled && rawDimensionTDABlocked;
     const isObservationForecast = observeDisplayEnabled && (f.tier === "Hold · No Bet" || rawDimensionTDABlocked);
     const displayPrediction = isObservationForecast ? "OBSERVE" : (f.group ?? "WAITING");
-    const executionLabel = !pulseEnabled
-      ? "PULSE OFF"
-      : isObservationForecast
-      ? "NO BET"
-      : f.group
-      ? effectiveExecutionMode
-      : "WAITING";
-    const executionColor = f.group && pulseEnabled && !isObservationForecast
-      ? (effectiveExecutionMode === "Dimension Compression" ? COLORS.amber : effectiveExecutionMode === "Neighbor Expansion" ? COLORS.cyan : effectiveExecutionMode === "Edge Expansion" ? COLORS.blue : COLORS.green)
-      : executionLabel === "NO BET"
-      ? COLORS.amber
-      : executionLabel === "PULSE OFF"
-      ? COLORS.red
-      : t.subtext;
-    const forecastTierLabel = f.tier;
-    const displayedTierLabel = dimensionTDABlocked ? "TDA HOLD" : f.tier;
-    const tierColor = displayedTierLabel === "Active · High Confidence"
-      ? COLORS.green
-      : displayedTierLabel === "Active · Confirmed"
-      ? COLORS.cyan
-      : displayedTierLabel === "Active · Caution"
-      ? COLORS.amber
-      : displayedTierLabel === "Hold · No Bet" || displayedTierLabel === "TDA HOLD"
-      ? COLORS.red
-      : t.text;
-    const forecastTierColor = f.tier === "Active · High Confidence"
-      ? COLORS.green
-      : f.tier === "Active · Confirmed"
-      ? COLORS.cyan
-      : f.tier === "Active · Caution"
-      ? COLORS.amber
-      : f.tier === "Hold · No Bet"
-      ? COLORS.red
-      : t.text;
+    const executionLabel = !pulseEnabled ? "PULSE OFF" : isObservationForecast ? "NO BET" : f.group ? effectiveExecutionMode : "WAITING";
+    const executionColor = f.group && pulseEnabled && !isObservationForecast ? COLORS.green : executionLabel === "NO BET" ? COLORS.amber : executionLabel === "PULSE OFF" ? COLORS.red : t.subtext;
+    const tierColor = f.tier === "Active · High Confidence" ? COLORS.green : f.tier === "Active · Confirmed" ? COLORS.cyan : f.tier === "Active · Caution" ? COLORS.amber : f.tier === "Hold · No Bet" ? COLORS.red : t.text;
     const coreDisplayNumbers = f.group ? (GROUPS[f.group] ?? f.numbers) : [] as SpinValue[];
     const finalDisplayNumbers = executionNumbers.length ? executionNumbers : f.numbers;
-    const addedDisplayNumbers = f.group && !isObservationForecast
-      ? finalDisplayNumbers.filter((value: SpinValue) => !coreDisplayNumbers.includes(value))
-      : [] as SpinValue[];
-    const statusReasonText = isObservationForecast
-      ? dimensionTDABlocked
-        ? "TDA Hold · No Bet"
-        : "No Bet"
-      : f.group
-      ? ""
-      : "Awaiting signal.";
+    const addedDisplayNumbers = f.group && !isObservationForecast ? finalDisplayNumbers.filter((value: SpinValue) => !coreDisplayNumbers.includes(value)) : [] as SpinValue[];
+    const statusReasonText = isObservationForecast ? "No Bet" : f.group ? "" : "Awaiting signal.";
     const numberDisplay = f.group && !isObservationForecast
       ? <div style={{ fontSize: 13, fontWeight: 900, marginTop: 10, lineHeight: 1.35 }}>
           <span style={{ color: COLORS.cyan }}>{coreDisplayNumbers.length ? coreDisplayNumbers.join(", ") : "—"}</span>
           {addedDisplayNumbers.length ? <span style={{ color: COLORS.amber }}> {addedDisplayNumbers.join(", ")}</span> : null}
         </div>
       : <div style={{ fontSize: 13, color: executionColor, fontWeight: 900, marginTop: 10 }}>{statusReasonText}</div>;
+
+    // Pulse engine tracker data
+    const tracker = (f as any).pulseEngineTracker;
+    const engineColors: Record<string, string> = { Straight: COLORS.blue, Inverted: COLORS.amber, Markov: COLORS.green, Random: COLORS.cyan };
+
     return <Panel title="Signal State" style={{ minHeight: 344 }}>
       <button onClick={applyPulseMode} style={{ width: "100%", height: 34, borderRadius: 10, border: `1px solid ${pulseEnabled ? COLORS.cyan : COLORS.red}`, background: pulseEnabled ? "rgba(34,199,243,0.16)" : "rgba(239,68,68,0.10)", color: pulseEnabled ? COLORS.cyan : COLORS.red, fontWeight: 950, cursor: "pointer", marginBottom: 8 }}>{pulseEnabled ? "PULSE ON" : "PULSE OFF"}</button>
-      <div style={{ fontSize: 10, color: t.subtext, fontWeight: 950, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Play Mode</div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
-        <button onClick={() => applyBBMode(false, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.red : t.borderStrong}`, background: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(239,68,68,0.10)" : t.input, color: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer", whiteSpace: "nowrap", fontSize: 12 }}>OFF</button>
-        <button onClick={() => applyBBMode(true, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.blue : t.borderStrong}`, background: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(37,99,235,0.14)" : t.input, color: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.blue : t.subtext, fontWeight: 950, cursor: "pointer", whiteSpace: "nowrap", fontSize: 11 }}>STRAIGHT</button>
-        <button onClick={() => applyBBMode(true, true)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.amber : t.borderStrong}`, background: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(245,158,11,0.12)" : t.input, color: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.amber : t.subtext, fontWeight: 950, cursor: "pointer", whiteSpace: "nowrap", fontSize: 11 }}>INVERTED</button>
-        <button onClick={applyMarkovMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${markovEnabled && !randomEnabled ? COLORS.green : t.borderStrong}`, background: markovEnabled && !randomEnabled ? "rgba(34,197,94,0.13)" : t.input, color: markovEnabled && !randomEnabled ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer", whiteSpace: "nowrap", fontSize: 11 }}>MARKOV</button>
-        <button onClick={applyRandomMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${randomEnabled ? COLORS.cyan : t.borderStrong}`, background: randomEnabled ? "rgba(34,199,243,0.13)" : t.input, color: randomEnabled ? COLORS.cyan : t.subtext, fontWeight: 950, cursor: "pointer", whiteSpace: "nowrap", fontSize: 11 }}>RANDOM</button>
-      </div>
+
+      {/* When Pulse is ON — show engine tracker */}
+      {pulseEnabled && tracker ? (
+        <div style={{ marginBottom: 10 }}>
+          {tracker.isWarming ? (
+            <div style={{ border: `1px solid ${t.border}`, borderRadius: 10, padding: "10px 12px", background: t.panel2, textAlign: "center" }}>
+              <div style={{ fontSize: 12, color: t.subtext, fontWeight: 900 }}>WARMING</div>
+              <div style={{ fontSize: 20, fontWeight: 950, color: t.subtext, marginTop: 4 }}>{tracker.spinsRemaining} spins remaining</div>
+              <div style={{ fontSize: 11, color: t.subtext, marginTop: 4 }}>All engines building history</div>
+            </div>
+          ) : (
+            <div>
+              {/* Active engine */}
+              <div style={{ border: `1px solid ${engineColors[tracker.selectedEngine] ?? COLORS.cyan}44`, borderRadius: 10, padding: "8px 12px", background: `${engineColors[tracker.selectedEngine] ?? COLORS.cyan}0a`, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>Active Engine</div>
+                  <div style={{ fontSize: 16, fontWeight: 950, color: engineColors[tracker.selectedEngine] ?? COLORS.cyan, marginTop: 2 }}>{tracker.selectedEngine}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>Win Rate (10)</div>
+                  <div style={{ fontSize: 16, fontWeight: 950, color: engineColors[tracker.selectedEngine] ?? COLORS.cyan, marginTop: 2 }}>{tracker.engineRates[tracker.selectedEngine]}%</div>
+                </div>
+              </div>
+              {/* All engine rates */}
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4 }}>
+                {["Straight","Inverted","Markov","Random"].map(eng => {
+                  const rate = tracker.engineRates[eng] ?? 0;
+                  const isActive = eng === tracker.selectedEngine;
+                  const col = engineColors[eng];
+                  return (
+                    <div key={eng} style={{ border: `1px solid ${isActive ? col+"66" : t.border}`, borderRadius: 8, padding: "5px 6px", background: isActive ? `${col}10` : t.input, textAlign: "center" }}>
+                      <div style={{ fontSize: 8, color: isActive ? col : t.subtext, fontWeight: 700, textTransform: "uppercase" }}>{eng.slice(0,3)}</div>
+                      <div style={{ fontSize: 13, fontWeight: 950, color: isActive ? col : t.text, marginTop: 2 }}>{rate}%</div>
+                    </div>
+                  );
+                })}
+              </div>
+              {tracker.switched && <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 900, marginTop: 6, textAlign: "center" }}>↔ Switched from {tracker.previousEngine}</div>}
+            </div>
+          )}
+        </div>
+      ) : !pulseEnabled ? (
+        // Manual engine selection (Pulse OFF)
+        <div>
+          <div style={{ fontSize: 10, color: t.subtext, fontWeight: 950, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Play Mode</div>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
+            <button onClick={() => applyBBMode(false, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.red : t.borderStrong}`, background: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(239,68,68,0.10)" : t.input, color: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 12 }}>OFF</button>
+            <button onClick={() => applyBBMode(true, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.blue : t.borderStrong}`, background: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(37,99,235,0.14)" : t.input, color: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.blue : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>STRAIGHT</button>
+            <button onClick={() => applyBBMode(true, true)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.amber : t.borderStrong}`, background: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(245,158,11,0.12)" : t.input, color: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.amber : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>INVERTED</button>
+            <button onClick={applyMarkovMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${markovEnabled && !randomEnabled ? COLORS.green : t.borderStrong}`, background: markovEnabled && !randomEnabled ? "rgba(34,197,94,0.13)" : t.input, color: markovEnabled && !randomEnabled ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>MARKOV</button>
+            <button onClick={applyRandomMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${randomEnabled ? COLORS.cyan : t.borderStrong}`, background: randomEnabled ? "rgba(34,199,243,0.13)" : t.input, color: randomEnabled ? COLORS.cyan : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>RANDOM</button>
+          </div>
+        </div>
+      ) : null}
+
+      {/* Final prediction */}
       <div style={{ textAlign: "center", padding: "10px 0" }}>
         <div style={{ fontSize: 11, color: t.subtext, fontWeight: 950 }}>FINAL PREDICTION</div>
         <div style={{ fontSize: 50, fontWeight: 950, color: f.group && !isObservationForecast ? COLORS.cyan : t.subtext, lineHeight: 1, marginTop: 8 }}>{displayPrediction}</div>
@@ -6782,14 +6858,12 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       </div>
       <div style={{ border: `1px solid ${t.border}`, borderRadius: 12, background: t.panel2, padding: "9px 10px", marginTop: 8 }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center", fontSize: 12, fontWeight: 900 }}>
-          <span style={{ color: t.subtext }}>PULSE Source</span>
-          <span style={{ color: pulseEnabled ? COLORS.cyan : COLORS.red }}>{pulseEnabled ? "Pulse Engine" : pulseStatus}</span>
+          <span style={{ color: t.subtext }}>Signal Source</span>
+          <span style={{ color: pulseEnabled ? COLORS.cyan : COLORS.red }}>{pulseEnabled ? (tracker?.selectedEngine ? `Pulse · ${tracker.selectedEngine}` : "Pulse · Warming") : "Manual"}</span>
           <span style={{ color: t.subtext }}>Execution</span>
           <span style={{ color: executionColor }}>{executionLabel}</span>
           <span style={{ color: t.subtext }}>Tier</span>
-          <span style={{ color: tierColor }}>{displayedTierLabel}</span>
-          {dimensionTDABlocked ? <span style={{ color: t.subtext }}>Forecast Tier</span> : null}
-          {dimensionTDABlocked ? <span style={{ color: forecastTierColor }}>{forecastTierLabel}</span> : null}
+          <span style={{ color: tierColor }}>{f.tier}</span>
         </div>
       </div>
     </Panel>;
