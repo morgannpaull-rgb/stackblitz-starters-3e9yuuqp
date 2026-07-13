@@ -7970,7 +7970,6 @@ const StreakAnalyticsPanel = () => {
     <LossInvestigationPanel />
     <AxisFailureAnalysisPanel />
     <DimensionPerformancePanel />
-    <AutoRunAuditPanel />
     <StreakAnalyticsPanel />
     <ComparisonTable title="Strategy Stability Matrix" />
   </section>;
