@@ -7965,6 +7965,16 @@ const StreakAnalyticsPanel = () => {
     return <Panel title="REPORTS QUICK ACCESS"><div style={{ display: "flex", flexWrap: "wrap", gap: 8 }}>{links.map(([id, label]) => <Button key={id} variant="secondary" onClick={() => jump(id)}>{label}</Button>)}</div><div style={{ marginTop: 8, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Jump directly to any report section without scrolling through the full Reports page.</div></Panel>;
   };
 
+  const Analytics = () => <section style={{ display: "grid", gap: 14 }}>
+    <RouterAuditPanel />
+    <LossInvestigationPanel />
+    <AxisFailureAnalysisPanel />
+    <DimensionPerformancePanel />
+    <AutoRunAuditPanel />
+    <StreakAnalyticsPanel />
+    <ComparisonTable title="Strategy Stability Matrix" />
+  </section>;
+
   const Reports = () => <section style={{ display: "grid", gap: 14 }}>
     <ReportQuickAccessPanel />
     <div id="report-router-audit"><RouterAuditPanel /></div>
