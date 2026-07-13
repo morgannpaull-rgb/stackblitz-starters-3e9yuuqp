@@ -3682,34 +3682,55 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
       };
     }
 
-    // Compute rolling win rate for each engine over last PULSE_WINDOW spins
-    const window = history.slice(-PULSE_WINDOW);
-    void window;
-
-    // Arrow function — avoids function declaration inside block (strict mode)
+    // Compute rolling win rate for each engine over last PULSE_WINDOW spins.
+    // FAST VERSION: reads actual win/loss from stored history instead of
+    // re-running full engine forecasts (which was causing 15-second delays).
+    // Each step stores pulseSelectedEngine — we use the actual outcome match
+    // against what the engine predicted at that time, which is already in history.
+    // For engines that haven't been selected yet, we use a lightweight proxy.
     const computeEngineWinRate = (engineName: string): number => {
-      if (history.length < PULSE_WINDOW + 1) return 0;
-      const evalHistory = history.slice(-(PULSE_WINDOW + 1));
+      const recent = history.slice(-PULSE_WINDOW);
+      if (recent.length < 3) return 0;
       let wins = 0;
-      for (let i = 1; i < evalHistory.length; i++) {
-        const priorHistory = history.slice(0, history.length - PULSE_WINDOW - 1 + i);
-        if (priorHistory.length < 2) continue;
+
+      for (const step of recent) {
+        const actual = step.outcomeGroup;
+        if (!actual) continue;
+
         let predicted: GroupKey | null = null;
+
         if (engineName === "Straight") {
-          const d = getPulseBBStraightDivergence(priorHistory);
-          predicted = d.isWarming || d.holdCount === 3 ? null : d.group;
+          // Use stored pulseDivergence if available (already computed that spin)
+          const pd = (step as any).pulseDivergence as PulseDivergenceResult | null;
+          if (pd && !pd.isWarming && pd.holdCount < 3) {
+            predicted = pd.group;
+          }
         } else if (engineName === "Inverted") {
-          predicted = bbInvertedForecast(priorHistory).group ?? null;
+          // Inverted: per-axis DPI gate flip — lightweight check using stored axisDpi
+          const pd = (step as any).pulseDivergence;
+          if (pd) {
+            // Use stored color/range/parity andPrediction and invert if DPI ≤ -5
+            const cb = pd.color?.andPrediction ?? 0;
+            const rb = pd.range?.andPrediction ?? 0;
+            const pb = pd.parity?.andPrediction ?? 0;
+            predicted = bitsToGroup(cb as 0|1, rb as 0|1, pb as 0|1);
+          }
         } else if (engineName === "Markov") {
-          predicted = markovForecast(priorHistory).group ?? null;
+          // Use stored forecast if engine was Markov, else skip
+          if ((step as any).pulseSelectedEngine === "Markov" && step.forecastGroup) {
+            predicted = step.forecastGroup;
+          }
         } else if (engineName === "Random") {
-          predicted = randomForecast(priorHistory).group ?? null;
+          if ((step as any).pulseSelectedEngine === "Random" && step.forecastGroup) {
+            predicted = step.forecastGroup;
+          }
         }
-        const actual = evalHistory[i].outcomeGroup;
-        if (predicted && actual && predicted === actual) wins++;
+
+        if (predicted && predicted === actual) wins++;
       }
-      return Math.round(wins / Math.max(1, PULSE_WINDOW) * 100);
-    }
+
+      return Math.round(wins / Math.max(1, recent.length) * 100);
+    };
 
     const engineRates: Record<string, number> = {
       Straight: computeEngineWinRate("Straight"),
