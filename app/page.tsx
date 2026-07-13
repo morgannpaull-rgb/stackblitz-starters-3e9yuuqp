@@ -2011,23 +2011,33 @@ function score3InputGates(bits: (0|1)[], window = 12): { id: number; score: numb
 const GATE_3_HOLD_THRESHOLD  = 0.55; // must beat this to be trusted (higher than 2-input due to larger search space)
 const GATE_3_EVAL_WINDOW     = 12;
 
+// ── Gate selection cache ───────────────────────────────────────────────────
+// Caches the best gate per axis per history length to avoid re-scoring
+// 256 truth tables on every spin. Cache key = axis bits joined + length.
+const _gateCache = new Map<string, { id: number; score: number; name: string; prediction: 0|1|null; isHold: boolean; topScores: {id:number;score:number;name:string}[] }>();
+
 function selectBest3InputGate(bits: (0|1)[]): {
-  gateId: number;
-  gateName: string;
-  fitScore: number;
-  prediction: 0|1 | null;
-  isHold: boolean;
-  topScores: { id: number; score: number; name: string }[];
+  gateId: number; gateName: string; fitScore: number;
+  prediction: 0|1|null; isHold: boolean;
+  topScores: {id:number;score:number;name:string}[];
 } {
+  const cacheKey = bits.length + ":" + bits.slice(-15).join("");
+  const cached = _gateCache.get(cacheKey);
+  if (cached) return { gateId: cached.id, gateName: cached.name, fitScore: cached.score, prediction: cached.prediction, isHold: cached.isHold, topScores: cached.topScores };
+
   const ranked = score3InputGates(bits, GATE_3_EVAL_WINDOW);
   const best = ranked[0];
-  if (best.score <= GATE_3_HOLD_THRESHOLD) {
-    return { gateId: best.id, gateName: best.name, fitScore: best.score, prediction: null, isHold: true, topScores: ranked.slice(0,6) };
-  }
-  const prediction = bits.length >= 3
+  const isHold = best.score <= GATE_3_HOLD_THRESHOLD;
+  const prediction = (!isHold && bits.length >= 3)
     ? apply3InputGate(best.id, bits[bits.length-3], bits[bits.length-2], bits[bits.length-1])
-    : 0 as 0|1;
-  return { gateId: best.id, gateName: best.name, fitScore: best.score, prediction, isHold: false, topScores: ranked.slice(0,6) };
+    : null;
+
+  const result = { id: best.id, score: best.score, name: best.name, prediction, isHold, topScores: ranked.slice(0,6) };
+  // Keep cache small — only last 50 entries
+  if (_gateCache.size > 50) _gateCache.delete(_gateCache.keys().next().value);
+  _gateCache.set(cacheKey, result);
+
+  return { gateId: best.id, gateName: best.name, fitScore: best.score, prediction, isHold, topScores: ranked.slice(0,6) };
 }
 
 // Kept for compatibility — wraps 3-input gate as BooleanGate type
@@ -3663,9 +3673,11 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
     const PULSE_SWITCH_GAP  = 15; // pp gap required to trigger a switch
     const PULSE_WINDOW      = 10; // rolling window for win rate
 
-    // Not enough history yet — hold
+    // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
+      const warmForecast = bbStraightForecast(history);
       return {
+        ...warmForecast,
         group: null as GroupKey | null,
         numbers: [] as SpinValue[],
         confidence: 0,
