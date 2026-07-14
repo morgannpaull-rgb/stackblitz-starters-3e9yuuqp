@@ -4,7 +4,7 @@ import React, { useMemo, useState } from "react";
 
 type SpinValue = number | "00";
 type Result = "win" | "loss" | "push";
-type TierLabel = "Active · High Confidence" | "Active · Confirmed" | "Active · Caution" | "Hold · No Bet" | "No Prediction" | "BB Straight" | "BB Inverted" | "BB Inverted Armed" | "Disabled";
+type TierLabel = "Active · High Confidence" | "Active · Confirmed" | "Active · Caution" | "Hold · No Bet" | "No Prediction" | "Straight" | "Inverted" | "BB Inverted Armed" | "Disabled";
 type GroupKey = "BHE" | "BHO" | "BLE" | "BLO" | "RHE" | "RHO" | "RLE" | "RLO";
 type Strategy =
   | "Flat"
@@ -22,7 +22,7 @@ type Strategy =
   | "Progressive Confidence";
 type Appearance = "dark" | "light";
 type ViewKey = "Dashboard" | "Analytics" | "Reports" | "Sessions";
-type BBMode = "BB Off" | "BB Straight" | "BB Inverted";
+type BBMode = "BB Off" | "Straight" | "Inverted";
 type ExecutionMode = "Stream Direct" | "Dimension Compression" | "Edge Expansion" | "Neighbor Expansion" | "Hybrid Coverage";
 
 type PulseAudit = {
@@ -152,18 +152,10 @@ const DEFAULT_DIMENSION_GATE_MIN = 51;
 const RV_MODERATE = 45;
 const RV_HIGH = 58;
 const RV_EXTREME = 75;
-const RV_STRUCTURAL_MODERATE = 55;
-const RV_STRUCTURAL_HIGH = 68;
-const RV_STRUCTURAL_EXTREME = 82;
-const RV_STRUCTURAL_PENALTY_MODERATE = 3;
-const RV_STRUCTURAL_PENALTY_HIGH = 7;
-const RV_STRUCTURAL_PENALTY_EXTREME = 12;
 const RV_CONFIDENCE_PENALTY_MODERATE = 4;
 const RV_CONFIDENCE_PENALTY_HIGH = 8;
 const RV_CONFIDENCE_PENALTY_EXTREME = 14;
-const ENTROPY_EXTREME_BLOCK = 78;
 const PERSISTENCE_GATE_MIN = 50;
-const STRONG_PERSISTENCE_MIN = 56;
 const NEURAL_DOWNGRADE_THRESHOLD = -6;
 const NEURAL_HOLD_THRESHOLD = -12;
 const DEFAULT_STRATEGY: Strategy = "Flat";
@@ -648,146 +640,12 @@ function buildAutoRunAuditEntry(priorRows: Step[], row: Step) {
   };
 }
 
-function getAutoRunAuditRows(history: Step[]) {
-  const tagged = history.filter((row) => (row as any).autoRun);
-  return tagged.length ? tagged : history;
-}
-
 function getAxisSideLabel(axis: PulseDriftAxisKey, bit: 0 | 1) {
   if (axis === "color") return bit === 0 ? "Black" : "Red";
   if (axis === "range") return bit === 0 ? "High" : "Low";
   return bit === 0 ? "Even" : "Odd";
 }
 
-
-function getAdaptiveDriftWindow(values: (0 | 1)[]) {
-  const sample = values.slice(-16);
-  if (sample.length < 6) return 12;
-
-  let flips = 0;
-  for (let i = 1; i < sample.length; i += 1) {
-    if (sample[i] !== sample[i - 1]) flips += 1;
-  }
-
-  const flipRate = sample.length > 1 ? (flips / (sample.length - 1)) * 100 : 0;
-  const recent12 = values.slice(-12);
-  const counts = recent12.reduce(
-    (acc, value) => {
-      acc[value] += 1;
-      return acc;
-    },
-    { 0: 0, 1: 0 } as Record<0 | 1, number>
-  );
-  const dominantShare = recent12.length
-    ? (Math.max(counts[0], counts[1]) / recent12.length) * 100
-    : 50;
-
-  if (flipRate >= 70) return 6;
-  if (flipRate >= 55) return 8;
-  if (dominantShare >= 65 && values.length >= 16) return 16;
-  return 12;
-}
-
-function getDriftStatusAndAction(driftPercent: number, driftDelta: number, warming = false) {
-  if (warming) return { status: "Warming", action: "KEEP" };
-  if (driftPercent >= 62) return { status: "Flip", action: "FLIP" };
-  if (driftPercent >= 50) return { status: "Drifting", action: "COMPRESS" };
-  if (driftPercent < 45 && driftDelta <= -8) return { status: "Resynced", action: "KEEP" };
-  if (driftPercent >= 45) return { status: "Testing", action: "HOLD" };
-  return { status: "In Range", action: "KEEP" };
-}
-
-function getPulseDriftDestinationCore(
-  history: Step[],
-  predictedBits: [0 | 1, 0 | 1, 0 | 1]
-) {
-  const groups = groupSeries(history);
-  const bitRows = groups.map(groupToBits);
-
-  const axes = [
-    {
-      key: "color" as PulseDriftAxisKey,
-      values: bitRows.map((row) => row[0]),
-      predictedBit: predictedBits[0],
-    },
-    {
-      key: "range" as PulseDriftAxisKey,
-      values: bitRows.map((row) => row[1]),
-      predictedBit: predictedBits[1],
-    },
-    {
-      key: "parity" as PulseDriftAxisKey,
-      values: bitRows.map((row) => row[2]),
-      predictedBit: predictedBits[2],
-    },
-  ].map((axis) =>
-    getAxisDirectionalDrift(axis.key, axis.values, axis.predictedBit)
-  );
-
-  const adjustedBits = [...predictedBits] as [0 | 1, 0 | 1, 0 | 1];
-
-  axes.forEach((axis) => {
-    if (axis.action === "FLIP") {
-      const index = axis.axis === "color" ? 0 : axis.axis === "range" ? 1 : 2;
-      adjustedBits[index] = axis.destinationBit;
-    }
-  });
-
-  const keepAxes = axes.filter((axis) => axis.action === "KEEP" || axis.action === "FLIP");
-  const compressAxes = axes.filter((axis) => axis.action === "COMPRESS");
-  const holdAxes = axes.filter((axis) => axis.action === "HOLD");
-
-  const activeAxes = keepAxes.map((axis) => axis.axis as AxisKey);
-
-  const mode: AdaptiveTDAMode =
-    holdAxes.length > 1 || activeAxes.length < 2
-      ? "OBSERVE"
-      : activeAxes.length === 3 && compressAxes.length === 0
-      ? "FULL_3D"
-      : "COMPRESSED_2D";
-
-  const score = Math.max(
-    0,
-    Math.min(
-      100,
-      Math.round(
-        axes.reduce((sum, axis) => {
-          const axisScore =
-            axis.status === "In Range"
-              ? 82
-              : axis.status === "Resynced"
-              ? 74
-              : axis.status === "Flip"
-              ? 62
-              : axis.status === "Drifting"
-              ? 54
-              : 32;
-          return sum + axisScore;
-        }, 0) / 3
-      )
-    )
-  );
-
-  return {
-    axes,
-    originalBits: predictedBits,
-    adjustedBits,
-    originalGroup: bitsToGroup(predictedBits[0], predictedBits[1], predictedBits[2]),
-    adjustedGroup: bitsToGroup(adjustedBits[0], adjustedBits[1], adjustedBits[2]),
-    activeAxes,
-    mode,
-    modeLabel: getTdaModeLabel(mode),
-    score,
-    summary:
-      holdAxes.length > 1
-        ? "Drift Hold"
-        : compressAxes.length >= 1
-        ? "Drift Compression"
-        : axes.some((axis) => axis.action === "FLIP")
-        ? "Drift Flip"
-        : "In Range",
-  };
-}
 
 function detectRegime(window: string) {
   let flips = 0;
@@ -821,16 +679,6 @@ function predict(window: string, regime: string) {
   }
 
   return last;
-}
-
-function getLabLeader(regime: string) {
-  return regime === "Alternation"
-    ? "Alternation"
-    : regime === "Momentum"
-    ? "Persistence"
-    : regime === "Transition"
-    ? "Structure"
-    : "Entropy";
 }
 
 function getLabAxisForecast(bits: (0 | 1)[]): LabAxisForecast {
@@ -1200,10 +1048,6 @@ function isActivePulseRow(row: Step) {
   return row.result !== "push" && row.note.startsWith("PULSE");
 }
 
-function isProtectionHoldRow(row: Step) {
-  return row.result === "push" && row.note.startsWith("Pulse Loss Protection");
-}
-
 function getActivePulseLossStreak(history: Step[]) {
   let streak = 0;
   for (let i = history.length - 1; i >= 0; i -= 1) {
@@ -1229,43 +1073,6 @@ function getActivePulseLossStreak(history: Step[]) {
   return streak;
 }
 
-
-function getRecentActivePulseRows(history: Step[], limit: number) {
-  const rows: Step[] = [];
-  for (let i = history.length - 1; i >= 0 && rows.length < limit; i -= 1) {
-    const row = history[i];
-    if (isActivePulseRow(row)) rows.push(row);
-  }
-  return rows.reverse();
-}
-
-function getAxisRecentAccuracyFromRows(history: Step[], axis: "color" | "range" | "parity", window = WDS_WINDOW) {
-  const rows: Step[] = [];
-  for (let i = history.length - 1; i >= 0 && rows.length < window; i -= 1) {
-    const row = history[i];
-    if (isActivePulseRow(row) && row.predictedGroup && row.outcomeGroup) rows.push(row);
-  }
-  if (rows.length < WDS_MIN_TRIALS) return { trials: rows.length, wins: 0, rate: 0.5, weak: false };
-  const axisIndex = axis === "color" ? 0 : axis === "range" ? 1 : 2;
-  let wins = 0;
-  rows.forEach((row) => {
-    const predicted = groupToBits(row.predictedGroup as GroupKey);
-    const actual = groupToBits(row.outcomeGroup as GroupKey);
-    if (predicted[axisIndex] === actual[axisIndex]) wins += 1;
-  });
-  const rate = wins / rows.length;
-  return { trials: rows.length, wins, rate, weak: rate < WDS_ACCURACY_MIN };
-}
-
-function getForecastAgreementScore(history: Step[], pulseGroup?: GroupKey | null) {
-  const pulse = pulseGroup ?? forecast(history).group;
-  const straight = bbStraightForecast(history).group;
-  const inverted = bbInvertedForecast(history).group;
-  const groups = [pulse, straight, inverted].filter(Boolean) as GroupKey[];
-  if (!groups.length) return 0;
-  const maxAgreement = Math.max(...groups.map((group) => groups.filter((value) => value === group).length));
-  return Math.round((maxAgreement / groups.length) * 100);
-}
 
 function getNeuralAssistMetrics(history: Step[]) {
   const rawPulse = forecast(history);
@@ -1317,169 +1124,6 @@ function getNeuralAssistMetrics(history: Step[]) {
     adjustedReason,
   };
 }
-
-function getPulseRvMetrics(history: Step[]) {
-  const rows = groupSeries(history).map(groupToBits);
-  const color = getAxisRotationVelocity(rows.map((b) => b[0]));
-  const range = getAxisRotationVelocity(rows.map((b) => b[1]));
-  const parity = getAxisRotationVelocity(rows.map((b) => b[2]));
-  const composite = Math.round((color + range + parity) / 3);
-  const state = getRotationState(composite);
-  const confidencePenalty =
-    composite >= RV_EXTREME
-      ? RV_CONFIDENCE_PENALTY_EXTREME
-      : composite >= RV_HIGH
-      ? RV_CONFIDENCE_PENALTY_HIGH
-      : composite >= RV_MODERATE
-      ? RV_CONFIDENCE_PENALTY_MODERATE
-      : 0;
-
-  return {
-    color,
-    range,
-    parity,
-    composite,
-    instabilityScore: composite,
-    state,
-    confidencePenalty,
-    weakSuppressed: composite >= RV_HIGH,
-    extremeObserve: composite >= RV_EXTREME,
-  };
-}
-
-
-function applyNeuralGovernance(
-  tier: TierLabel,
-  confidence: number,
-  neuralAdjustment: number,
-  neuralStatus: string
-) {
-  let adjustedTier = tier;
-  let adjustedConfidence = confidence;
-  let governanceHold = false;
-  let governanceReason = "Neural Neutral";
-
-  // DOWNGRADE AUTHORITY ONLY
-  // Neural can reduce aggression or hold execution,
-  // but cannot upgrade confidence/tier.
-
-  if (neuralAdjustment <= NEURAL_HOLD_THRESHOLD || neuralStatus === "Conflict") {
-    governanceHold = true;
-    adjustedTier = "Hold · No Bet";
-    adjustedConfidence = Math.max(0, confidence - 15);
-    governanceReason = "Neural HOLD";
-  } else if (neuralAdjustment <= NEURAL_DOWNGRADE_THRESHOLD) {
-    if (tier === "Active · High Confidence") {
-      adjustedTier = "Active · Confirmed";
-    } else if (tier === "Active · Confirmed") {
-      adjustedTier = "Active · Caution";
-    } else if (tier === "Active · Caution") {
-      adjustedTier = "Hold · No Bet";
-    }
-
-    adjustedConfidence = Math.max(0, confidence - 8);
-    governanceReason = "Neural Downgrade";
-  }
-
-  return {
-    adjustedTier,
-    adjustedConfidence,
-    governanceHold,
-    governanceReason,
-  };
-}
-
-
-function getNeuralCalibratedPulse(history: Step[]) {
-  const neural = getNeuralAssistMetrics(history);
-  const rawPulse = neural.rawPulse;
-  const pulseLossStreak = getActivePulseLossStreak(history);
-  const rv = getPulseRvMetrics(history);
-  const directionalAdaptation = getDirectionalAdaptationMetrics(history);
-  const e = entropy(groupSeries(history));
-
-  // HARMONIZED FILTER ARCHITECTURE
-  // PULSE is the only forecast engine.
-  // Neural Assist is diagnostics only here; it no longer modifies live confidence.
-  // Consensus is the only execution gate.
-  // ARV handles reversal detection. RV is diagnostics only.
-  // Entropy is an environment warning and only blocks at extreme readings.
-  // Loss pressure applies a temporary confidence penalty after 3 active PULSE losses.
-  const lossPressureActive = false;
-  const lossPressurePenalty = 0;
-  const entropyExtreme = false;
-  const entropyPenalty = 0;
-  const rvPenalty = 0;
-
-  const directionalPenalty = 0;
-  const directionalRecoveryBonus = 0;
-
-  const finalConfidence = Math.round(
-    rawPulse.confidence -
-      lossPressurePenalty -
-      entropyPenalty -
-      directionalPenalty +
-      directionalRecoveryBonus
-  );
-  let finalTier = entropyExtreme ? "Hold · No Bet" : getPulseTier(finalConfidence);
-
-  const finalReason =
-    rawPulse?.pulseDiagnostics?.driftCore?.summary
-      ? `Engine Rule Drift Core · ${rawPulse.pulseDiagnostics.driftCore.summary}.`
-      : rawPulse.reason;
-
-  return {
-    ...rawPulse,
-    confidence: finalConfidence,
-    tier: finalTier,
-    reason: finalReason,
-    rawConfidence: rawPulse.confidence,
-    neuralScore: neural.neuralScore,
-    neuralAdjustment: 0,
-    neuralStatus: neural.status,
-    neuralDiagnosticConfidence: neural.adjustedConfidence,
-    neuralDiagnosticAdjustment: neural.adjustment,
-    pulseLossStreak,
-    lossPressureActive,
-    lossPressurePenalty,
-    lossProtectionActive: lossPressureActive,
-    lossProtectionHold: false,
-    lossProtectionPenalty: lossPressurePenalty,
-    reEntryScore: 0,
-    reEntryThreshold: 0,
-    reEntryPassed: true,
-    reEntryChecks: null,
-    rv,
-    rvStructuralGovernance: { level: "Disabled", score: 0, penalty: 0, blockExecution: false },
-    rvPenalty: 0,
-    rvStructuralLevel: "Disabled",
-    rvStructuralScore: 0,
-    entropyExtreme,
-    rvStructuralBlock: false,
-    entropyValue: e,
-    entropyPenalty,
-    disLevel: 0,
-    disPenalty: 0,
-    disLabel: "Disabled",
-    disWorstAxis: "None",
-    disWorstAxisRate: 0,
-    directionalAdaptation,
-    directionalPenalty,
-    directionalRecoveryBonus,
-  };
-}
-
-
-// =====================================================
-// LOCKED BB BOOLEAN LOGIC
-// BB Straight follows the confirmed Boolean table:
-// Base side wins. First opposite = loss. Second same opposite = loss.
-// Third and beyond same opposite = win because the forecast switches
-// after two consecutive opposite outcomes. First base after a run is
-// a reset loss until the second same base confirms the reset.
-// BB Inverted is the mirrored Boolean structure and is eligible only
-// when DPI is at/below -5. DPI calculation itself is unchanged.
-// =====================================================
 
 function groupToBits(group: GroupKey): [0 | 1, 0 | 1, 0 | 1] {
   return [
@@ -1893,9 +1537,6 @@ const BASE_AXIS_CONFIDENCE       = 65;
 const AXIS_CONF_WINDOW           = 12;
 const LOSS_PROTECT_TRIGGER       = 4;
 const LOSS_PROTECT_SEVERE        = 6;
-const ENTROPY_ELEVATED_THRESHOLD = 85;
-const ENTROPY_RANDOM_THRESHOLD   = 94;
-const FLIP_RATE_UNSTABLE         = 0.70;
 // ─────────────────────────────────────────────────────────────────────────────
 
 function scoreDimensionConformance(bits: (0 | 1)[], window = 10): { conformanceScore: number; mismatchStreak: number; windowUsed: number } {
@@ -2056,21 +1697,6 @@ function applyGate(gate: BooleanGate, a: 0|1, b: 0|1): 0|1 {
   }
 }
 
-function scoreAllGates(bits: (0|1)[], window=12): Record<BooleanGate, number> {
-  const gates: BooleanGate[] = ["AND","NAND","OR","NOR","XOR","XNOR"];
-  const scores = {} as Record<BooleanGate, number>;
-  for (const gate of gates) {
-    if (bits.length < 3) { scores[gate]=0; continue; }
-    const check = bits.slice(-(window+2));
-    let correct=0, total=0;
-    for (let i=2; i<check.length; i++) { if (applyGate(gate,check[i-2],check[i-1])===check[i]) correct++; total++; }
-    scores[gate] = total?correct/total:0;
-  }
-  return scores;
-}
-
-// ── Axis DPI — now tracks selected 3-input gate performance ──────────────────
-// +1 when outcome matches the selected gate's prediction, -1 when not. Cap at 0.
 function computeAxisDpi(bits: (0|1)[], gateId: number): number {
   if (bits.length < 4) return 0;
   let dpi = 0;
@@ -2084,193 +1710,6 @@ function computeAxisDpi(bits: (0|1)[], gateId: number): number {
 // ── 7 Components (mirroring Baccarat exactly) ─────────────────────────────────
 
 // Component 1 — Persistence / Stability
-function getAxisPersistenceStability(bits: (0|1)[], predictedBit: 0|1, window=10) {
-  const recent = bits.slice(-window);
-  if (recent.length < 4) return { score:50, status:"Building", flips:0, flipRate:0, unstable:false, breakingDown:false, penalty:0 };
-  let flips = 0;
-  for (let i=1; i<recent.length; i++) if (recent[i]!==recent[i-1]) flips++;
-  const {length: runLength} = getCurrentBitRun(recent);
-  const flipRate = flips / Math.max(1, recent.length-1);
-  const targetSupport = recent.filter(b=>b===predictedBit).length / recent.length;
-  const runSupport = Math.min(1, runLength/4);
-  const score = Math.max(0, Math.min(100, Math.round(72 - flipRate*44 + runSupport*18 + targetSupport*18)));
-  const unstable = flipRate >= 0.70;
-  const breakingDown = unstable && runLength <= 1;
-  return {
-    score, flips, flipRate: Math.round(flipRate*100),
-    unstable, breakingDown,
-    status: breakingDown?"Breaking Down":unstable?"Flipping":score>=70?"Stable":"Mixed",
-    penalty: breakingDown?8:unstable?4:score<45?2:0,
-  };
-}
-
-// Component 2 — Entropy
-function getAxisEntropy(bits: (0|1)[], window=12) {
-  const recent = bits.slice(-window);
-  if (recent.length < 4) return { score:0, penalty:0, random:false, elevated:false, status:"No Data" };
-  const ones = recent.filter(b=>b===1).length;
-  const p1 = ones/recent.length; const p0 = 1-p1;
-  const e = [p0,p1].reduce((s,p)=>p>0?s-p*Math.log2(p):s,0);
-  const score = Math.round(e*100);
-  const random = score >= 94; const elevated = score >= 85;
-  return { score, random, elevated, penalty: random?5:elevated?2:0, status: random?"Random Flow":elevated?"Elevated":"Stable Flow" };
-}
-
-// Component 3 — Loss Protection (uses selected 3-input gate)
-function getAxisLossProtection(bits: (0|1)[], gateId: number) {
-  if (bits.length < 4) return { active:false, severe:false, lossRun:0, penalty:0, observe:false, status:"No Data" };
-  let lossRun = 0;
-  for (let i=bits.length-1; i>=3; i--) {
-    const pred = apply3InputGate(gateId, bits[i-3], bits[i-2], bits[i-1]);
-    if (pred!==bits[i]) lossRun++;
-    else break;
-  }
-  const active = lossRun >= LOSS_PROTECT_TRIGGER;
-  const severe = lossRun >= LOSS_PROTECT_SEVERE;
-  return {
-    active, severe, lossRun,
-    penalty: severe?8:active?3:0,
-    observe: severe,
-    status: severe?`Loss Protection Hold (${lossRun})`:active?`Loss Protection Watch (${lossRun})`:"Clear",
-  };
-}
-
-// Component 4 — Consensus / Re-Entry (uses selected 3-input gate)
-function getAxisConsensus(
-  gatePredThis: 0|1,
-  gatePredOtherA: 0|1,
-  gatePredOtherB: 0|1,
-  bits: (0|1)[],
-  gateId: number,
-) {
-  // Recent win = selected gate was correct on last spin
-  const recentWin = bits.length >= 4
-    ? apply3InputGate(gateId, bits[bits.length-4], bits[bits.length-3], bits[bits.length-2]) === bits[bits.length-1]
-    : false;
-  let twoRecentWins = 0;
-  for (let i=Math.max(3,bits.length-3); i<bits.length; i++) {
-    const pred = apply3InputGate(gateId, bits[i-3], bits[i-2], bits[i-1]);
-    if (pred===bits[i]) twoRecentWins++;
-  }
-  const agrees = [gatePredOtherA, gatePredOtherB].filter(b=>b===gatePredThis).length;
-  const recent = bits.slice(-10);
-  const axisAccuracy = recent.length>=4
-    ? (() => {
-        let c=0;
-        for(let i=3;i<recent.length;i++) {
-          if(apply3InputGate(gateId,recent[i-3],recent[i-2],recent[i-1])===recent[i]) c++;
-        }
-        return c/Math.max(1,recent.length-3);
-      })()
-    : 0.5;
-  const reEntryReady = recentWin || twoRecentWins>=2 || (agrees>=1 && axisAccuracy>=0.52);
-  return {
-    agrees, recentWin, reEntryReady,
-    lift: reEntryReady?8:0,
-    status: reEntryReady?"Re-Entry Ready":"Waiting",
-  };
-}
-
-// Component 5 — DPI Structural Gate
-// Mirrors Baccarat getDpiStructuralPulseState exactly but uses per-axis DPI.
-function getAxisDpiStructural(bits: (0|1)[], confidence: number) {
-  const window = 6;
-  const start = Math.max(1, bits.length - window + 1);
-  const dpiSeries: number[] = [];
-  for (let i=start; i<=bits.length; i++) dpiSeries.push(computeAxisDpi(bits.slice(0,i), 128));
-  let worsening=0, repair=0;
-  for (let i=1; i<dpiSeries.length; i++) {
-    if (dpiSeries[i]<dpiSeries[i-1]) worsening++;
-    else if (dpiSeries[i]>dpiSeries[i-1]) repair++;
-  }
-  const last3 = dpiSeries.slice(-3);
-  let w3=0, r3=0;
-  for (let i=1; i<last3.length; i++) { if(last3[i]<last3[i-1])w3++; else if(last3[i]>last3[i-1])r3++; }
-  const last4 = dpiSeries.slice(-4);
-  let w4=0;
-  for (let i=1; i<last4.length; i++) if(last4[i]<last4[i-1]) w4++;
-  const currentDpi = dpiSeries[dpiSeries.length-1] ?? 0;
-  const deepPressure = currentDpi <= -8;
-  const extremePressure = currentDpi <= -12;
-  const rapidDivergence = currentDpi <= -5 && w4 >= 3;
-  const persistentDivergence = deepPressure && worsening >= 4 && repair === 0;
-  const confidenceReboundWithoutRepair = deepPressure && confidence >= 50 && w3 >= 1 && r3 === 0;
-  const structuralRecoveryConfirmed = r3 >= 1 || (repair >= 2 && w3 === 0);
-  const forceObserve = (rapidDivergence || persistentDivergence || confidenceReboundWithoutRepair) && !structuralRecoveryConfirmed;
-  const penalty = extremePressure&&forceObserve?12:forceObserve?8:rapidDivergence?5:0;
-  const velocity = dpiSeries.length>=2?dpiSeries[dpiSeries.length-1]-dpiSeries[0]:0;
-  const status = forceObserve
-    ? confidenceReboundWithoutRepair?"Recovery Gate Hold":persistentDivergence?"Persistent DPI Divergence":"DPI Velocity Warning"
-    : structuralRecoveryConfirmed?"DPI Stabilizing":deepPressure?"Deep DPI Pressure":"DPI Clear";
-  return { forceObserve, penalty, status, velocity, currentDpi };
-}
-
-// Component 6 — Engine-Specific Cadence Assist
-// Mirrors Baccarat getMarkovAssistForBbPulse trap cadence detection, per axis.
-function getAxisCadenceAssist(bits: (0|1)[]) {
-  if (bits.length < 8) return { penalty:0, observe:false, status:"Building" };
-  const recent = bits.slice(-16).join("");
-  // Trap cadences that cause AND to repeatedly misfire
-  const trapPattern = recent.includes("11011011") || recent.endsWith("11011") || recent.endsWith("1101");
-  const altPattern  = recent.includes("101101101") || recent.includes("010010010");
-  const engineRisk  = trapPattern || altPattern;
-  // Recent AND accuracy over last 12
-  const recentBits = bits.slice(-13);
-  let wins=0, trials=0;
-  for (let i=1; i<recentBits.length; i++) {
-    const pred = getStraightNextBit(recentBits.slice(0,i) as (0|1)[]);
-    if (pred===recentBits[i]) wins++;
-    trials++;
-  }
-  const accuracy = trials?wins/trials:0.5;
-  const bbWeak = trials>=7 && accuracy<=0.35;
-  const severe = bbWeak && engineRisk;
-  const penalty = severe?13:bbWeak&&engineRisk?11:engineRisk?0:bbWeak?6:0;
-  return {
-    penalty,
-    observe: severe,
-    status: severe?"Cadence Severe Risk":bbWeak&&engineRisk?"Cadence Trap Risk":engineRisk?"Cadence Risk":bbWeak?"AND Weakening":"Clear",
-  };
-}
-
-// Component 7 — Neural Governance
-// Mirrors Baccarat applyNeuralGovernance — downgrade authority only.
-function getAxisNeuralGovernance(confidence: number) {
-  const NEURAL_HOLD_THRESHOLD     = 35;
-  const NEURAL_DOWNGRADE_THRESHOLD = 48;
-  if (confidence <= NEURAL_HOLD_THRESHOLD) {
-    return { hold:true,  reason:"Neural HOLD" };
-  }
-  if (confidence <= NEURAL_DOWNGRADE_THRESHOLD) {
-    return { hold:false, reason:"Neural Downgrade" };
-  }
-  return { hold:false, reason:"Neural Neutral" };
-}
-
-// ── Cadence override (mirrors Baccarat PBBPBB pattern) ───────────────────────
-// When spread drops below 40, instead of HOLD we follow a fixed repeating
-// pattern based on which bit value broke the spread.
-// break=1 (was predicting 1 when spread broke) → cadence: 1,0,0,1,0,0,...
-// break=0 (was predicting 0 when spread broke) → cadence: 0,1,1,0,1,1,...
-function getAxisCadence(bits: (0|1)[], gateId: number, spreadBrokeAtIndex: number): { pattern: (0|1)[]; index: number; nextBit: 0|1 } {
-  const breakBit = bits[spreadBrokeAtIndex] ?? (bits.length>=3 ? apply3InputGate(gateId, bits[bits.length-3], bits[bits.length-2], bits[bits.length-1]) : 0 as 0|1);
-  const pattern: (0|1)[] = breakBit===1 ? [1,0,0] : [0,1,1];
-  const stepsSinceBreak = Math.max(0, bits.length - spreadBrokeAtIndex - 1);
-  const index = stepsSinceBreak % pattern.length;
-  return { pattern, index, nextBit: pattern[index] };
-}
-
-function findSpreadBreakIndex(bits: (0|1)[], gateId: number): number {
-  for (let i = bits.length-1; i >= Math.max(3, bits.length-20); i--) {
-    const priorBits = bits.slice(0,i);
-    const dpi = computeAxisDpi(priorBits, gateId);
-    const conf = priorBits.length>=4 ? computeAxisConfidence(priorBits, gateId) : BASE_AXIS_CONFIDENCE;
-    const spread = Math.abs(conf - Math.abs(dpi));
-    if (spread >= SPREAD_THRESHOLD) return i;
-  }
-  return 0;
-}
-
 function computeAxisConfidence(bits: (0|1)[], gateId: number, window=AXIS_CONF_WINDOW): number {
   if (bits.length < 4) return BASE_AXIS_CONFIDENCE;
   const check = bits.slice(-(window+3));
@@ -2474,20 +1913,6 @@ function bbStraightForecast(history: Step[]) {
   };
 }
 
-function invertGroup(group: GroupKey): GroupKey {
-  const map: Record<GroupKey, GroupKey> = {
-    BHE: "RHE",
-    BHO: "RHO",
-    BLE: "RLE",
-    BLO: "RLO",
-    RHE: "BHE",
-    RHO: "BHO",
-    RLE: "BLE",
-    RLO: "BLO",
-  };
-  return map[group];
-}
-
 function bbInvertedForecast(history: Step[]) {
   if (!history.length) {
     return { group: "BHE" as GroupKey, numbers: GROUPS.BHE, confidence: 0, tier: "Active · Confirmed", reason: "Locked Inverted initial base recommendation." };
@@ -2584,52 +2009,6 @@ function getBooleanAxisPatternConfidence(bits: (0 | 1)[], mode: "Straight" | "In
   return Math.max(38, Math.min(96, Math.round((wins / recent.length) * 100)));
 }
 
-function getSelectedEngineAxisConfidence(history: Step[], scope: PulseEngineScope, dpiCore?: any) {
-  const bitRows = groupSeries(history).map(groupToBits);
-  const colorBits = bitRows.map((b) => b[0]);
-  const rangeBits = bitRows.map((b) => b[1]);
-  const parityBits = bitRows.map((b) => b[2]);
-
-  if (scope === "Markov") {
-    const color = getMarkovNextBit(colorBits, 3);
-    const range = getMarkovNextBit(rangeBits, 3);
-    const parity = getMarkovNextBit(parityBits, 3);
-    return {
-      color: getMarkovAxisConfidence(colorBits, color, 3),
-      range: getMarkovAxisConfidence(rangeBits, range, 3),
-      parity: getMarkovAxisConfidence(parityBits, parity, 3),
-    };
-  }
-
-  if (scope === "Random") {
-    const axisDpi = getRandomAxisDpiValues(history);
-    return {
-      color: Math.max(50, Math.min(82, Math.round(50 + Math.abs(axisDpi.color) * 3))),
-      range: Math.max(50, Math.min(82, Math.round(50 + Math.abs(axisDpi.range) * 3))),
-      parity: Math.max(50, Math.min(82, Math.round(50 + Math.abs(axisDpi.parity) * 3))),
-    };
-  }
-
-  if (scope === "BB Inverted") {
-    const axisDpi = dpiCore?.axisDpi ?? getAxisBbDpiValues(history, false);
-    return {
-      color: getBooleanAxisPatternConfidence(colorBits, isDpiDimensionLocked(axisDpi.color) ? "Inverted" : "Straight"),
-      range: getBooleanAxisPatternConfidence(rangeBits, isDpiDimensionLocked(axisDpi.range) ? "Inverted" : "Straight"),
-      parity: getBooleanAxisPatternConfidence(parityBits, isDpiDimensionLocked(axisDpi.parity) ? "Inverted" : "Straight"),
-    };
-  }
-
-  return {
-    color: getBooleanAxisPatternConfidence(colorBits, "Straight"),
-    range: getBooleanAxisPatternConfidence(rangeBits, "Straight"),
-    parity: getBooleanAxisPatternConfidence(parityBits, "Straight"),
-  };
-}
-
-function getEngineConfidenceFromAxes(axisConfidence: { color: number; range: number; parity: number }) {
-  return Math.round((axisConfidence.color + axisConfidence.range + axisConfidence.parity) / 3);
-}
-
 function markovForecast(history: Step[]) {
   if (history.length < 6) {
     return {
@@ -2675,7 +2054,7 @@ function markovForecast(history: Step[]) {
 
 
 
-type PulseEngineScope = "Pulse Only" | "BB Straight" | "BB Inverted" | "Markov" | "Random";
+type PulseEngineScope = "Pulse Only" | "Straight" | "Inverted" | "Markov" | "Random";
 
 type EngineAxisStreams = {
   colorBits: (0 | 1)[];
@@ -2702,7 +2081,7 @@ function getPureEngineAxisBits(history: Step[], scope: PulseEngineScope) {
     getInvertedNextBit(parityBits),
   ];
 
-  if (scope === "BB Straight") {
+  if (scope === "Straight") {
     return {
       primaryBits: straightBits,
       secondaryBits: invertedBits,
@@ -2711,7 +2090,7 @@ function getPureEngineAxisBits(history: Step[], scope: PulseEngineScope) {
     };
   }
 
-  if (scope === "BB Inverted") {
+  if (scope === "Inverted") {
     // IMPORTANT: Pulse + Inverted must use the SAME engine output as Inverted-only.
     // Inverted-only does not start globally inverted; it starts from the BB Straight lock
     // and only converts individual axes when the Inverted engine's DPI rule is triggered.
@@ -2779,43 +2158,6 @@ function getEnginePredictionGroupForPrior(prior: Step[], scope: PulseEngineScope
   if (scope === "Pulse Only") return null;
   if (scope === "Markov" && prior.length < 6) return null;
   return getPureEngineAxisBits(prior, scope).primaryGroup;
-}
-
-function getEngineAxisStreams(history: Step[], scope: PulseEngineScope): EngineAxisStreams {
-  if (scope === "Pulse Only") {
-    const bitRows = groupSeries(history).map(groupToBits);
-    return {
-      colorBits: bitRows.map((b) => b[0]),
-      rangeBits: bitRows.map((b) => b[1]),
-      parityBits: bitRows.map((b) => b[2]),
-      engineGroups: groupSeries(history),
-    };
-  }
-
-  const engineGroups: GroupKey[] = [];
-
-  for (let i = 0; i < history.length; i += 1) {
-    const prior = history.slice(0, i);
-    const group = getEnginePredictionGroupForPrior(prior, scope);
-    if (group) engineGroups.push(group);
-  }
-
-  const bitRows = engineGroups.map(groupToBits);
-
-  return {
-    colorBits: bitRows.map((b) => b[0]),
-    rangeBits: bitRows.map((b) => b[1]),
-    parityBits: bitRows.map((b) => b[2]),
-    engineGroups,
-  };
-}
-
-function getPulseEngineScope(bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, randomEnabled = false): PulseEngineScope {
-  if (randomEnabled) return "Random";
-  if (markovEnabled) return "Markov";
-  if (bbStraightEnabled && bbInvertedEnabled) return "BB Inverted";
-  if (bbStraightEnabled) return "BB Straight";
-  return "Pulse Only";
 }
 
 function flipAxisBit(bit: 0 | 1): 0 | 1 {
@@ -3087,562 +2429,6 @@ function getSpreadPulseAxisSideMetrics(history: Step[]) {
   };
 }
 
-function getPulseForecastFromEngineScope(history: Step[], scope: PulseEngineScope) {
-  // DIRECTIONAL SPREAD PULSE CORE
-  // Pulse prediction no longer comes from Historical Replay Evolution Lab.
-  // It now compares both sides of each dimension:
-  // Black spread = Black confidence - |DPI|
-  // Red spread   = Red confidence - |DPI|
-  // Higher spread wins. Ties select Red / Low / Odd.
-  void scope;
-
-  if (history.length < 4) {
-    return {
-      group: null as GroupKey | null,
-      numbers: [] as SpinValue[],
-      confidence: 0,
-      tier: "No Prediction",
-      reason: "Directional Spread Pulse waiting for 4-spin memory.",
-      sourceOfTruth: "Directional Spread Engine Governor",
-      dimensionTDA: {
-        min: DEFAULT_DIMENSION_GATE_MIN,
-        passed: false,
-        fullPass: false,
-        compressed: false,
-        mode: "OBSERVE" as AdaptiveTDAMode,
-        modeLabel: "HOLD",
-        activeAxes: [] as AxisKey[],
-        adaptiveNumbers: [] as SpinValue[],
-        color: 0,
-        range: 0,
-        parity: 0,
-        failed: ["Color", "Range", "Parity"],
-      },
-      replayDiagnostics: null,
-      pulseDiagnostics: null,
-      pulseGate: { allow: false, driftStatus: "Warming", executionCore: "Directional Spread Confidence-DPI Core" },
-    };
-  }
-
-  const metrics = getSpreadPulseAxisSideMetrics(history);
-  const axisDpi = metrics.axisDpi;
-  const priorAxisDpi = history.length ? getAxisBbDpiValues(history.slice(0, -1), false) : axisDpi;
-  const SPREAD_GOVERNOR_OVERRIDE_GAP = 10;
-
-  const engineGroup = getEnginePredictionGroupForPrior(history, scope);
-  const fallbackSpreadBits: [0 | 1, 0 | 1, 0 | 1] = [
-    metrics.color.selectedBit,
-    metrics.range.selectedBit,
-    metrics.parity.selectedBit,
-  ];
-  const engineBits: [0 | 1, 0 | 1, 0 | 1] = engineGroup
-    ? groupToBits(engineGroup)
-    : fallbackSpreadBits;
-
-  const governAxis = (axisMetric: any, engineBit: 0 | 1) => {
-    const engineSpread = engineBit === 0 ? axisMetric.spread.zero : axisMetric.spread.one;
-    const oppositeSpread = engineBit === 0 ? axisMetric.spread.one : axisMetric.spread.zero;
-    const spreadWinnerBit = axisMetric.spread.zero > axisMetric.spread.one ? 0 : 1;
-    const overrideGap = oppositeSpread - engineSpread;
-
-    // OPTION B RESTORE:
-    // The selected engine must remain the prediction source.
-    // Directional Spread is now a governor/diagnostic layer for tier, gap strength,
-    // zero-gap observe, and spread warnings. It must not replace Straight,
-    // Inverted, or Markov with the same Pulse-only group.
-    const shouldOverride = scope === "Pulse Only";
-    const selectedBit = (shouldOverride ? spreadWinnerBit : engineBit) as 0 | 1;
-    const selectedSpread = selectedBit === 0 ? axisMetric.spread.zero : axisMetric.spread.one;
-    const selectedConfidence = selectedBit === 0 ? axisMetric.confidence.zero : axisMetric.confidence.one;
-    return {
-      ...axisMetric,
-      engineBit,
-      engineSide: getAxisSideLabel(axisMetric.axis, engineBit),
-      engineSpread,
-      oppositeSpread,
-      overrideGap,
-      spreadWinnerBit: spreadWinnerBit as 0 | 1,
-      spreadWinnerSide: getAxisSideLabel(axisMetric.axis, spreadWinnerBit as 0 | 1),
-      governorAction: shouldOverride && selectedBit !== engineBit ? "ADJUST" : "KEEP",
-      selectedBit,
-      selectedSpread,
-      selectedConfidence,
-      signal: getAxisSideLabel(axisMetric.axis, selectedBit),
-    };
-  };
-
-  const governedColor = governAxis(metrics.color, engineBits[0]);
-  const governedRange = governAxis(metrics.range, engineBits[1]);
-  const governedParity = governAxis(metrics.parity, engineBits[2]);
-
-  const finalBits: [0 | 1, 0 | 1, 0 | 1] = [
-    governedColor.selectedBit,
-    governedRange.selectedBit,
-    governedParity.selectedBit,
-  ];
-
-  const bestGroup = bitsToGroup(finalBits[0], finalBits[1], finalBits[2]);
-  const confidence = Math.round((governedColor.selectedSpread + governedRange.selectedSpread + governedParity.selectedSpread) / 3);
-  const gapValues = [governedColor, governedRange, governedParity].map((axis: any) =>
-    Math.abs((axis?.spread?.zero ?? 0) - (axis?.spread?.one ?? 0))
-  );
-  const zeroGapCount = gapValues.filter((gap) => gap === 0).length;
-  const weakGapCount = gapValues.filter((gap) => gap > 0 && gap < 10).length;
-  const strongGapCount = gapValues.filter((gap) => gap >= 34).length;
-  const gapTier =
-    zeroGapCount > 0
-      ? "Hold · No Bet"
-      : strongGapCount >= 2 && weakGapCount === 0
-      ? "Active · High Confidence"
-      : weakGapCount > 0
-      ? "Active · Caution"
-      : "Active · Confirmed";
-
-  const makeSpreadAxis = (
-    axisMetric: any,
-    priorDpiValue: number
-  ) => {
-    const axisName = axisMetric.axis === "color" ? "Color" : axisMetric.axis === "range" ? "Range" : "Parity";
-    const destinationSide = axisMetric.signal;
-    return {
-      axis: axisMetric.axis,
-      predictedBit: axisMetric.engineBit,
-      destinationBit: axisMetric.selectedBit,
-      fromSide: axisMetric.engineSide,
-      toSide: destinationSide,
-      driftPercent: axisMetric.selectedSpread,
-      priorDriftPercent: axisMetric.engineSpread,
-      driftDelta: axisMetric.dpi - priorDpiValue,
-      status: axisMetric.governorAction === "ADJUST" ? "Spread Adjust" : "Engine Keep",
-      action: axisMetric.governorAction,
-      trials: axisMetric.trials,
-      violations: axisMetric.dpiPenalty,
-      windowSize: axisMetric.trials,
-      dpi: axisMetric.dpi,
-      priorDpi: priorDpiValue,
-      pressure: axisMetric.selectedSpread,
-      basePressure: axisMetric.dpiPenalty,
-      trend: axisMetric.dpi < priorDpiValue ? "Falling" : axisMetric.dpi > priorDpiValue ? "Recovering" : "Flat",
-      confidence: axisMetric.selectedConfidence,
-      axisConfidence: axisMetric.selectedConfidence,
-      spread: axisMetric.selectedSpread,
-      sideConfidence: axisMetric.confidence,
-      sideSpread: axisMetric.spread,
-      zeroSide: axisMetric.zeroSide,
-      oneSide: axisMetric.oneSide,
-      engineBit: axisMetric.engineBit,
-      engineSide: axisMetric.engineSide,
-      engineSpread: axisMetric.engineSpread,
-      oppositeSpread: axisMetric.oppositeSpread,
-      overrideGap: axisMetric.overrideGap,
-      overrideThreshold: SPREAD_GOVERNOR_OVERRIDE_GAP,
-      spreadWinnerSide: axisMetric.spreadWinnerSide,
-      signal: axisMetric.signal,
-      label: `${axisName} engine ${axisMetric.engineSide} ${axisMetric.engineSpread} · ${axisMetric.zeroSide} ${axisMetric.confidence.zero}%/${axisMetric.spread.zero} vs ${axisMetric.oneSide} ${axisMetric.confidence.one}%/${axisMetric.spread.one} → ${destinationSide}`,
-    };
-  };
-
-  const axes = [
-    makeSpreadAxis(governedColor, priorAxisDpi.color),
-    makeSpreadAxis(governedRange, priorAxisDpi.range),
-    makeSpreadAxis(governedParity, priorAxisDpi.parity),
-  ];
-
-  const zeroGapAxes = axes
-    .filter((axis: any) =>
-      axis.sideSpread &&
-      typeof axis.sideSpread.zero === "number" &&
-      typeof axis.sideSpread.one === "number" &&
-      Math.abs(axis.sideSpread.zero - axis.sideSpread.one) === 0
-    )
-    .map((axis: any) => axis.axis as AxisKey);
-  const zeroGapActive = zeroGapAxes.length > 0;
-
-  const axisConfidence = {
-    color: metrics.color.selectedConfidence,
-    range: metrics.range.selectedConfidence,
-    parity: metrics.parity.selectedConfidence,
-  };
-
-  const axisSpread = {
-    color: metrics.color.selectedSpread,
-    range: metrics.range.selectedSpread,
-    parity: metrics.parity.selectedSpread,
-  };
-
-  const axisSideConfidence = {
-    color: metrics.color.confidence,
-    range: metrics.range.confidence,
-    parity: metrics.parity.confidence,
-  };
-
-  const axisSideSpread = {
-    color: metrics.color.spread,
-    range: metrics.range.spread,
-    parity: metrics.parity.spread,
-  };
-
-  const spreadCore = {
-    axes,
-    axisDpi,
-    axisConfidence,
-    axisSpread,
-    axisSideConfidence,
-    axisSideSpread,
-    originalBits: engineBits,
-    secondaryBits: fallbackSpreadBits,
-    adjustedBits: finalBits,
-    originalGroup: engineGroup ?? bestGroup,
-    secondaryGroup: bitsToGroup(fallbackSpreadBits[0], fallbackSpreadBits[1], fallbackSpreadBits[2]),
-    adjustedGroup: bestGroup,
-    activeAxes: ["color", "range", "parity"] as AxisKey[],
-    mode: "FULL_3D" as AdaptiveTDAMode,
-    modeLabel: "DIRECTIONAL SPREAD",
-    score: confidence,
-    summary: "Pulse Engine",
-    lockedAxes: [] as AxisKey[],
-    flippedAxes: axes.filter((axis: any) => axis.action === "ADJUST").map((axis: any) => axis.axis as AxisKey),
-    warningAxes: axes.filter((axis: any) => axis.overrideGap > 0 && axis.overrideGap < SPREAD_GOVERNOR_OVERRIDE_GAP).map((axis: any) => axis.axis as AxisKey),
-    zeroGapAxes,
-    zeroGapActive,
-    zeroGapAction: zeroGapActive ? "Observe / No Override when Observe Hold is ON" : "Clear",
-    source: "Directional Spread Engine Governor",
-  };
-
-  const axisRows = [
-    {
-      key: "color" as AxisKey,
-      name: "Color",
-      confidence: metrics.color.selectedConfidence,
-      spread: metrics.color.selectedSpread,
-      stability: getAxisStabilityScore(metrics.bits.colorBits),
-      persistence: getAxisPersistenceScore(metrics.bits.colorBits, finalBits[0]),
-      regime: "Directional Spread Confidence-DPI",
-      survivor: "Pulse Engine",
-      replayAccuracy: metrics.color.selectedConfidence,
-      trust: metrics.color.selectedConfidence,
-      drift: axes[0],
-    },
-    {
-      key: "range" as AxisKey,
-      name: "Range",
-      confidence: metrics.range.selectedConfidence,
-      spread: metrics.range.selectedSpread,
-      stability: getAxisStabilityScore(metrics.bits.rangeBits),
-      persistence: getAxisPersistenceScore(metrics.bits.rangeBits, finalBits[1]),
-      regime: "Directional Spread Confidence-DPI",
-      survivor: "Pulse Engine",
-      replayAccuracy: metrics.range.selectedConfidence,
-      trust: metrics.range.selectedConfidence,
-      drift: axes[1],
-    },
-    {
-      key: "parity" as AxisKey,
-      name: "Parity",
-      confidence: metrics.parity.selectedConfidence,
-      spread: metrics.parity.selectedSpread,
-      stability: getAxisStabilityScore(metrics.bits.parityBits),
-      persistence: getAxisPersistenceScore(metrics.bits.parityBits, finalBits[2]),
-      regime: "Directional Spread Confidence-DPI",
-      survivor: "Pulse Engine",
-      replayAccuracy: metrics.parity.selectedConfidence,
-      trust: metrics.parity.selectedConfidence,
-      drift: axes[2],
-    },
-  ];
-
-  const tier = gapTier;
-
-  const replayDiagnostics = {
-    sourceOfTruth: "Directional Spread Engine Governor",
-    color: {
-      bit: finalBits[0],
-      side: getAxisSideLabel("color", finalBits[0]),
-      regime: "Directional Spread Confidence-DPI",
-      survivor: "Pulse Engine",
-      trust: governedColor.selectedConfidence,
-      replayAccuracy: governedColor.selectedConfidence,
-      confidence: governedColor.selectedConfidence,
-      spread: governedColor.selectedSpread,
-      dpi: axisDpi.color,
-      sideConfidence: metrics.color.confidence,
-      sideSpread: metrics.color.spread,
-    },
-    range: {
-      bit: finalBits[1],
-      side: getAxisSideLabel("range", finalBits[1]),
-      regime: "Directional Spread Confidence-DPI",
-      survivor: "Pulse Engine",
-      trust: governedRange.selectedConfidence,
-      replayAccuracy: governedRange.selectedConfidence,
-      confidence: governedRange.selectedConfidence,
-      spread: governedRange.selectedSpread,
-      dpi: axisDpi.range,
-      sideConfidence: metrics.range.confidence,
-      sideSpread: metrics.range.spread,
-    },
-    parity: {
-      bit: finalBits[2],
-      side: getAxisSideLabel("parity", finalBits[2]),
-      regime: "Directional Spread Confidence-DPI",
-      survivor: "Pulse Engine",
-      trust: governedParity.selectedConfidence,
-      replayAccuracy: governedParity.selectedConfidence,
-      confidence: governedParity.selectedConfidence,
-      spread: governedParity.selectedSpread,
-      dpi: axisDpi.parity,
-      sideConfidence: metrics.parity.confidence,
-      sideSpread: metrics.parity.spread,
-    },
-    activeRegime: "Directional Spread Confidence-DPI",
-    activeSurvivors: "Pulse Engine",
-    survivorDominance: "Pulse Engine",
-    replayAccuracy: confidence,
-    survivorTrust: confidence,
-    labPulseBits: finalBits,
-    driftCore: spreadCore,
-    labGroup: bestGroup,
-    lockedCore: false,
-    engineRuleGroup: engineGroup,
-    pulseRole: "Directional Spread Engine Governor",
-    axisDpi,
-    axisConfidence,
-    axisSpread,
-    axisSideConfidence,
-    axisSideSpread,
-    zeroGapAxes,
-    zeroGapActive,
-  };
-
-  const dimensionTDA = {
-    min: DEFAULT_DIMENSION_GATE_MIN,
-    passed: true,
-    fullPass: true,
-    compressed: false,
-    mode: "FULL_3D" as AdaptiveTDAMode,
-    modeLabel: "DIRECTIONAL SPREAD",
-    activeAxes: ["color", "range", "parity"] as AxisKey[],
-    driftCore: spreadCore,
-    adaptiveNumbers: getAdaptiveDimensionNumbers(bestGroup, ["color", "range", "parity"] as AxisKey[]),
-    color: metrics.color.selectedConfidence,
-    range: metrics.range.selectedConfidence,
-    parity: metrics.parity.selectedConfidence,
-    colorSpread: metrics.color.selectedSpread,
-    rangeSpread: metrics.range.selectedSpread,
-    paritySpread: metrics.parity.selectedSpread,
-    axisSideConfidence,
-    axisSideSpread,
-    zeroGapAxes,
-    zeroGapActive,
-    colorStability: axisRows[0].stability,
-    rangeStability: axisRows[1].stability,
-    parityStability: axisRows[2].stability,
-    colorPersistence: axisRows[0].persistence,
-    rangePersistence: axisRows[1].persistence,
-    parityPersistence: axisRows[2].persistence,
-    persistence: Math.round((axisRows[0].persistence + axisRows[1].persistence + axisRows[2].persistence) / 3),
-    lowestPersistence: Math.min(axisRows[0].persistence, axisRows[1].persistence, axisRows[2].persistence),
-    stability: confidence,
-    migrationRisk: Math.max(0, 100 - confidence),
-    failed: [] as string[],
-  };
-
-  const reason = `Directional Spread Pulse · Color ${metrics.color.zeroSide} ${metrics.color.confidence.zero}-${metrics.color.dpiPenalty}=${metrics.color.spread.zero} / ${metrics.color.oneSide} ${metrics.color.confidence.one}-${metrics.color.dpiPenalty}=${metrics.color.spread.one} · Range ${metrics.range.zeroSide} ${metrics.range.confidence.zero}-${metrics.range.dpiPenalty}=${metrics.range.spread.zero} / ${metrics.range.oneSide} ${metrics.range.confidence.one}-${metrics.range.dpiPenalty}=${metrics.range.spread.one} · Parity ${metrics.parity.zeroSide} ${metrics.parity.confidence.zero}-${metrics.parity.dpiPenalty}=${metrics.parity.spread.zero} / ${metrics.parity.oneSide} ${metrics.parity.confidence.one}-${metrics.parity.dpiPenalty}=${metrics.parity.spread.one}.`;
-
-  return {
-    group: bestGroup as GroupKey,
-    engineRuleGroup: engineGroup,
-    regime: "Directional Spread Engine Governor",
-    leaders: `${scope} + Directional Spread Governor`,
-    numbers: GROUPS[bestGroup as GroupKey],
-    confidence,
-    tier,
-    reason,
-    sourceOfTruth: "Directional Spread Engine Governor",
-    zeroGapAxes,
-    zeroGapActive,
-    zeroGapAction: zeroGapActive ? "Observe / No Override when Observe Hold is ON" : "Clear",
-    dimensionTDA,
-    weakDimensionSubstitution: {
-      active: false,
-      substitutedAxis: null as null | "Color" | "Range" | "Parity",
-      originalBits: engineBits,
-      adjustedBits: finalBits,
-      originalGroup: engineGroup ?? bestGroup,
-      adjustedGroup: bestGroup,
-      penalty: 0,
-      disabled: true,
-      reason: "Disabled because Pulse prediction is governed by Directional Spread over the selected engine.",
-      axisRates: axisConfidence,
-    },
-    replayDiagnostics,
-    pulseDiagnostics: {
-      replay: replayDiagnostics,
-      axisRows,
-      entropy: entropy(groupSeries(history)),
-      migrationRisk: Math.max(0, 100 - confidence),
-      dimensionTDA,
-      driftCore: spreadCore,
-      engineScope: scope,
-      axisDpi,
-      axisConfidence,
-      axisSpread,
-      axisSideConfidence,
-      axisSideSpread,
-    },
-    pulseGate: {
-      allow: true,
-      resyncStatus: spreadCore.summary,
-      driftStatus: spreadCore.summary,
-      familyStatus: "Engine Governor",
-      compressionStatus: spreadCore.modeLabel,
-      labCoreLocked: false,
-      executionCore: "Directional Spread Engine Governor",
-      diagnosticsOnly: false,
-      zeroGapAxes,
-      zeroGapActive,
-      zeroGapAction: zeroGapActive ? "Observe / No Override when Observe Hold is ON" : "Clear",
-      dimensionTDA,
-    },
-  };
-}
-
-function forceDpiDimensionLockOnDecision(history: Step[], scope: PulseEngineScope, decision: any) {
-  // Spread Pulse is already the final source of truth.
-  // Do not re-apply selected-engine DPI lock/flip on top of it.
-  if (decision?.replayDiagnostics?.pulseRole === "Directional Spread Engine Governor" || decision?.sourceOfTruth === "Directional Spread Engine Governor") return decision;
-
-  // FINAL SAFETY OVERRIDE:
-  // This guarantees the visible Final Prediction, execution basket, wheel panel,
-  // and settlement all use the DPI-locked group, not any older Drift/TDA/replay group.
-  if (scope === "Pulse Only") return decision;
-
-  const primaryGroup =
-    getEnginePredictionGroupForPrior(history, scope) ??
-    decision?.engineRuleGroup ??
-    decision?.replayDiagnostics?.engineRuleGroup ??
-    decision?.group ??
-    null;
-
-  if (!primaryGroup) return decision;
-
-  const dpiCore = getAxisDpiLockCore(history, scope, primaryGroup as GroupKey);
-  const finalGroup = dpiCore.adjustedGroup as GroupKey;
-  const colorAxis = dpiCore.axes.find((axis: any) => axis.axis === "color");
-  const rangeAxis = dpiCore.axes.find((axis: any) => axis.axis === "range");
-  const parityAxis = dpiCore.axes.find((axis: any) => axis.axis === "parity");
-
-  const nextDimensionTDA = {
-    ...(decision?.dimensionTDA ?? {}),
-    passed: true,
-    fullPass: true,
-    compressed: false,
-    mode: "FULL_3D" as AdaptiveTDAMode,
-    modeLabel: dpiCore.modeLabel,
-    activeAxes: ["color", "range", "parity"] as AxisKey[],
-    driftCore: dpiCore,
-    adaptiveNumbers: getAdaptiveDimensionNumbers(finalGroup, ["color", "range", "parity"] as AxisKey[]),
-    color: decision?.dimensionTDA?.color ?? decision?.replayDiagnostics?.color?.confidence ?? 0,
-    range: decision?.dimensionTDA?.range ?? decision?.replayDiagnostics?.range?.confidence ?? 0,
-    parity: decision?.dimensionTDA?.parity ?? decision?.replayDiagnostics?.parity?.confidence ?? 0,
-    stability: dpiCore.score,
-    migrationRisk: Math.max(0, 100 - dpiCore.score),
-    failed: [],
-  };
-
-  const nextReplayDiagnostics = {
-    ...(decision?.replayDiagnostics ?? {}),
-    sourceOfTruth: `${scope} Engine Rule + DPI Pressure Flip`,
-    activeRegime: "DPI Pressure Flip",
-    activeSurvivors: scope,
-    survivorDominance: scope,
-    labPulseBits: dpiCore.adjustedBits,
-    driftCore: dpiCore,
-    labGroup: finalGroup,
-    engineRuleGroup: primaryGroup,
-    pulseRole: "DPI Pressure Flip Core",
-    axisDpi: dpiCore.axisDpi,
-    color: {
-      ...(decision?.replayDiagnostics?.color ?? {}),
-      bit: dpiCore.adjustedBits[0],
-      side: getAxisSideLabel("color", dpiCore.adjustedBits[0]),
-    },
-    range: {
-      ...(decision?.replayDiagnostics?.range ?? {}),
-      bit: dpiCore.adjustedBits[1],
-      side: getAxisSideLabel("range", dpiCore.adjustedBits[1]),
-    },
-    parity: {
-      ...(decision?.replayDiagnostics?.parity ?? {}),
-      bit: dpiCore.adjustedBits[2],
-      side: getAxisSideLabel("parity", dpiCore.adjustedBits[2]),
-    },
-  };
-
-  return {
-    ...decision,
-    group: finalGroup,
-    engineRuleGroup: primaryGroup,
-    numbers: GROUPS[finalGroup],
-    sourceOfTruth: `${scope} Engine Rule + DPI Pressure Flip`,
-    reason: `${scope} primary pattern with DPI dimension lock.`,
-    dimensionTDA: nextDimensionTDA,
-    replayDiagnostics: nextReplayDiagnostics,
-    pulseDiagnostics: {
-      ...(decision?.pulseDiagnostics ?? {}),
-      replay: nextReplayDiagnostics,
-      dimensionTDA: nextDimensionTDA,
-      driftCore: dpiCore,
-      engineScope: scope,
-      axisDpi: dpiCore.axisDpi,
-    },
-    pulseGate: {
-      ...(decision?.pulseGate ?? {}),
-      allow: true,
-      resyncStatus: dpiCore.summary,
-      driftStatus: dpiCore.summary,
-      compressionStatus: dpiCore.modeLabel,
-      executionCore: `${scope} Engine Rule + DPI Pressure Flip`,
-      diagnosticsOnly: false,
-      dimensionTDA: nextDimensionTDA,
-    },
-  };
-}
-
-function applyPulseShellGovernance(history: Step[], rawPulse: any) {
-  const pulseLossStreak = getActivePulseLossStreak(history);
-  const e = entropy(groupSeries(history));
-  const lossPressureActive = false;
-  const lossPressurePenalty = 0;
-  const entropyExtreme = false;
-  const entropyPenalty = 0;
-  const finalConfidence = Math.round(rawPulse.confidence - lossPressurePenalty - entropyPenalty);
-  const finalTier =
-    entropyExtreme
-      ? DEFAULT_EXECUTE_OBSERVATION
-        ? "Hold · No Bet"
-        : "Active · Caution"
-      : !DEFAULT_EXECUTE_OBSERVATION && finalConfidence < 50
-      ? "Active · Caution"
-      : getPulseTier(finalConfidence);
-  const reasonParts: string[] = [];
-  if (lossPressureActive) reasonParts.push(`Pulse Loss Pressure -${lossPressurePenalty}`);
-  if (entropyExtreme) reasonParts.push(`Entropy Extreme ${e}%`);
-
-  return {
-    ...rawPulse,
-    confidence: finalConfidence,
-    tier: finalTier,
-    reason: reasonParts.length ? `${reasonParts.join(" · ")}.` : rawPulse.reason,
-    rawConfidence: rawPulse.confidence,
-    pulseLossStreak,
-    lossPressureActive,
-    lossPressurePenalty,
-    entropyExtreme,
-    entropyValue: e,
-    entropyPenalty,
-  };
-}
 function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, randomEnabled = false) {
   const bbMode = randomEnabled ? "Random" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted" : bbStraightEnabled ? "Straight" : "BB Off";
   if (pulseEnabled && bbMode !== "BB Off") return `PULSE + ${bbMode}`;
@@ -3840,191 +2626,6 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
 }
 
 
-function getAxisResyncState(history: Step[]) {
-  const groups = groupSeries(history);
-  const rows = groups.map(groupToBits);
-
-  const axisRows = [
-    { key: "color", label: "Color", values: rows.map((r) => r[0]) },
-    { key: "range", label: "Range", values: rows.map((r) => r[1]) },
-    { key: "parity", label: "Parity", values: rows.map((r) => r[2]) },
-  ];
-
-  const axis = axisRows.map((row) => {
-    const recent = row.values.slice(-8);
-    const prior = row.values.slice(-16, -8);
-
-    const stability = getAxisStabilityScore(row.values);
-    const recentRun = getCurrentBitRun(recent).length;
-    const priorStability = prior.length >= 4 ? getAxisStabilityScore(prior) : stability;
-    const improving = stability >= priorStability || recentRun >= 3;
-    const weak = stability < 45 && recentRun < 3;
-    const strong = stability >= 58 || recentRun >= 4;
-
-    return {
-      ...row,
-      stability,
-      priorStability,
-      improving,
-      weak,
-      strong,
-      recentRun,
-    };
-  });
-
-  const strongCount = axis.filter((a) => a.strong).length;
-  const improvingCount = axis.filter((a) => a.improving).length;
-  const weakCount = axis.filter((a) => a.weak).length;
-
-  const score = Math.max(0, Math.min(100, Math.round(
-    strongCount * 22 +
-    improvingCount * 16 -
-    weakCount * 18 +
-    20
-  )));
-
-  return {
-    axis,
-    strongCount,
-    improvingCount,
-    weakCount,
-    score,
-    status:
-      strongCount >= 2 && improvingCount >= 2 ? "Alignment Forming" :
-      weakCount >= 2 ? "Diverging" :
-      improvingCount >= 2 ? "Stabilizing" :
-      "Mixed",
-  };
-}
-
-function getForecastConsistencyState(history: Step[], decision: any) {
-  if (!decision?.group) {
-    return { score: 0, status: "No Forecast", stableCount: 0 };
-  }
-
-  const lookback = history.slice(-10);
-  const sameForecast = lookback.filter((row) => row.forecastGroup === decision.group || row.predictedGroup === decision.group).length;
-  const stableCount = sameForecast;
-  const score = Math.max(0, Math.min(100, Math.round((sameForecast / Math.max(1, lookback.length || 1)) * 100)));
-
-  return {
-    score: lookback.length < 4 ? 55 : score,
-    status:
-      score >= 65 ? "Consistent" :
-      score >= 40 ? "Mixed" :
-      "Changing",
-    stableCount,
-  };
-}
-
-function getEntropyChaosInfluence(history: Step[]) {
-  const e = entropy(groupSeries(history));
-  const penalty =
-    e >= 85 ? 14 :
-    e >= 75 ? 9 :
-    e >= 65 ? 5 :
-    0;
-
-  return {
-    entropy: e,
-    chaos: e,
-    penalty,
-    status:
-      e >= 85 ? "Extreme" :
-      e >= 75 ? "High" :
-      e >= 65 ? "Elevated" :
-      "Normal",
-  };
-}
-
-
-function getDominantAxisBit(values: (0 | 1)[], window = 8) {
-  const recent = values.slice(-window);
-  if (!recent.length) return null as 0 | 1 | null;
-
-  const ones = recent.filter((v) => v === 1).length;
-  const zeros = recent.length - ones;
-  if (ones === zeros) return null;
-
-  return (ones > zeros ? 1 : 0) as 0 | 1;
-}
-
-function getPulseAxisCorrection(history: Step[], decision: any, resync: any, entropyChaos: any) {
-  if (!decision?.group) {
-    return {
-      group: null as GroupKey | null,
-      numbers: [] as SpinValue[],
-      mode: "None",
-      correctedAxis: null as string | null,
-      originalGroup: null as GroupKey | null,
-      reason: "No forecast group.",
-    };
-  }
-
-  const originalBits = groupToBits(decision.group);
-  const correctedBits = [...originalBits] as [0 | 1, 0 | 1, 0 | 1];
-
-  const weakAxes = resync.axis.filter((a: any) => a.weak);
-  const strongAxes = resync.axis.filter((a: any) => a.strong || a.improving);
-
-  // Tool 1: Single-Axis Correction
-  // If exactly one axis is weak while the other two are strong/improving,
-  // correct only that weak dimension. This is not global inversion.
-  if (weakAxes.length === 1 && strongAxes.length >= 2) {
-    const weak = weakAxes[0];
-    const axisIndex = weak.key === "color" ? 0 : weak.key === "range" ? 1 : 2;
-    correctedBits[axisIndex] = (correctedBits[axisIndex] === 0 ? 1 : 0) as 0 | 1;
-
-    const correctedGroup = bitsToGroup(correctedBits[0], correctedBits[1], correctedBits[2]);
-
-    return {
-      group: correctedGroup,
-      numbers: GROUPS[correctedGroup],
-      mode: "Single-Axis Correction",
-      correctedAxis: weak.label,
-      originalGroup: decision.group,
-      reason: `${weak.label} weak while other dimensions are stabilizing; flipped ${weak.label} only.`,
-    };
-  }
-
-  // Tool 2: Chaos State
-  // When entropy/chaos is elevated, hold the dominant side of the weakest axis
-  // instead of forcing a full no-bet. This only adjusts one dimension.
-  if (entropyChaos.status === "High" || entropyChaos.status === "Extreme" || entropyChaos.status === "Elevated") {
-    const weakest = [...resync.axis].sort((a: any, b: any) => a.stability - b.stability)[0];
-
-    if (weakest) {
-      const axisIndex = weakest.key === "color" ? 0 : weakest.key === "range" ? 1 : 2;
-      const heldBit = getDominantAxisBit(weakest.values, 8);
-
-      if (heldBit !== null && heldBit !== correctedBits[axisIndex]) {
-        correctedBits[axisIndex] = heldBit;
-
-        const correctedGroup = bitsToGroup(correctedBits[0], correctedBits[1], correctedBits[2]);
-
-        return {
-          group: correctedGroup,
-          numbers: GROUPS[correctedGroup],
-          mode: "Chaos State",
-          correctedAxis: weakest.label,
-          originalGroup: decision.group,
-          reason: `${entropyChaos.status} entropy; holding dominant ${weakest.label} side until environment normalizes.`,
-        };
-      }
-    }
-  }
-
-  return {
-    group: decision.group as GroupKey,
-    numbers: GROUPS[decision.group as GroupKey],
-    mode: "None",
-    correctedAxis: null as string | null,
-    originalGroup: decision.group as GroupKey,
-    reason: "No axis correction required.",
-  };
-}
-
-
 function getAxisTransitionAcceleration(history: Step[]) {
   const groups = groupSeries(history);
   const rows = groups.map(groupToBits);
@@ -4107,26 +2708,12 @@ function getAxisDriftVelocity(history: Step[]) {
   };
 }
 
-function getTransitionRiskFromScore(score: number) {
-  if (score >= 75) return "Extreme";
-  if (score >= 55) return "High";
-  if (score >= 35) return "Medium";
-  return "Low";
-}
-
-function getTransitionEvidenceStrength(samples: number, riskScore: number) {
-  if (samples >= 24 && riskScore >= 55) return "Strong";
-  if (samples >= 16 && riskScore >= 35) return "Moderate";
-  if (samples >= 8) return "Developing";
-  return "Warming";
-}
-
 function getTransitionIntelligenceRead(history: Step[], decision: any) {
   // TRANSITION INTELLIGENCE CORE
   // This is advisory/environment intelligence only.
   // It does not pick BHE/RLO/etc. and it does not override BB Straight,
   // BB Inverted, Markov, Gap Structure, or the Family-first execution router.
-  // Pulse still selects dimensions first; Transition Intelligence only reads
+  // Pulse still selects dimensions first; Pattern Intelligence only reads
   // whether Color / Range / Parity behavior is beginning to rotate.
   const transition = getAxisTransitionAcceleration(history);
   const drift = getAxisDriftVelocity(history);
@@ -4201,7 +2788,7 @@ function getTransitionIntelligenceRead(history: Step[], decision: any) {
 
   return {
     active: true,
-    source: "Transition Intelligence",
+    source: "Pattern Intelligence",
     structure,
     state,
     expectedNextRegime,
@@ -4221,28 +2808,6 @@ function getTransitionIntelligenceRead(history: Step[], decision: any) {
     strongGapCount,
     diagnosticOnly: true,
     summary: `${state} · ${expectedNextRegime} · ${action}`,
-  };
-}
-
-function applyTransitionIntelligenceToDecision(history: Step[], decision: any) {
-  if (!decision?.group) return decision;
-  const transitionIntelligence = getTransitionIntelligenceRead(history, decision);
-  return {
-    ...decision,
-    pulseDiagnostics: {
-      ...(decision?.pulseDiagnostics ?? {}),
-      transitionIntelligence,
-    },
-    pulseGate: {
-      ...(decision?.pulseGate ?? {}),
-      transitionState: transitionIntelligence.state,
-      transitionRisk: transitionIntelligence.risk,
-      transitionAction: transitionIntelligence.action,
-      transitionExpectedRegime: transitionIntelligence.expectedNextRegime,
-      transitionEvidenceStrength: transitionIntelligence.evidenceStrength,
-      transitionDiagnosticOnly: true,
-    },
-    reason: `${decision.reason ?? ""} · Transition Intelligence: ${transitionIntelligence.summary} · advisory only.`,
   };
 }
 
@@ -4286,227 +2851,6 @@ function getForecastCompression(history: Step[], decision: any) {
     compression,
     score: compression ? 42 : 68,
     status: compression ? "Dimensional Compression Active" : "Diverse",
-  };
-}
-
-function getStructuralPulseRead(history: Step[], decision: any, resync: any, consistency: any, entropyChaos: any) {
-  const transition = getAxisTransitionAcceleration(history);
-  const drift = getAxisDriftVelocity(history);
-  const family = getForecastFamilySaturation(history, decision);
-  const compression = getForecastCompression(history, decision);
-
-  const entropyPenalty =
-    entropyChaos.status === "Extreme" ? 8 :
-    entropyChaos.status === "High" ? 5 :
-    entropyChaos.status === "Elevated" ? 2 :
-    0;
-
-  const score = Math.max(0, Math.min(100, Math.round(
-    resync.score * 0.25 +
-    consistency.score * 0.18 +
-    transition.score * 0.20 +
-    drift.score * 0.17 +
-    family.score * 0.12 +
-    compression.score * 0.08 -
-    entropyPenalty
-  )));
-
-  const directionalAdvisory =
-    transition.status === "Acceleration Risk" ||
-    drift.status === "Drift Breaking" ||
-    (family.status === "Saturated Failure" && compression.status === "Dimensional Compression Active");
-
-  return {
-    transition,
-    drift,
-    family,
-    compression,
-    entropyPenalty,
-    score,
-    directionalAdvisory,
-    status:
-      directionalAdvisory ? "Directional Conflict" :
-      score >= 68 ? "Structure Aligned" :
-      score >= 54 ? "Structure Mixed" :
-      "Structure Weak",
-  };
-}
-
-
-function getDirectionalRebuildEngine(history: Step[], decision: any, resync: any, structural: any, entropyChaos: any) {
-  if (!decision?.group) {
-    return {
-      selectedGroup: null,
-      selectedReason: "No forecast",
-      candidates: [],
-    };
-  }
-
-  const originalBits = groupToBits(decision.group);
-
-  const candidates: [0 | 1, 0 | 1, 0 | 1][] = [
-    originalBits as [0 | 1, 0 | 1, 0 | 1],
-    [originalBits[0], originalBits[1], (originalBits[2] === 0 ? 1 : 0) as 0 | 1],
-    [originalBits[0], (originalBits[1] === 0 ? 1 : 0) as 0 | 1, originalBits[2]],
-    [(originalBits[0] === 0 ? 1 : 0) as 0 | 1, originalBits[1], originalBits[2]],
-  ];
-
-  const scored = candidates.map((bits) => {
-    const group = bitsToGroup(bits[0], bits[1], bits[2]);
-
-    const family = getForecastFamily(group);
-    const recent = history.slice(-10);
-
-    const familyLosses = recent.filter(
-      (r) =>
-        getForecastFamily(r.forecastGroup ?? r.predictedGroup ?? null) === family &&
-        String(r.result).toLowerCase() === "loss"
-    ).length;
-
-    const parityBonus =
-      bits[2] === originalBits[2] ? 0 : 8;
-
-    const rangeBonus =
-      bits[1] === originalBits[1] ? 0 : 6;
-
-    const colorBonus =
-      bits[0] === originalBits[0] ? 0 : 5;
-
-    const score =
-      structural.score +
-      parityBonus +
-      rangeBonus +
-      colorBonus -
-      familyLosses * 10 -
-      entropyChaos.penalty;
-
-    return {
-      group,
-      score,
-      familyLosses,
-      changedParity: bits[2] !== originalBits[2],
-      changedRange: bits[1] !== originalBits[1],
-      changedColor: bits[0] !== originalBits[0],
-    };
-  });
-
-  scored.sort((a,b) => b.score - a.score);
-
-  const best = scored[0];
-
-  return {
-    selectedGroup: best.group,
-    selectedReason:
-      best.changedParity ? "Parity rebuilt" :
-      best.changedRange ? "Range rebuilt" :
-      best.changedColor ? "Color rebuilt" :
-      "Original structure retained",
-    candidates: scored,
-  };
-}
-
-function applyPulseEnhancerToDecision(decision: any, pulse: any, pulseEnabled: boolean, history: Step[] = []) {
-  if (!pulseEnabled || !decision?.group || decision?.source === "NONE") return decision;
-
-  const resync = getAxisResyncState(history);
-  const consistency = getForecastConsistencyState(history, decision);
-  const entropyChaos = getEntropyChaosInfluence(history);
-
-  const structural = getStructuralPulseRead(
-    history,
-    decision,
-    resync,
-    consistency,
-    entropyChaos
-  );
-
-  // Keep and strengthen directional tools:
-  // - Single-Axis Correction
-  // - Chaos State
-  // - Alignment Detection
-  // - Axis Drift
-  // - Transition Acceleration
-  // - Forecast Family Saturation
-  // - Forecast Compression
-  // - Directional Rebuild Engine
-
-  const correction = getPulseAxisCorrection(
-    history,
-    decision,
-    resync,
-    entropyChaos
-  );
-
-  const rebuild = getDirectionalRebuildEngine(
-    history,
-    correction.group ? { ...decision, group: correction.group } : decision,
-    resync,
-    structural,
-    entropyChaos
-  );
-
-  const finalGroup = correction.group ?? decision.group;
-  const transitionIntelligence = getTransitionIntelligenceRead(history, { ...decision, group: finalGroup });
-
-  const directionalScore = Math.max(
-    0,
-    Math.min(
-      100,
-      Math.round(
-        structural.score +
-        (rebuild.selectedGroup !== decision.group ? 8 : 0) +
-        (resync.improvingCount || 0) * 4 -
-        (resync.weakCount || 0) * 3
-      )
-    )
-  );
-
-  const tier =
-    directionalScore >= 76
-      ? "Active · High Confidence"
-      : directionalScore >= 60
-      ? "Active · Confirmed"
-      : directionalScore >= 48
-      ? "Active · Caution"
-      : "Hold · No Bet";
-
-  return {
-    ...decision,
-    originalGroup: decision.group,
-    forecastGroup: decision.group,
-    group: finalGroup,
-    numbers: GROUPS[finalGroup],
-    confidence: directionalScore,
-    tier,
-    pulseEnhanced: true,
-    pulseDiagnostics: {
-      resync,
-      consistency,
-      entropyChaos,
-      structural,
-      correction,
-      rebuild: { ...rebuild, diagnosticOnly: true, selectedGroupIgnored: true },
-      transitionIntelligence,
-    },
-    pulseGate: {
-      allow: true,
-      correctionMode: correction.mode,
-      rebuildReason: `${rebuild.selectedReason} · Diagnostic only`,
-      transitionStatus: transitionIntelligence.state,
-      transitionRisk: transitionIntelligence.risk,
-      transitionAction: transitionIntelligence.action,
-      driftStatus: structural.drift.status,
-      familyStatus: structural.family.status,
-      compressionStatus: structural.compression.status,
-    },
-    reason:
-      `${decision.reason ?? ""} · ` +
-      `PULSE Directional Layer · ` +
-      `${rebuild.selectedReason} · ` +
-      `${structural.transition.status} · ` +
-      `${structural.drift.status} · ` +
-      `${structural.family.status} · ` +
-      `${structural.compression.status}.`,
   };
 }
 
@@ -4574,7 +2918,7 @@ function normalizeObserveTierForSettings(decision: any, settings: TierExecutionS
         transitionExpectedRegime: transitionIntelligence?.expectedNextRegime,
         transitionHighRiskObserveHold: true,
       },
-      reason: `${decision?.reason ?? "Transition Intelligence Governor."} · Observe Hold ON: TI Risk High/Extreme (${transitionIntelligence?.riskScore ?? "—"}) forces Observe / No Bet.`,
+      reason: `${decision?.reason ?? "Pattern Intelligence Governor."} · Observe Hold ON: TI Risk High/Extreme (${transitionIntelligence?.riskScore ?? "—"}) forces Observe / No Bet.`,
     };
   }
 
@@ -5544,7 +3888,7 @@ export default function Page() {
   const [autoSpins, setAutoSpins] = useState(DEFAULT_AUTO_SPINS);
   const [strategy, setStrategy] = useState<Strategy>(DEFAULT_STRATEGY);
   const [pulseEnabled, setPulseEnabled] = useState(false);
-  const [bbMode, setBbMode] = useState<BBMode>("BB Straight");
+  const [bbMode, setBbMode] = useState<BBMode>("Straight");
   const [bbStraightEnabled, setBbStraightEnabled] = useState(false);
   const [bbInvertedEnabled, setBbInvertedEnabled] = useState(false);
   const [markovEnabled, setMarkovEnabled] = useState(false);
@@ -7138,8 +5482,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       row.pulseDiagnostics?.engineScope ??
       row.pulseDiagnostics?.replay?.engineScope;
 
-    if (scope === "BB Straight") return "Straight";
-    if (scope === "BB Inverted") return "Inverted";
+    if (scope === "Straight") return "Straight";
+    if (scope === "Inverted") return "Inverted";
     if (scope === "Markov") return "Markov";
 
     const note = row.note || "";
@@ -7988,7 +6332,181 @@ const StreakAnalyticsPanel = () => {
     <div id="report-comparison"><ComparisonTable title="Report Comparison" /></div>
     <div id="report-session-log"><RecentLog /></div>
   </section>;
-  const Sessions = () => <section style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}><Panel title="Saved Sessions"><div style={{ display: "grid", gap: 10 }}><Button onClick={() => setShowSave(true)} variant="secondary">Save Current Session</Button><Select value={selectedSession} onChange={(e: any) => { const name = e.target.value; setSelectedSession(name); if (name) recoverSession(name); }} options={["", ...savedSessions.map(s => s.name)]} /><div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8 }}><Button onClick={deleteSession} variant="danger" disabled={!selectedSession}>Delete</Button><Button variant="secondary" onClick={() => window.print()} disabled={!history.length}>Print/PDF</Button><Button variant="secondary" onClick={downloadCSV} disabled={!history.length}>Session CSV</Button><Button variant="secondary" onClick={downloadRouterAuditCSV} disabled={!history.length}>Spin Audit CSV</Button><Button variant="secondary" onClick={downloadLossInvestigationCSV} disabled={!history.length}>Loss Analysis CSV</Button></div></div></Panel><Panel title="Merge Sessions"><select multiple value={selectedMerge} onChange={(e: any) => setSelectedMerge(Array.from(e.target.selectedOptions).map((o: any) => o.value))} style={{ width: "100%", minHeight: 180, padding: 10, borderRadius: 10, background: t.input, color: t.text, border: `1px solid ${t.borderStrong}` }}>{savedSessions.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}</select><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}><Button onClick={mergeSelected} disabled={!selectedMerge.length}>Merge Selected</Button><Button variant="secondary" onClick={() => setSelectedMerge([])} disabled={!selectedMerge.length}>Clear</Button></div></Panel><div style={{ gridColumn: "1 / -1" }}><RecentLog /></div><div style={{ gridColumn: "1 / -1" }}><LossInvestigationPanel /></div></section>;
+  const Sessions = () => {
+    // ── Compute metrics for each saved session ──────────────────────────────
+    const sessionMetrics = savedSessions.map(s => {
+      const h = s.history;
+      const active = h.filter(r => r.result === "win" || r.result === "loss");
+      const wins = active.filter(r => r.result === "win").length;
+      const losses = active.filter(r => r.result === "loss").length;
+      const winRate = active.length ? Math.round(wins / active.length * 100) : 0;
+      const endBankroll = h.length ? h[h.length-1].bankroll : s.startingBankroll;
+      const net = endBankroll - s.startingBankroll;
+      const roi = s.startingBankroll ? Math.round(net / s.startingBankroll * 100) : 0;
+      // Profit factor = gross wins / gross losses
+      const grossWins = h.filter(r => r.net > 0).reduce((sum, r) => sum + r.net, 0);
+      const grossLosses = Math.abs(h.filter(r => r.net < 0).reduce((sum, r) => sum + r.net, 0));
+      const pf = grossLosses > 0 ? Math.round(grossWins / grossLosses * 100) / 100 : grossWins > 0 ? 999 : 0;
+      // Best/worst streak
+      let curStreak = 0; let bestStreak = 0; let worstStreak = 0; let curLoss = 0;
+      for (const r of active) {
+        if (r.result === "win") { curStreak++; bestStreak = Math.max(bestStreak, curStreak); curLoss = 0; }
+        else { curLoss++; worstStreak = Math.max(worstStreak, curLoss); curStreak = 0; }
+      }
+      // Dominant Pulse engine
+      const engineCounts: Record<string,number> = {};
+      for (const r of h) {
+        const eng = (r as any).pulseSelectedEngine;
+        if (eng) engineCounts[eng] = (engineCounts[eng] ?? 0) + 1;
+      }
+      const dominantEngine = Object.entries(engineCounts).sort((a,b)=>b[1]-a[1])[0]?.[0] ?? "—";
+      const date = s.createdAt ? new Date(s.createdAt).toLocaleDateString() : "—";
+      return { name: s.name, date, spins: h.length, active: active.length, wins, losses, winRate, endBankroll, net, roi, pf, bestStreak, worstStreak, dominantEngine, startingBankroll: s.startingBankroll };
+    }).sort((a,b) => b.name.localeCompare(a.name));
+
+    // ── Cross-session totals ────────────────────────────────────────────────
+    const wonSessions = sessionMetrics.filter(s => s.net > 0).length;
+    const lostSessions = sessionMetrics.filter(s => s.net < 0).length;
+    const totalNet = sessionMetrics.reduce((sum, s) => sum + s.net, 0);
+    const avgROI = sessionMetrics.length ? Math.round(sessionMetrics.reduce((sum,s) => sum+s.roi, 0) / sessionMetrics.length) : 0;
+    const avgWinRate = sessionMetrics.length ? Math.round(sessionMetrics.reduce((sum,s) => sum+s.winRate, 0) / sessionMetrics.length) : 0;
+    const allPFs = sessionMetrics.filter(s => s.pf > 0 && s.pf < 999);
+    const avgPF = allPFs.length ? Math.round(allPFs.reduce((sum,s) => sum+s.pf, 0) / allPFs.length * 100) / 100 : 0;
+    const bestSession = sessionMetrics.reduce((best, s) => s.roi > (best?.roi ?? -999) ? s : best, sessionMetrics[0]);
+    const worstSession = sessionMetrics.reduce((worst, s) => s.roi < (worst?.roi ?? 999) ? s : worst, sessionMetrics[0]);
+
+    const engineColors: Record<string,string> = { Straight: COLORS.blue, Inverted: COLORS.amber, Markov: COLORS.green, Random: COLORS.cyan };
+
+    return (
+      <section style={{ display: "grid", gap: 14 }}>
+
+        {/* ── Cross-session summary ── */}
+        {sessionMetrics.length > 0 && (
+          <Panel title="Overall Performance">
+            {/* Top metrics row */}
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8, marginBottom: 14 }}>
+              {[
+                { label: "Sessions", value: sessionMetrics.length, color: t.text },
+                { label: "Won / Lost", value: `${wonSessions} / ${lostSessions}`, color: wonSessions > lostSessions ? COLORS.green : COLORS.red },
+                { label: "Total Net", value: totalNet >= 0 ? `+${totalNet.toLocaleString()}` : totalNet.toLocaleString(), color: totalNet >= 0 ? COLORS.green : COLORS.red },
+                { label: "Avg ROI", value: `${avgROI}%`, color: avgROI >= 0 ? COLORS.green : COLORS.red },
+                { label: "Avg Win Rate", value: `${avgWinRate}%`, color: avgWinRate >= 20 ? COLORS.green : COLORS.amber },
+                { label: "Avg PF", value: avgPF.toFixed(2), color: avgPF >= 1 ? COLORS.green : COLORS.red },
+              ].map(({ label, value, color }) => (
+                <div key={label} style={{ border: `1px solid ${t.border}`, borderRadius: 10, padding: "10px 12px", background: t.panel2, textAlign: "center" }}>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>{label}</div>
+                  <div style={{ fontSize: 18, fontWeight: 950, color, marginTop: 4 }}>{value}</div>
+                </div>
+              ))}
+            </div>
+
+            {/* Best / Worst session */}
+            {bestSession && worstSession && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 14 }}>
+                <div style={{ border: `1px solid ${COLORS.green}44`, borderRadius: 10, padding: "10px 12px", background: "rgba(16,185,129,0.06)" }}>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>Best Session</div>
+                  <div style={{ fontSize: 15, fontWeight: 950, color: COLORS.green, marginTop: 4 }}>{bestSession.name}</div>
+                  <div style={{ fontSize: 12, color: t.subtext, marginTop: 2 }}>ROI {bestSession.roi}% · Net +{bestSession.net.toLocaleString()} · PF {bestSession.pf}</div>
+                </div>
+                <div style={{ border: `1px solid ${COLORS.red}44`, borderRadius: 10, padding: "10px 12px", background: "rgba(239,68,68,0.06)" }}>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>Worst Session</div>
+                  <div style={{ fontSize: 15, fontWeight: 950, color: COLORS.red, marginTop: 4 }}>{worstSession.name}</div>
+                  <div style={{ fontSize: 12, color: t.subtext, marginTop: 2 }}>ROI {worstSession.roi}% · Net {worstSession.net.toLocaleString()} · PF {worstSession.pf}</div>
+                </div>
+              </div>
+            )}
+
+            {/* ROI bar chart per session */}
+            <div style={{ marginBottom: 6 }}>
+              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 8 }}>ROI Per Session</div>
+              <div style={{ display: "flex", gap: 4, alignItems: "flex-end", height: 60 }}>
+                {sessionMetrics.slice(-20).map(s => {
+                  const maxAbs = Math.max(...sessionMetrics.map(x => Math.abs(x.roi)), 1);
+                  const h = Math.max(4, Math.round(Math.abs(s.roi) / maxAbs * 56));
+                  const col = s.roi >= 0 ? COLORS.green : COLORS.red;
+                  return (
+                    <div key={s.name} title={`${s.name}: ${s.roi}%`} style={{ flex: 1, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "flex-end", height: 60 }}>
+                      <div style={{ width: "100%", height: h, background: col, borderRadius: 3, opacity: 0.85 }} />
+                    </div>
+                  );
+                })}
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: t.subtext, marginTop: 4 }}>
+                <span>Oldest</span><span>Most Recent</span>
+              </div>
+            </div>
+          </Panel>
+        )}
+
+        {/* ── Session history table ── */}
+        {sessionMetrics.length > 0 && (
+          <CollapsiblePanel id="sessionHistoryTable" title="Session History">
+            <div style={{ overflowX: "auto" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${t.border}` }}>
+                    {["Session","Date","Spins","End","Net","ROI","Win%","PF","Best W","Worst L","Engine"].map(h => (
+                      <th key={h} style={{ padding: "6px 8px", textAlign: h === "Session" ? "left" : "center", color: t.subtext, fontWeight: 700, fontSize: 10, textTransform: "uppercase", letterSpacing: 0.6, whiteSpace: "nowrap" }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {sessionMetrics.map((s, i) => (
+                    <tr key={s.name} style={{ borderBottom: `1px solid ${t.border}`, background: i % 2 === 0 ? "transparent" : `${t.panel2}` }}>
+                      <td style={{ padding: "8px 8px", fontWeight: 900, color: t.text, whiteSpace: "nowrap" }}>{s.name}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: t.subtext }}>{s.date}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: t.text }}>{s.spins}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: t.text, fontWeight: 900 }}>{s.endBankroll.toLocaleString()}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", fontWeight: 950, color: s.net >= 0 ? COLORS.green : COLORS.red }}>{s.net >= 0 ? `+${s.net}` : s.net}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", fontWeight: 950, color: s.roi >= 0 ? COLORS.green : COLORS.red }}>{s.roi}%</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: s.winRate >= 20 ? COLORS.green : COLORS.amber }}>{s.winRate}%</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: s.pf >= 1 ? COLORS.green : COLORS.red, fontWeight: 900 }}>{s.pf === 999 ? "∞" : s.pf.toFixed(2)}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: COLORS.green }}>{s.bestStreak}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: COLORS.red }}>{s.worstStreak}</td>
+                      <td style={{ padding: "8px 8px", textAlign: "center", color: engineColors[s.dominantEngine] ?? t.subtext, fontWeight: 900 }}>{s.dominantEngine}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </CollapsiblePanel>
+        )}
+
+        {/* ── Session management ── */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <Panel title="Save & Load Sessions">
+            <div style={{ display: "grid", gap: 10 }}>
+              <Button onClick={() => setShowSave(true)} variant="secondary">Save Current Session</Button>
+              <Select value={selectedSession} onChange={(e: any) => { const name = e.target.value; setSelectedSession(name); if (name) recoverSession(name); }} options={["", ...savedSessions.map(s => s.name)]} />
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
+                <Button onClick={deleteSession} variant="danger" disabled={!selectedSession}>Delete</Button>
+                <Button variant="secondary" onClick={() => window.print()} disabled={!history.length}>Print/PDF</Button>
+              </div>
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+                <Button variant="secondary" onClick={downloadCSV} disabled={!history.length}>Session CSV</Button>
+                <Button variant="secondary" onClick={downloadRouterAuditCSV} disabled={!history.length}>Spin Audit CSV</Button>
+                <Button variant="secondary" onClick={downloadLossInvestigationCSV} disabled={!history.length}>Loss Analysis CSV</Button>
+              </div>
+            </div>
+          </Panel>
+          <Panel title="Merge Sessions">
+            <select multiple value={selectedMerge} onChange={(e: any) => setSelectedMerge(Array.from(e.target.selectedOptions).map((o: any) => o.value))} style={{ width: "100%", minHeight: 140, padding: 10, borderRadius: 10, background: t.input, color: t.text, border: `1px solid ${t.borderStrong}` }}>
+              {savedSessions.map(s => <option key={s.name} value={s.name}>{s.name}</option>)}
+            </select>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginTop: 10 }}>
+              <Button onClick={mergeSelected} disabled={!selectedMerge.length}>Merge Selected</Button>
+              <Button variant="secondary" onClick={() => setSelectedMerge([])} disabled={!selectedMerge.length}>Clear</Button>
+            </div>
+          </Panel>
+        </div>
+
+        {/* ── Current session log and loss analysis ── */}
+        <RecentLog />
+        <LossInvestigationPanel />
+
+      </section>
+    );
+  };
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Arial, sans-serif", display: "grid", gridTemplateColumns: "82px 1fr" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
@@ -8008,7 +6526,7 @@ const StreakAnalyticsPanel = () => {
           </div>
           <button onClick={() => setShowGlossary(false)} style={{ border: `1px solid ${t.borderStrong}`, background: t.input, borderRadius: 10, width: 42, height: 38, fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.text, flexShrink: 0, lineHeight: 1 }}>×</button>
         </div>
-        {[["Auto Simulation Optimization", "Performance pass that batches Run Auto results, prevents repeated replay loops during simulation, memoizes shadow comparisons, and calculates recent accuracy from stored forecast rows."], ["Bankroll", "Current simulated bankroll after settled spins."], ["Base Unit / Number", "The starting wager amount per active number before strategy scaling and limit enforcement."], ["Adaptive TDA", " upgrade that allows full 3D execution when all dimensions pass, or controlled 2D compression when two dimensions pass and one dimension is weakening."], ["Active · Confirmed", "Gap-structure tier used when separation is usable but not strong enough for Strong and not weak enough for Weak."], ["DPI", "Directional Pressure Index. A pressure-state counter used directly by Spread Pulse as the pressure subtraction in Confidence - |DPI|."], ["DPI Zone", "Summary of pressure level: Neutral, Pressure, or Transition."], ["Engine Shadow Comparison", "Replays PULSE, Straight, Inverted, Markov, and Random against the same spin history so their results can be compared even when they are not live."], ["Entropy Regime Weighting", "Controlled PULSE modifier that slightly adjusts predictor weights based on chaos level. High entropy can favor reversal/recency models, but it cannot dominate the forecast or create Strong by itself."], ["ESI", "Engine Strength Index. A composite Live Engine Rankings score that combines win rate, ROI adjustment, and active engine status to estimate current engine quality."], ["Execution Accuracy", "Performance of actual bettable signals only. Advisory-only tiers are recorded as pushes/no-bets and do not affect bankroll, DPI, ROI, or win/loss totals."], ["Execution Compression", "PULSE-only execution behavior that widens from the strict 3D group to a 2D straight-up basket using current DPM evidence: selected side spread, side-to-side gap, and DPI pressure. It keeps the two strongest live dimensions and relaxes the weakest live dimension."], ["Execution Mode", "Controls whether the system uses Stream Direct, Neighbor Expansion, Edge Expansion, or Hybrid Coverage."], ["Edge Expansion", "Adds only the one-number edge map to the core stream forecast: BHE+9, RHE+2, BHO+1, RHO+10, RLE+2, BLO+1. It does not include Neighbor Expansion numbers."], ["Flat", "Uses the base unit per active number whenever a signal qualifies."], ["Hybrid Coverage", "Combines core stream numbers with both Neighbor Expansion and Edge Expansion coverage."], ["Inverted Mode", "Uses the mirrored Boolean structure only when the DPI threshold is reached; DPI calculation itself remains unchanged."], ["Limit Hit", "Occurs when the requested unit size is reduced by the table limit or per-number limit."], ["Martingale 3", "Doubles the unit after each 3-loss block. More aggressive than Martingale 5 and Martingale 7, especially with expanded number baskets."], ["Martingale 5", "Doubles the unit after each 5-loss block. Medium progression between Martingale 3 and Martingale 7."], ["Post-10 Win Recovery", "Flat betting until a 10+ loss streak arms recovery. The first win after that streak stays flat; the following spin enters Martingale-5 recovery until the next win resets to flat."], ["Martingale 7", "Doubles the unit after each 7-loss block."], ["Neighbor Expansion", "Adds only the PULSE neighbor expansion map to the core stream forecast. It does not include Edge Expansion numbers."], ["Neural Assist", "Diagnostics-only model in the harmonized architecture. It shows recent accuracy, agreement, and entropy context but does not modify live PULSE confidence."], ["Hold · No Bet", "Gap-structure observe state. If Observe Hold is ON, any zero-gap dimension can hold execution as no bet."], ["Per Number Limit", "Maximum straight-up bet allowed on each number. Default is $300 and can be changed in Settings."], ["Persistence Durability", "Legacy TDA diagnostic that checks whether a predicted Color, Range, or Parity alignment has held long enough to trust execution. It remains diagnostic; current Dimension Compression uses DPM spread/gap/DPI evidence instead of persistence."], ["PULSE", "Directional Spread Confidence-DPI engine. It predicts each dimension from Side Spread = Side Confidence - |DPI|. The higher side spread selects Black vs Red, High vs Low, and Even vs Odd. Ties select Red / Low / Odd." ], ["PULSE-Only Expansion", "Additional coverage numbers that are applied only when the active source is PULSE and the execution mode uses Neighbor Expansion or Hybrid Coverage. BB Straight and BB Inverted do not use these added numbers."], ["Saved Control Settings", "Settings option that saves bankroll, base unit, strategy, auto spins, PULSE/BB state, execution mode, table limits, tier execution rules, and appearance for the next login."], ["SIG", "Signals. In Engine Shadow Comparison, SIG is the number of actionable/executed signals produced by that engine during the replay/session."], ["Signal Accuracy", "Forecast accuracy view that can study all PULSE tiers, including advisory-only Directional Observe states."], ["Signal State", "Live decision panel showing the final Directional Spread Core prediction, execution state, and tier."], ["Step Recovery", "Controlled staged recovery: 1x, 2x, 3x, then 4x base by loss depth."], ["Straight Mode", "Runs the locked Straight Boolean table from spin 1."], ["Strategy Comparison", "Replays all strategy models from the same raw outcomes to compare ending bankroll, ROI, drawdown, profit factor, and other metrics."], ["Stream Conflict", "Warning shown when neighbor expansion numbers do not match the core forecast stream group."], ["Stream Direct", "Executes only the core predicted group numbers."], ["Active · High Confidence", "Gap-structure tier: at least two dimensions have strong separation at 34+ and no weak non-zero gap is present."], ["Table Limit", "Maximum total wager allowed across the active execution basket. Default is $10,000 and can be changed in Settings."], ["TDA", ". Structural diagnostic layer only. TDA no longer independently vetoes execution; Consensus is the final execution authority. Persistence remains diagnostic. Current Dimension Compression uses live DPM spread/gap/DPI evidence rather than TDA persistence."], ["Tier Execution Rules", "Settings controls that decide whether Weak and Directional Observe tiers are actually executed or only tracked as advisory forecasts."], ["Active · Caution", "Gap-structure tier used when at least one non-zero dimension gap is weak and the signal is still allowed to execute by settings."], ["Wheel Neighbor Overlay", "Execution layer that adds selected wheel-neighbor numbers without changing the core stream forecast."]].map(([term, def]) => <div key={term} style={{ borderBottom: `1px solid ${t.border}`, padding: "13px 0" }}><div style={{ fontSize: 16, fontWeight: 950 }}>{term}</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4, lineHeight: 1.45 }}>{def}</div></div>)}
+        {[["Auto Simulation Optimization", "Performance pass that batches Run Auto results, prevents repeated replay loops during simulation, memoizes shadow comparisons, and calculates recent accuracy from stored forecast rows."], ["Bankroll", "Current simulated bankroll after settled spins."], ["Base Unit / Number", "The starting wager amount per active number before strategy scaling and limit enforcement."], ["Adaptive TDA", " upgrade that allows full 3D execution when all dimensions pass, or controlled 2D compression when two dimensions pass and one dimension is weakening."], ["Active · Confirmed", "Gap-structure tier used when separation is usable but not strong enough for Strong and not weak enough for Weak."], ["DPI", "Directional Pressure Index. A pressure-state counter used directly by Spread Pulse as the pressure subtraction in Confidence - |DPI|."], ["DPI Zone", "Summary of pressure level: Neutral, Pressure, or Transition."], ["Engine Shadow Comparison", "Replays PULSE, Straight, Inverted, Markov, and Random against the same spin history so their results can be compared even when they are not live."], ["Entropy Regime Weighting", "Controlled PULSE modifier that slightly adjusts predictor weights based on chaos level. High entropy can favor reversal/recency models, but it cannot dominate the forecast or create Strong by itself."], ["ESI", "Engine Strength Index. A composite Live Engine Rankings score that combines win rate, ROI adjustment, and active engine status to estimate current engine quality."], ["Execution Accuracy", "Performance of actual bettable signals only. Advisory-only tiers are recorded as pushes/no-bets and do not affect bankroll, DPI, ROI, or win/loss totals."], ["Execution Compression", "PULSE-only execution behavior that widens from the strict 3D group to a 2D straight-up basket using current DPM evidence: selected side spread, side-to-side gap, and DPI pressure. It keeps the two strongest live dimensions and relaxes the weakest live dimension."], ["Execution Mode", "Controls whether the system uses Stream Direct, Neighbor Expansion, Edge Expansion, or Hybrid Coverage."], ["Edge Expansion", "Adds only the one-number edge map to the core stream forecast: BHE+9, RHE+2, BHO+1, RHO+10, RLE+2, BLO+1. It does not include Neighbor Expansion numbers."], ["Flat", "Uses the base unit per active number whenever a signal qualifies."], ["Hybrid Coverage", "Combines core stream numbers with both Neighbor Expansion and Edge Expansion coverage."], ["Inverted Mode", "Uses the mirrored Boolean structure only when the DPI threshold is reached; DPI calculation itself remains unchanged."], ["Limit Hit", "Occurs when the requested unit size is reduced by the table limit or per-number limit."], ["Martingale 3", "Doubles the unit after each 3-loss block. More aggressive than Martingale 5 and Martingale 7, especially with expanded number baskets."], ["Martingale 5", "Doubles the unit after each 5-loss block. Medium progression between Martingale 3 and Martingale 7."], ["Post-10 Win Recovery", "Flat betting until a 10+ loss streak arms recovery. The first win after that streak stays flat; the following spin enters Martingale-5 recovery until the next win resets to flat."], ["Martingale 7", "Doubles the unit after each 7-loss block."], ["Neighbor Expansion", "Adds only the PULSE neighbor expansion map to the core stream forecast. It does not include Edge Expansion numbers."], ["Neural Assist", "Diagnostics-only model in the harmonized architecture. It shows recent accuracy, agreement, and entropy context but does not modify live PULSE confidence."], ["Hold · No Bet", "Gap-structure observe state. If Observe Hold is ON, any zero-gap dimension can hold execution as no bet."], ["Per Number Limit", "Maximum straight-up bet allowed on each number. Default is $300 and can be changed in Settings."], ["Persistence Durability", "Legacy TDA diagnostic that checks whether a predicted Color, Range, or Parity alignment has held long enough to trust execution. It remains diagnostic; current Dimension Compression uses DPM spread/gap/DPI evidence instead of persistence."], ["PULSE", "Directional Spread Confidence-DPI engine. It predicts each dimension from Side Spread = Side Confidence - |DPI|. The higher side spread selects Black vs Red, High vs Low, and Even vs Odd. Ties select Red / Low / Odd." ], ["PULSE-Only Expansion", "Additional coverage numbers that are applied only when the active source is PULSE and the execution mode uses Neighbor Expansion or Hybrid Coverage. BB Straight and BB Inverted do not use these added numbers."], ["Saved Control Settings", "Settings option that saves bankroll, base unit, strategy, auto spins, PULSE/BB state, execution mode, table limits, tier execution rules, and appearance for the next login."], ["SIG", "Signals. In Engine Shadow Comparison, SIG is the number of actionable/executed signals produced by that engine during the replay/session."], ["Signal Accuracy", "Forecast accuracy view that can study all PULSE tiers, including advisory-only Directional Observe states."], ["Signal State", "Live decision panel showing the final Pulse Engine prediction, execution state, and tier."], ["Step Recovery", "Controlled staged recovery: 1x, 2x, 3x, then 4x base by loss depth."], ["Straight Mode", "Runs the locked Straight Boolean table from spin 1."], ["Strategy Comparison", "Replays all strategy models from the same raw outcomes to compare ending bankroll, ROI, drawdown, profit factor, and other metrics."], ["Stream Conflict", "Warning shown when neighbor expansion numbers do not match the core forecast stream group."], ["Stream Direct", "Executes only the core predicted group numbers."], ["Active · High Confidence", "Gap-structure tier: at least two dimensions have strong separation at 34+ and no weak non-zero gap is present."], ["Table Limit", "Maximum total wager allowed across the active execution basket. Default is $10,000 and can be changed in Settings."], ["TDA", ". Structural diagnostic layer only. TDA no longer independently vetoes execution; Consensus is the final execution authority. Persistence remains diagnostic. Current Dimension Compression uses live DPM spread/gap/DPI evidence rather than TDA persistence."], ["Tier Execution Rules", "Settings controls that decide whether Weak and Directional Observe tiers are actually executed or only tracked as advisory forecasts."], ["Active · Caution", "Gap-structure tier used when at least one non-zero dimension gap is weak and the signal is still allowed to execute by settings."], ["Wheel Neighbor Overlay", "Execution layer that adds selected wheel-neighbor numbers without changing the core stream forecast."]].map(([term, def]) => <div key={term} style={{ borderBottom: `1px solid ${t.border}`, padding: "13px 0" }}><div style={{ fontSize: 16, fontWeight: 950 }}>{term}</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4, lineHeight: 1.45 }}>{def}</div></div>)}
         <div style={{ display: "flex", justifyContent: "center", marginTop: 16, paddingBottom: 4 }}><div style={{ width: 130 }}><Button onClick={() => setShowGlossary(false)}>Done</Button></div></div>
       </div>
     </div> : null}
