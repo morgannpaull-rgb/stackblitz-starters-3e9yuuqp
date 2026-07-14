@@ -2708,6 +2708,42 @@ function getAxisDriftVelocity(history: Step[]) {
   };
 }
 
+function getTransitionRiskFromScore(score: number): string {
+  return score >= 70 ? "High" : score >= 40 ? "Moderate" : "Low";
+}
+
+function getTransitionEvidenceStrength(samples: number, risk: number): string {
+  return samples >= 20 && risk >= 50 ? "Strong" : samples >= 10 ? "Moderate" : "Weak";
+}
+
+function getNeuralCalibratedPulse(history: Step[], decision: any) {
+  return decision;
+}
+
+function getPulseDriftDestinationCore(history: Step[]) {
+  return { active: false, direction: null as GroupKey | null };
+}
+
+function getLabLeader(history: Step[]) {
+  return null;
+}
+
+function isProtectionHoldRow(row: Step) {
+  return false;
+}
+
+function getTIValidationForRow(row: Step, index: number, history: Step[]) {
+  return { state: "—", validated: null, windowUsed: 0, correct: false };
+}
+
+function getTIAccuracySummaryRows(rows: any[]) {
+  return [];
+}
+
+function getTIRegimeAccuracyRows(history: Step[]) {
+  return [];
+}
+
 function getTransitionIntelligenceRead(history: Step[], decision: any) {
   // TRANSITION INTELLIGENCE CORE
   // This is advisory/environment intelligence only.
