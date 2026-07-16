@@ -2515,53 +2515,52 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     }
 
     // Compute rolling win rate for each engine over last PULSE_WINDOW spins.
-    // FAST VERSION: reads actual win/loss from stored history instead of
-    // re-running full engine forecasts (which was causing 15-second delays).
-    // Each step stores pulseSelectedEngine — we use the actual outcome match
-    // against what the engine predicted at that time, which is already in history.
-    // For engines that haven't been selected yet, we use a lightweight proxy.
+    // Uses allEngineDiagnostics, which snapshots every engine's prediction
+    // every spin regardless of which one was actually selected — this is
+    // what makes a fair, apples-to-apples comparison possible. (Previously
+    // Markov/Random were only credited with a win if they had *already*
+    // been the selected engine that spin, which meant they could never
+    // accumulate any win rate once Pulse locked onto a different engine —
+    // a bug that made switching away from a bad engine nearly impossible.)
     const computeEngineWinRate = (engineName: string): number => {
       const recent = history.slice(-PULSE_WINDOW);
       if (recent.length < 3) return 0;
       let wins = 0;
+      let evaluated = 0;
 
       for (const step of recent) {
         const actual = step.outcomeGroup;
         if (!actual) continue;
 
+        const diag = (step as any).allEngineDiagnostics;
         let predicted: GroupKey | null = null;
 
-        if (engineName === "Straight") {
-          // Use stored pulseDivergence if available (already computed that spin)
+        if (diag) {
+          if (engineName === "Straight") predicted = diag.straight?.group ?? null;
+          else if (engineName === "Inverted") predicted = diag.inverted?.group ?? null;
+          else if (engineName === "Markov") predicted = diag.markov?.group ?? null;
+          else if (engineName === "Random") predicted = diag.random?.group ?? null;
+        } else if (engineName === "Straight" || engineName === "Inverted") {
+          // Fallback for older history rows recorded before allEngineDiagnostics
+          // existed — use the legacy pulseDivergence-based proxy.
           const pd = (step as any).pulseDivergence as PulseDivergenceResult | null;
-          if (pd && !pd.isWarming && pd.holdCount < 3) {
+          if (engineName === "Straight" && pd && !pd.isWarming && pd.holdCount < 3) {
             predicted = pd.group;
-          }
-        } else if (engineName === "Inverted") {
-          // Inverted: per-axis DPI gate flip — lightweight check using stored axisDpi
-          const pd = (step as any).pulseDivergence;
-          if (pd) {
-            // Use stored color/range/parity andPrediction and invert if DPI ≤ -5
+          } else if (engineName === "Inverted" && pd) {
             const cb = pd.color?.andPrediction ?? 0;
             const rb = pd.range?.andPrediction ?? 0;
             const pb = pd.parity?.andPrediction ?? 0;
             predicted = bitsToGroup(cb as 0|1, rb as 0|1, pb as 0|1);
           }
-        } else if (engineName === "Markov") {
-          // Use stored forecast if engine was Markov, else skip
-          if ((step as any).pulseSelectedEngine === "Markov" && step.forecastGroup) {
-            predicted = step.forecastGroup;
-          }
-        } else if (engineName === "Random") {
-          if ((step as any).pulseSelectedEngine === "Random" && step.forecastGroup) {
-            predicted = step.forecastGroup;
-          }
         }
 
-        if (predicted && predicted === actual) wins++;
+        if (predicted) {
+          evaluated += 1;
+          if (predicted === actual) wins++;
+        }
       }
 
-      return Math.round(wins / Math.max(1, recent.length) * 100);
+      return evaluated > 0 ? Math.round(wins / evaluated * 100) : 0;
     };
 
     const engineRates: Record<string, number> = {
@@ -4707,7 +4706,14 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       .map((row) => {
         const tracker = row.pulseEngineTracker!;
         const rates = tracker.engineRates || {};
-        const leader = Object.entries(rates).sort((a, b) => (b[1] as number) - (a[1] as number))[0]?.[0] ?? "—";
+        const entries = Object.entries(rates) as [string, number][];
+        const maxRate = entries.length ? Math.max(...entries.map(([, v]) => v)) : 0;
+        const topEntries = entries.filter(([, v]) => v === maxRate);
+        // Only declare a real leader when exactly one engine has the top rate
+        // AND that rate is above 0 — an all-tied (especially all-zero) result
+        // means there's no actual signal to prefer one engine over another,
+        // so we should not flag the active engine as "stuck" in that case.
+        const leader = maxRate > 0 && topEntries.length === 1 ? topEntries[0][0] : "—";
         return {
           spin: row.spin,
           selectedEngine: tracker.selectedEngine ?? "—",
@@ -4718,7 +4724,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           markovRate: rates["Markov"] ?? 0,
           randomRate: rates["Random"] ?? 0,
           leader,
-          leaderWasSelected: leader === (tracker.selectedEngine ?? "—"),
+          leaderWasSelected: leader === "—" ? true : leader === (tracker.selectedEngine ?? "—"),
         };
       });
   };
