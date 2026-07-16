@@ -4439,179 +4439,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const downloadStructureForecastQualityCSV = () => downloadRowsAsCSV(rowsForStructureForecastQualityExport(), "edgelab_temp_structure_forecast_quality.csv");
 
-  // TEMPORARY STRUCTURE EXECUTION INTELLIGENCE REPORT
-  // Purpose: Study Structure -> preferred execution mode only.
-  // This is analytics/read-only and does not change Pulse, BB, or live execution.
-  const getModeQualityForRow = (row: Step, mode: "Stream Direct" | "Neighbor Expansion" | "Edge Expansion" | "Dimension Compression") => {
-    const forecastBasket = (row.forecastGroup ?? row.predictedGroup ?? null) as GroupKey | null;
-    const actualBasket = row.outcomeGroup;
-    if (!forecastBasket || !actualBasket) {
-      return { captured: false, dimReach: 0, modeNumbers: [] as SpinValue[] };
-    }
-
-    const decision = {
-      dimensionTDA: row.pulseDiagnostics?.dimensionTDA ?? row.pulseGate?.dimensionTDA ?? null,
-    };
-
-    const coreNumbers = GROUPS[forecastBasket] ?? [];
-    const modeNumbers =
-      mode === "Neighbor Expansion"
-        ? uniqueNumbers([...coreNumbers, ...getNeighborExpansionNumbers(forecastBasket)])
-        : mode === "Edge Expansion"
-        ? uniqueNumbers([...coreNumbers, ...getEdgeExpansionNumbers(forecastBasket)])
-        : mode === "Dimension Compression"
-        ? uniqueNumbers(getDimensionCompressionNumbers(forecastBasket, decision))
-        : coreNumbers;
-
-    const outcomeKey = String(row.outcome);
-    const captured = modeNumbers.some((value) => String(value) === outcomeKey);
-    const actualBits = groupToBits(actualBasket);
-    const modeGroups = Array.from(new Set(modeNumbers.map((value) => numberToGroup(value))));
-    const dimReach = modeGroups.length
-      ? Math.max(
-          ...modeGroups.map((group) => {
-            const bits = groupToBits(group);
-            return bits.reduce((sum: number, bit, index) => sum + (bit === actualBits[index] ? 1 : 0), 0 as number);
-          })
-        )
-      : 0;
-
-    return { captured, dimReach, modeNumbers };
-  };
-
-  const getStructureExecutionIntelligenceRows = () => {
-    type ModeStats = { captured: number; sumReach: number };
-    type RowStats = {
-      structure: string;
-      samples: number;
-      stream: ModeStats;
-      neighbor: ModeStats;
-      edge: ModeStats;
-      compression: ModeStats;
-      zero: number;
-      one: number;
-      two: number;
-      three: number;
-    };
-
-    const blankMode = () => ({ captured: 0, sumReach: 0 });
-    const map: Record<string, RowStats> = {};
-
-    history.forEach((row) => {
-      const forecastBasket = (row.forecastGroup ?? row.predictedGroup ?? null) as GroupKey | null;
-      if (!forecastBasket || !row.outcomeGroup) return;
-
-      const metric = getGapMetricsForRow(row);
-      const structure = `${getStructureGapLabel(metric.colorGap)} / ${getStructureGapLabel(metric.rangeGap)} / ${getStructureGapLabel(metric.parityGap)}`;
-      const quality = getForecastQualityForGroups(forecastBasket, row.outcomeGroup);
-      const dimensionsCorrect = quality.dimensionsCorrect;
-      if (typeof dimensionsCorrect !== "number") return;
-
-      if (!map[structure]) {
-        map[structure] = {
-          structure,
-          samples: 0,
-          stream: blankMode(),
-          neighbor: blankMode(),
-          edge: blankMode(),
-          compression: blankMode(),
-          zero: 0,
-          one: 0,
-          two: 0,
-          three: 0,
-        };
-      }
-
-      const bucket = map[structure];
-      bucket.samples += 1;
-      if (dimensionsCorrect === 0) bucket.zero += 1;
-      else if (dimensionsCorrect === 1) bucket.one += 1;
-      else if (dimensionsCorrect === 2) bucket.two += 1;
-      else if (dimensionsCorrect === 3) bucket.three += 1;
-
-      const modes = [
-        ["stream", "Stream Direct"],
-        ["neighbor", "Neighbor Expansion"],
-        ["edge", "Edge Expansion"],
-        ["compression", "Dimension Compression"],
-      ] as const;
-
-      modes.forEach(([key, mode]) => {
-        const result = getModeQualityForRow(row, mode);
-        bucket[key].captured += result.captured ? 1 : 0;
-        bucket[key].sumReach += result.dimReach;
-      });
-    });
-
-    const modeScore = (stats: RowStats, key: "stream" | "neighbor" | "edge" | "compression") => {
-      const mode = stats[key];
-      const captureRate = stats.samples ? mode.captured / stats.samples : 0;
-      const avgReach = stats.samples ? mode.sumReach / stats.samples : 0;
-      return captureRate * 2 + avgReach;
-    };
-
-    const modeLabel: Record<"stream" | "neighbor" | "edge" | "compression", string> = {
-      stream: "Stream Direct",
-      neighbor: "Neighbor Expansion",
-      edge: "Edge Expansion",
-      compression: "Dimension Compression",
-    };
-
-    return Object.values(map).map((row) => {
-      const keys = ["stream", "neighbor", "edge", "compression"] as const;
-      const bestKey = keys.slice().sort((a, b) => modeScore(row, b) - modeScore(row, a))[0];
-      return {
-        ...row,
-        bestMode: modeLabel[bestKey],
-        bestScore: modeScore(row, bestKey),
-      };
-    }).sort((a, b) => b.samples - a.samples || b.bestScore - a.bestScore || a.structure.localeCompare(b.structure));
-  };
-
-  const rowsForStructureExecutionIntelligenceExport = () => [
-    [
-      "Gap Structure",
-      "Samples",
-      "Stream Capture %",
-      "Stream Avg Dim Reach",
-      "Neighbor Capture %",
-      "Neighbor Avg Dim Reach",
-      "Edge Capture %",
-      "Edge Avg Dim Reach",
-      "Compression Capture %",
-      "Compression Avg Dim Reach",
-      "Best Mode",
-      "0/3 %",
-      "1/3 %",
-      "2/3 %",
-      "3/3 %",
-    ],
-    ...getStructureExecutionIntelligenceRows().map((row) => {
-      const pct = (value: number) => row.samples ? `${((value / row.samples) * 100).toFixed(1)}%` : "0.0%";
-      const avg = (sum: number) => row.samples ? (sum / row.samples).toFixed(2) : "0.00";
-      return [
-        row.structure,
-        row.samples,
-        pct(row.stream.captured),
-        avg(row.stream.sumReach),
-        pct(row.neighbor.captured),
-        avg(row.neighbor.sumReach),
-        pct(row.edge.captured),
-        avg(row.edge.sumReach),
-        pct(row.compression.captured),
-        avg(row.compression.sumReach),
-        row.bestMode,
-        pct(row.zero),
-        pct(row.one),
-        pct(row.two),
-        pct(row.three),
-      ];
-    }),
-  ];
-
-  const downloadStructureExecutionIntelligenceCSV = () =>
-    downloadRowsAsCSV(rowsForStructureExecutionIntelligenceExport(), "edgelab_temp_structure_execution_intelligence.csv");
-
 
 
   const TI_VALIDATION_WINDOW = 5;
@@ -4745,7 +4572,44 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     ];
   };
 
-  const getRouterAuditRows = () => {
+  // ─── ENGINE / GATE SUMMARY (current architecture) ─────────────────────────
+  // Replaces the old Structure/Family/Router Recommendation/TI Adjustment
+  // fields, which described a routing+transition-intelligence governance
+  // stack that testing showed added little value and has since been removed.
+  // The live system is: an active engine (Straight/Inverted/Markov/Random,
+  // auto-selected by Pulse) driving a per-axis 3-input gate selector that is
+  // either WARMING, HOLD (no gate beat the fit threshold), or EXECUTE.
+  const getEngineLabelForRow = (row: Step) => {
+    const selected = (row as any).pulseSelectedEngine;
+    if (selected) return selected;
+    if ((row as any)._bbStraightEnabled) return "Straight";
+    if ((row as any)._bbInvertedEnabled) return "Inverted";
+    if ((row as any)._markovEnabled) return "Markov";
+    if ((row as any)._randomEnabled) return "Random";
+    return "—";
+  };
+
+  const getGateSummaryForAxis = (row: Step, axis: "color" | "range" | "parity") => {
+    const d = (row.pulseDivergence as any)?.[axis];
+    if (!d) return { state: "—", gateName: "—", fitPct: null as number | null, label: "—" };
+    const state = d.performanceState ?? "—";
+    const gateName = d.selectedGate ?? "—";
+    const fitPct = typeof d.gateFitScore === "number" ? Math.round(d.gateFitScore * 100) : null;
+    const label = state === "WARMING" || state === "HOLD"
+      ? state
+      : `${gateName}${fitPct !== null ? ` ${fitPct}%` : ""}`;
+    return { state, gateName, fitPct, label };
+  };
+
+  const getEngineGateSummaryForRow = (row: Step) => {
+    const engine = getEngineLabelForRow(row);
+    const colorGate = getGateSummaryForAxis(row, "color");
+    const rangeGate = getGateSummaryForAxis(row, "range");
+    const parityGate = getGateSummaryForAxis(row, "parity");
+    return { engine, colorGate, rangeGate, parityGate };
+  };
+
+  const getSpinAuditRows = () => {
     return history.map((row, index) => {
       const structure = getStructureForHistoryRow(row);
       const forecastBasket = (row.forecastGroup ?? row.predictedGroup ?? null) as GroupKey | null;
@@ -4781,9 +4645,14 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         ? `${winningEvidence} did not meet routing threshold; final execution ${finalExecutionMode}. ${evidenceDetails}.`
         : `No learned execution profile; final execution ${finalExecutionMode}.`;
       const executionValue = getExecutionValueForRow(row);
+      const engineGate = getEngineGateSummaryForRow(row);
 
       return {
         spin: row.spin,
+        engine: engineGate.engine,
+        colorGate: engineGate.colorGate,
+        rangeGate: engineGate.rangeGate,
+        parityGate: engineGate.parityGate,
         structure,
         family: getStructureFamilyKey(structure),
         signature: getStructureCompressionSignature(structure),
@@ -4827,28 +4696,29 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     });
   };
 
-  const rowsForRouterAuditExport = () => [
-    ["Spin", "Forecast", "Outcome", "Execution Mode", "Pulse", "Engine", "Dimensions Correct", "Color", "Range", "Parity", "Result", "Core Hit", "Winning Source"],
-    ...getRouterAuditRows().map((row) => {
-      const histRow = history.find(h => h.spin === row.spin);
+  // Clean 14-column spin audit export — engine + per-axis gate state only,
+  // no TI/structure/routing columns (those belonged to the removed
+  // routing/transition-intelligence governance stack).
+  const rowsForSpinAuditExport = () => [
+    ["Spin", "Forecast", "Outcome", "Execution Mode", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Dimensions Correct", "Color", "Range", "Parity", "Result", "Winning Source"],
+    ...getSpinAuditRows().map((row) => {
       const fc = row.forecast ? groupToBits(row.forecast as GroupKey) : null;
       const oc = row.outcome ? groupToBits(row.outcome as GroupKey) : null;
       const colorHit  = fc && oc ? (fc[0]===oc[0]?"C":"I") : "—";
       const rangeHit  = fc && oc ? (fc[1]===oc[1]?"C":"I") : "—";
       const parityHit = fc && oc ? (fc[2]===oc[2]?"C":"I") : "—";
-      const pulse  = (histRow as any)?._pulseEnabled  !== undefined ? ((histRow as any)._pulseEnabled  ? "ON" : "OFF") : "—";
-      const engine = (histRow as any)?._bbStraightEnabled ? "Straight" : (histRow as any)?._bbInvertedEnabled ? "Inverted" : (histRow as any)?._markovEnabled ? "Markov" : (histRow as any)?._pulseEnabled ? "Pulse Only" : "Off";
       return [
         row.spin, row.forecast, row.outcome, row.finalExecutionMode,
-        pulse, engine, row.dimensionsCorrect,
+        row.engine, row.colorGate.label, row.rangeGate.label, row.parityGate.label,
+        row.dimensionsCorrect,
         colorHit, rangeHit, parityHit,
-        row.result, row.coreHit, row.winningSource,
+        row.result, row.winningSource,
       ];
     }),
   ];
 
   const getLossInvestigationRows = () => {
-    const routerRows = getRouterAuditRows();
+    const routerRows = getSpinAuditRows();
     const rows: any[] = [];
     let streak: any[] = [];
     let streakId = 0;
@@ -4856,11 +4726,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const flush = () => {
       if (streak.length >= 5) {
         streakId += 1;
-        const structures = streak.map((row) => row.structure);
-        const families = streak.map((row) => row.family);
-        const modes = streak.map((row) => row.finalExecutionMode ?? row.routerSelectedMode);
-        const routerModes = streak.map((row) => row.routerRecommendation ?? row.routerSelectedMode);
-        const sources = streak.map((row) => row.source);
+        const modes = streak.map((row) => row.finalExecutionMode);
+        const engines = streak.map((row) => row.engine);
         const mostCommon = (values: string[]) => {
           const counts: Record<string, number> = {};
           values.forEach((value) => { counts[value || "—"] = (counts[value || "—"] || 0) + 1; });
@@ -4872,11 +4739,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           startSpin: streak[0].spin,
           endSpin: streak[streak.length - 1].spin,
           length: streak.length,
-          commonStructure: mostCommon(structures),
-          commonFamily: mostCommon(families),
           commonMode: mostCommon(modes),
-          commonRouterRecommendation: mostCommon(routerModes),
-          commonSource: mostCommon(sources),
+          commonEngine: mostCommon(engines),
           avgDim,
           ...row,
         }));
@@ -4893,56 +4757,30 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   };
 
   const rowsForLossInvestigationExport = () => [
-    ["Streak ID", "Start Spin", "End Spin", "Length", "Avg Dim Correct", "Spin", "Forecast", "Outcome", "Dimensions Correct", "Color", "Range", "Parity", "Core Hit", "Winning Source", "Pulse", "Engine"],
+    ["Streak ID", "Start Spin", "End Spin", "Length", "Avg Dim Correct", "Spin", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Forecast", "Outcome", "Dimensions Correct", "Color", "Range", "Parity", "Core Hit", "Winning Source"],
     ...getLossInvestigationRows().map((row) => {
       const fc = row.forecast ? groupToBits(row.forecast as GroupKey) : null;
       const oc = row.outcome ? groupToBits(row.outcome as GroupKey) : null;
       const colorHit  = fc && oc ? (fc[0]===oc[0]?"C":"I") : "—";
       const rangeHit  = fc && oc ? (fc[1]===oc[1]?"C":"I") : "—";
       const parityHit = fc && oc ? (fc[2]===oc[2]?"C":"I") : "—";
-      const histRow   = history.find(h => h.spin === row.spin);
-      const pulse  = (histRow as any)?._pulseEnabled  !== undefined ? ((histRow as any)._pulseEnabled  ? "ON" : "OFF") : "—";
-      const engine = (histRow as any)?._bbStraightEnabled ? "Straight" : (histRow as any)?._bbInvertedEnabled ? "Inverted" : (histRow as any)?._markovEnabled ? "Markov" : "—";
       return [
         row.streakId, row.startSpin, row.endSpin, row.length,
         row.avgDim.toFixed(2), row.spin,
+        row.engine, row.colorGate.label, row.rangeGate.label, row.parityGate.label,
         row.forecast, row.outcome, row.dimensionsCorrect,
         colorHit, rangeHit, parityHit,
         row.coreHit, row.winningSource,
-        pulse, engine,
       ];
     }),
   ];
 
-  const rowsForRouterMissedOpportunityExport = () => [
-    ["Spin", "Structure", "Family", "Actual Mode", "Best Historical Mode", "Source", "Samples", "Advantage", "Dimensions Correct", "Result", "Core Hit", "Added Hit", "Winning Source", "Reason"],
-    ...getRouterAuditRows()
-      .filter((row) => row.samples > 0 && row.finalExecutionMode !== row.routerRecommendation)
-      .map((row) => [
-        row.spin,
-        row.structure,
-        row.family,
-        row.finalExecutionMode,
-        row.routerRecommendation,
-        row.source,
-        row.samples,
-        row.advantage.toFixed(2),
-        row.dimensionsCorrect,
-        row.result,
-        row.coreHit,
-        row.addedHit,
-        row.winningSource,
-        row.reason,
-      ]),
-  ];
-
-  const downloadRouterAuditCSV = () => downloadRowsAsCSV(rowsForRouterAuditExport(), "edgelab_spin_audit.csv");
+  const downloadSpinAuditCSV = () => downloadRowsAsCSV(rowsForSpinAuditExport(), "edgelab_spin_audit.csv");
   const downloadLossInvestigationCSV = () => downloadRowsAsCSV(rowsForLossInvestigationExport(), "edgelab_loss_investigation.csv");
-  const downloadRouterMissedOpportunityCSV = () => downloadRowsAsCSV(rowsForRouterMissedOpportunityExport(), "edgelab_router_missed_opportunity.csv");
 
   // AXIS FAILURE ANALYSIS
-  // Purpose: track every 2/3-dimension loss so Pulse can identify the axis
-  // that keeps breaking before any forecast/router logic is changed.
+  // Purpose: track every 2/3-dimension loss so we can identify the axis that
+  // keeps breaking, alongside which engine and gate state was active for it.
   const getAxisCorrectForRouterRow = (row: any, axis: "Color" | "Range" | "Parity") => {
     if (!row?.forecast || !row?.outcome) return null;
     const forecastBits = groupToBits(row.forecast as GroupKey);
@@ -4956,17 +4794,24 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     return axes.length === 1 ? axes[0] : "—";
   };
 
+  const getGateForFailedAxis = (row: any, failedAxis: string) =>
+    failedAxis === "Color" ? row.colorGate
+    : failedAxis === "Range" ? row.rangeGate
+    : failedAxis === "Parity" ? row.parityGate
+    : { state: "—", gateName: "—", fitPct: null as number | null, label: "—" };
+
   const getAxisFailureRows = () => {
-    const routerRows = getRouterAuditRows();
-    return routerRows
+    const spinRows = getSpinAuditRows();
+    return spinRows
       .filter((row) => row.result === "loss" && Number(row.dimensionsCorrect) === 2)
       .map((row) => {
         const failedAxis = getFailedAxisForRouterRow(row);
-        const recoveryRow = failedAxis === "—" ? null : routerRows.find((candidate) => candidate.spin > row.spin && getAxisCorrectForRouterRow(candidate, failedAxis as any) === true);
+        const recoveryRow = failedAxis === "—" ? null : spinRows.find((candidate) => candidate.spin > row.spin && getAxisCorrectForRouterRow(candidate, failedAxis as any) === true);
         const recoveryDelay = recoveryRow ? recoveryRow.spin - row.spin : null;
         return {
           ...row,
           failedAxis,
+          failedAxisGate: getGateForFailedAxis(row, failedAxis),
           colorCorrect: getAxisCorrectForRouterRow(row, "Color"),
           rangeCorrect: getAxisCorrectForRouterRow(row, "Range"),
           parityCorrect: getAxisCorrectForRouterRow(row, "Parity"),
@@ -4979,10 +4824,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const getAxisFailureSummaryRows = () => {
     const rows = getAxisFailureRows();
-    const map: Record<string, { key: string; failedAxis: string; structure: string; samples: number; open: number; totalDelay: number; delays: number[]; modes: Record<string, number>; risks: Record<string, number>; states: Record<string, number> }> = {};
+    const map: Record<string, { key: string; failedAxis: string; engine: string; samples: number; open: number; totalDelay: number; delays: number[]; modes: Record<string, number>; gateStates: Record<string, number> }> = {};
     rows.forEach((row) => {
-      const key = `${row.failedAxis}__${row.structure}`;
-      if (!map[key]) map[key] = { key, failedAxis: row.failedAxis, structure: row.structure, samples: 0, open: 0, totalDelay: 0, delays: [], modes: {}, risks: {}, states: {} };
+      const key = `${row.failedAxis}__${row.engine}`;
+      if (!map[key]) map[key] = { key, failedAxis: row.failedAxis, engine: row.engine, samples: 0, open: 0, totalDelay: 0, delays: [], modes: {}, gateStates: {} };
       const bucket = map[key];
       bucket.samples += 1;
       if (typeof row.recoveryDelay === "number") {
@@ -4992,8 +4837,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         bucket.open += 1;
       }
       bucket.modes[row.finalExecutionMode || "—"] = (bucket.modes[row.finalExecutionMode || "—"] || 0) + 1;
-      bucket.risks[row.transitionRisk || "—"] = (bucket.risks[row.transitionRisk || "—"] || 0) + 1;
-      bucket.states[row.transitionState || "—"] = (bucket.states[row.transitionState || "—"] || 0) + 1;
+      bucket.gateStates[row.failedAxisGate.state || "—"] = (bucket.gateStates[row.failedAxisGate.state || "—"] || 0) + 1;
     });
     const top = (counts: Record<string, number>) => Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—";
     return Object.values(map)
@@ -5002,36 +4846,26 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         avgDelay: row.delays.length ? row.totalDelay / row.delays.length : null,
         maxDelay: row.delays.length ? Math.max(...row.delays) : null,
         topMode: top(row.modes),
-        topRisk: top(row.risks),
-        topState: top(row.states),
+        topGateState: top(row.gateStates),
       }))
       .sort((a, b) => b.samples - a.samples || (b.avgDelay ?? 0) - (a.avgDelay ?? 0));
   };
 
   const rowsForAxisFailureExport = () => [
-    ["Spin", "Failed Axis", "Structure", "Forecast", "Outcome", "Router Recommendation", "Final Execution Mode", "Transition State", "TI Risk", "Color Correct", "Range Correct", "Parity Correct", "Recovery Spin", "Recovery Delay", "Family", "Signature", "Router Active", "Source", "Samples", "Advantage", "Reason"],
+    ["Spin", "Failed Axis", "Engine", "Gate State", "Forecast", "Outcome", "Final Execution Mode", "Color Correct", "Range Correct", "Parity Correct", "Recovery Spin", "Recovery Delay"],
     ...getAxisFailureRows().map((row) => [
       row.spin,
       row.failedAxis,
-      row.structure,
+      row.engine,
+      row.failedAxisGate.label,
       row.forecast,
       row.outcome,
-      row.routerRecommendation,
       row.finalExecutionMode,
-      row.transitionState,
-      row.transitionRisk,
       row.colorCorrect === null ? "—" : row.colorCorrect ? "YES" : "NO",
       row.rangeCorrect === null ? "—" : row.rangeCorrect ? "YES" : "NO",
       row.parityCorrect === null ? "—" : row.parityCorrect ? "YES" : "NO",
       row.recoverySpin,
       row.recoveryDelayLabel,
-      row.family,
-      row.signature,
-      row.routerActive ? "YES" : "NO",
-      row.source,
-      row.samples,
-      row.advantage.toFixed(2),
-      row.reason,
     ]),
   ];
 
@@ -5443,14 +5277,13 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       if (!rows.length) {
         return {
           rows,
-          routerRows: [],
+          auditRows: [],
           title: `${band.type.toUpperCase()} STREAK ANALYSIS`,
           summary: [] as string[],
           diagnosis: "No detail available.",
           netChange: 0,
-          dominantRouterSource: "—",
-          avgRouterSamples: 0,
-          avgRouterAdvantage: 0,
+          dominantEngine: "—",
+          gateExecuteRate: 0,
           entropyValue: 0,
           executed: 0,
           tdaHolds: 0,
@@ -5467,15 +5300,16 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       const executed = rows.filter((row) => row.result === "win" || row.result === "loss").length;
       const coreMisses = rows.filter((row) => row.coreResult === "loss").length;
       const overlayMisses = rows.filter((row) => row.overlayResult === "loss").length;
-      const routerRows = getRouterAuditRows().filter((row) => row.spin >= band.startSpin && row.spin <= band.endSpin);
+      const auditRows = getSpinAuditRows().filter((row) => row.spin >= band.startSpin && row.spin <= band.endSpin);
       const mostCommon = (values: string[]) => {
         const counts: Record<string, number> = {};
         values.forEach((value) => { counts[value || "—"] = (counts[value || "—"] || 0) + 1; });
         return Object.entries(counts).sort((a, b) => b[1] - a[1])[0]?.[0] ?? "—";
       };
-      const dominantRouterSource = mostCommon(routerRows.map((row) => row.source));
-      const avgRouterSamples = routerRows.length ? routerRows.reduce((sum, row) => sum + (Number(row.samples) || 0), 0) / routerRows.length : 0;
-      const avgRouterAdvantage = routerRows.length ? routerRows.reduce((sum, row) => sum + (Number(row.advantage) || 0), 0) / routerRows.length : 0;
+      const dominantEngine = mostCommon(auditRows.map((row) => row.engine));
+      const gateStates = auditRows.flatMap((row) => [row.colorGate.state, row.rangeGate.state, row.parityGate.state]);
+      const executeGates = gateStates.filter((state) => state === "EXECUTE").length;
+      const gateExecuteRate = gateStates.length ? executeGates / gateStates.length : 0;
       const settlementMismatchCount = rows.filter((row) => row.predictedGroup && row.predictedGroup === row.outcomeGroup && row.result !== "win").length;
       const diagnosis = settlementMismatchCount > 0
         ? `SETTLEMENT WARNING: ${settlementMismatchCount} matching forecast/outcome rows did not settle as WIN.`
@@ -5483,28 +5317,26 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         ? e >= 62
           ? "Primary read: entropy/chaos expansion during loss block."
           : tdaHolds > Math.max(1, rows.length / 2)
-          ? "Primary read: TDA stability/persistence failed or execution was held often."
-          : avgRouterAdvantage < PULSE_EXECUTION_ROUTER_MIN_ADVANTAGE
-          ? "Primary read: router evidence advantage was weak during this block."
-          : "Primary read: final execution basket missed despite active router evidence."
+          ? "Primary read: diagnostic holds (no bet placed) were frequent during this block."
+          : gateExecuteRate < 0.5
+          ? "Primary read: gates were mostly HOLD/WARMING during this block — little live signal to act on."
+          : "Primary read: final execution basket missed despite gates actively executing."
         : "Winning streak block. Shows what aligned during this run.";
       return {
         rows,
-        routerRows,
+        auditRows,
         title: `${band.type === "loss" ? "LOSS" : "WIN"} STREAK ANALYSIS`,
         summary: [
           `Spins: ${band.startSpin}-${band.endSpin} · Length: ${band.length}`,
           `Bankroll: ${startBankroll} → ${endBankroll} · Net: ${netChange}`,
-          `Dominant Router Source: ${dominantRouterSource}`,
+          `Dominant Engine: ${dominantEngine}`,
           `Executed: ${executed}/${rows.length} · Diagnostic Holds: ${tdaHolds}`,
-          `AND Gate Open: ${rows.filter((r) => r.pulseAudit?.andConvergence).length}/${rows.length} spins · Partial (2/3): ${rows.filter((r) => !r.pulseAudit?.andConvergence && r.pulseAudit?.axesAgreeing === 2).length}`,
-          `Average Router Samples: ${avgRouterSamples.toFixed(1)} · Avg Advantage: +${avgRouterAdvantage.toFixed(2)}`,
+          `Gates Executing: ${executeGates}/${gateStates.length} axis-spins (${Math.round(gateExecuteRate * 100)}%)`,
         ],
         diagnosis,
         netChange,
-        dominantRouterSource,
-        avgRouterSamples,
-        avgRouterAdvantage,
+        dominantEngine,
+        gateExecuteRate,
         entropyValue: e,
         executed,
         tdaHolds,
@@ -5512,26 +5344,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         overlayMisses,
       };
     };
-  const getAuditEngineLabel = (row: Step) => {
-    const scope =
-      row.pulseGate?.engineScope ??
-      row.pulseDiagnostics?.engineScope ??
-      row.pulseDiagnostics?.replay?.engineScope;
-
-    if (scope === "Straight") return "Straight";
-    if (scope === "Inverted") return "Inverted";
-    if (scope === "Markov") return "Markov";
-
-    const note = row.note || "";
-    if (note.includes("Markov") || note.includes("MARKOV")) return "Markov";
-    if (note.includes("Inverted") || note.includes("BB_INVERTED")) return "Inverted";
-    if (note.includes("Straight") || note.includes("BB_STRAIGHT")) return "Straight";
-
-    return "Pulse";
-  };
-
-  const getAuditNote = (row: Step) => `${row.executionMode} · ${getAuditEngineLabel(row)}`;
-
   const StreakAuditModal = () => {
     if (!selectedStreakBand) return null;
     const audit = buildStreakAudit(selectedStreakBand);
@@ -5564,48 +5376,31 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
                 <th style={{ padding: "8px 10px" }}>Forecast</th>
                 <th style={{ padding: "8px 10px" }}>Outcome</th>
                 <th style={{ padding: "8px 10px" }}>Final</th>
-                <th style={{ padding: "8px 10px" }}>AND Gate</th>
-                <th style={{ padding: "8px 10px" }}>C·R·P DPI</th>
-                <th style={{ padding: "8px 10px" }}>Router Source</th>
-                <th style={{ padding: "8px 10px" }}>Winning Evidence</th>
-                <th style={{ padding: "8px 10px" }}>Samples</th>
-                <th style={{ padding: "8px 10px" }}>Advantage</th>
-                <th style={{ padding: "8px 10px" }}>Evidence Strength</th>
+                <th style={{ padding: "8px 10px" }}>Engine</th>
+                <th style={{ padding: "8px 10px" }}>Color Gate</th>
+                <th style={{ padding: "8px 10px" }}>Range Gate</th>
+                <th style={{ padding: "8px 10px" }}>Parity Gate</th>
                 <th style={{ padding: "8px 10px" }}>Net</th>
-                <th style={{ padding: "8px 10px" }}>Note</th>
+                <th style={{ padding: "8px 10px" }}>Mode</th>
               </tr>
             </thead>
             <tbody>
               {audit.rows.map((row) => {
                 const forecastLabel = row.predictedGroup ?? row.forecastGroup ?? "HOLD";
                 const outcomeLabel = `${String(row.outcome)}(${row.outcomeGroup})`;
-                const routerRow = audit.routerRows.find((auditRow) => auditRow.spin === row.spin);
-                const a = row.pulseAudit;
-                const andOpen = a?.andConvergence === true;
-                const andPartial = typeof a?.axesAgreeing === "number" ? a.axesAgreeing : null;
-                const andDir = a?.convergenceDirection ?? null;
-                const cDpi = a?.colorDpi ?? null;
-                const rDpi = a?.rangeDpi ?? null;
-                const pDpi = a?.parityDpi ?? null;
-                const dpiLabel = (cDpi !== null || rDpi !== null || pDpi !== null)
-                  ? `${cDpi ?? "—"} · ${rDpi ?? "—"} · ${pDpi ?? "—"}`
-                  : "—";
+                const auditRow = audit.auditRows.find((candidate) => candidate.spin === row.spin);
+                const gateColor = (state?: string) => state === "EXECUTE" ? COLORS.green : state === "HOLD" ? COLORS.amber : t.subtext;
                 return <tr key={`audit-${row.spin}`} style={{ borderBottom: `1px solid ${t.border}`, background: row.result === "win" ? "rgba(34,197,94,0.07)" : row.result === "loss" ? "rgba(239,68,68,0.06)" : "rgba(245,158,11,0.05)" }}>
                   <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                   <td style={{ padding: "8px 10px", color: COLORS.cyan, fontWeight: 950 }}>{forecastLabel}</td>
                   <td style={{ padding: "8px 10px", fontWeight: 900 }}>{outcomeLabel}</td>
                   <td style={{ padding: "8px 10px", color: resultColor(row.result), fontWeight: 950 }}>{row.result.toUpperCase()}</td>
-                  <td style={{ padding: "8px 10px", fontWeight: 950, color: andOpen ? COLORS.green : andPartial === 2 ? COLORS.amber : COLORS.red }}>
-                    {andOpen ? `✓ ${andDir}` : andPartial !== null ? `${andPartial}/3` : "—"}
-                  </td>
-                  <td style={{ padding: "8px 10px", color: t.subtext, fontFamily: "ui-monospace, monospace" }}>{dpiLabel}</td>
-                  <td style={{ padding: "8px 10px", fontWeight: 900 }}>{routerRow?.source ?? "—"}</td>
-                  <td style={{ padding: "8px 10px", fontWeight: 900 }}>{routerRow?.winningEvidence ?? "—"}</td>
-                  <td style={{ padding: "8px 10px", textAlign: "center", fontWeight: 900 }}>{routerRow?.samples ?? "—"}</td>
-                  <td style={{ padding: "8px 10px", textAlign: "center", fontWeight: 900 }}>{routerRow ? `+${routerRow.advantage.toFixed(2)}` : "—"}</td>
-                  <td style={{ padding: "8px 10px", fontWeight: 900 }}>{routerRow?.confidence ?? "—"}</td>
+                  <td style={{ padding: "8px 10px", fontWeight: 900 }}>{auditRow?.engine ?? getEngineLabelForRow(row)}</td>
+                  <td style={{ padding: "8px 10px", fontWeight: 900, color: gateColor(auditRow?.colorGate.state) }}>{auditRow?.colorGate.label ?? "—"}</td>
+                  <td style={{ padding: "8px 10px", fontWeight: 900, color: gateColor(auditRow?.rangeGate.state) }}>{auditRow?.rangeGate.label ?? "—"}</td>
+                  <td style={{ padding: "8px 10px", fontWeight: 900, color: gateColor(auditRow?.parityGate.state) }}>{auditRow?.parityGate.label ?? "—"}</td>
                   <td style={{ padding: "8px 10px", color: row.net > 0 ? COLORS.green : row.net < 0 ? COLORS.red : t.subtext, fontWeight: 900 }}>{row.net}</td>
-                  <td style={{ padding: "8px 10px", color: t.subtext, maxWidth: 360, overflow: "hidden", textOverflow: "ellipsis" }}>{getAuditNote(row)}</td>
+                  <td style={{ padding: "8px 10px", color: t.subtext, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis" }}>{row.executionMode}</td>
                 </tr>;
               })}
             </tbody>
@@ -6068,57 +5863,6 @@ const StreakAnalyticsPanel = () => {
 
 
 
-  const RouterAuditPanel = () => {
-    const rows = getRouterAuditRows().slice(-80).reverse();
-    const activeCount = rows.filter((row) => row.routerActive).length;
-    const fallbackCount = rows.filter((row) => !row.routerActive).length;
-    const tiAccuracyRows = getTIAccuracySummaryRows(getRouterAuditRows());
-    const overallTiAccuracy = tiAccuracyRows[0]?.pct ?? "—";
-    return <Panel title="ROUTER AUDIT">
-      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Shows why Pulse selected a mode, what evidence source was used, and when it stayed with manual/fallback mode.</div>
-        <div style={{ display: "flex", gap: 8 }}>
-          <Button variant="secondary" onClick={downloadRouterAuditCSV} disabled={!history.length}>ROUTER CSV</Button>
-          <Button variant="secondary" onClick={downloadRouterMissedOpportunityCSV} disabled={!history.length}>MISSED CSV</Button>
-        </div>
-      </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
-        <MiniMetric label="Router Active Rows" value={activeCount} accent={COLORS.green} />
-        <MiniMetric label="Fallback / Manual Rows" value={fallbackCount} accent={fallbackCount ? COLORS.amber : COLORS.green} />
-        <MiniMetric label="Current Source" value={pulseExecutionRouter.source ?? "—"} />
-        <MiniMetric label="Current Mode" value={pulseExecutionRouter.selectedMode ?? executionMode} accent={COLORS.cyan} />
-        <MiniMetric label="TI Accuracy" value={overallTiAccuracy} accent={COLORS.amber} />
-      </div>
-      <div style={{ maxHeight: 420, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
-        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Structure", "Family", "Router Recommendation", "TI Adjustment", "Final Execution", "TI Actual", "TI Correct", "TI Conf", "Active", "Source", "Samples", "Adv", "Dim", "Win Src", "Reason"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
-          <tbody>
-            {rows.length === 0 ? <tr><td colSpan={16} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No router audit rows yet.</td></tr> : rows.map((row) => (
-              <tr key={`${row.spin}-${row.structure}`} style={{ borderBottom: `1px solid ${t.border}` }}>
-                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
-                <td style={{ padding: "8px 10px" }}>{row.structure}</td>
-                <td style={{ padding: "8px 10px" }}>{row.family}</td>
-                <td style={{ padding: "8px 10px", color: row.routerRecommendation === "Neighbor Expansion" ? COLORS.green : row.routerRecommendation === "Dimension Compression" ? COLORS.cyan : t.text, fontWeight: 950 }}>{row.routerRecommendation}</td>
-                <td style={{ padding: "8px 10px", color: row.routerRecommendation !== row.finalExecutionMode ? COLORS.amber : t.subtext, fontWeight: 900 }}>{row.tiAdjustment}</td>
-                <td style={{ padding: "8px 10px", color: row.finalExecutionMode === "Dimension Compression" ? COLORS.cyan : row.finalExecutionMode === "Neighbor Expansion" ? COLORS.green : t.text, fontWeight: 950 }}>{row.finalExecutionMode}</td>
-                <td style={{ padding: "8px 10px", color: t.subtext }}>{row.tiActualRegime}</td>
-                <td style={{ padding: "8px 10px", color: row.tiCorrect === "YES" ? COLORS.green : row.tiCorrect === "NO" ? COLORS.red : t.subtext, fontWeight: 950 }}>{row.tiCorrect}</td>
-                <td style={{ padding: "8px 10px", color: row.tiValidationConfidence === "Strong" ? COLORS.green : row.tiValidationConfidence === "Moderate" ? COLORS.cyan : COLORS.amber, fontWeight: 900 }}>{row.tiValidationConfidence}</td>
-                <td style={{ padding: "8px 10px", color: row.routerActive ? COLORS.green : COLORS.amber, fontWeight: 950 }}>{row.routerActive ? "YES" : "NO"}</td>
-                <td style={{ padding: "8px 10px" }}>{row.source}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.samples}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.advantage.toFixed(2)}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.dimensionsCorrect}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center", color: row.winningSource === "Core" ? COLORS.green : row.winningSource !== "None" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.winningSource}</td>
-                <td style={{ padding: "8px 10px", color: t.subtext, maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis" }}>{row.reason}</td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-    </Panel>;
-  };
-
   // ─── TI REGIME ACCURACY ────────────────────────────────────────────────────
   const TI_VALIDATION_WINDOWS: Record<string, number> = {
     Reversal: 3, Drift: 5, Compression: 5, Expansion: 5, Recovery: 5, Scatter: 4, Stable: 4,
@@ -6241,34 +5985,32 @@ const StreakAnalyticsPanel = () => {
     const latest = rows.at(-1);
     return <Panel title="LOSS INVESTIGATION">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Auto-focuses only on loss streaks of 5 or more so we can identify structure, routing source, and mode failures.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Auto-focuses only on loss streaks of 5 or more so we can identify which engine and gate states were active during the failure.</div>
         <Button variant="secondary" onClick={downloadLossInvestigationCSV} disabled={!rows.length}>LOSS CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Loss Streaks ≥5" value={streakCount} accent={streakCount ? COLORS.red : COLORS.green} />
         <MiniMetric label="Rows Captured" value={rows.length} />
-        <MiniMetric label="Latest Common Family" value={latest?.commonFamily ?? "—"} />
+        <MiniMetric label="Latest Common Engine" value={latest?.commonEngine ?? "—"} />
         <MiniMetric label="Latest Final Mode" value={latest?.commonMode ?? "—"} />
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Streak", "Spin", "Structure", "Family", "Router Recommendation", "TI Adjustment", "Final Execution", "Source", "Forecast", "Outcome", "Dim", "Win Src", "Reason"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Streak", "Spin", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Final Execution", "Forecast", "Outcome", "Dim", "Win Src"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={13} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No loss streak of 5+ yet.</td></tr> : rows.slice(-80).reverse().map((row) => (
+            {rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No loss streak of 5+ yet.</td></tr> : rows.slice(-80).reverse().map((row) => (
               <tr key={`${row.streakId}-${row.spin}`} style={{ borderBottom: `1px solid ${t.border}` }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>L{row.length}</td>
                 <td style={{ padding: "8px 10px" }}>{row.spin}</td>
-                <td style={{ padding: "8px 10px" }}>{row.structure}</td>
-                <td style={{ padding: "8px 10px" }}>{row.family}</td>
-                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.routerRecommendation}</td>
-                <td style={{ padding: "8px 10px", color: row.routerRecommendation !== row.finalExecutionMode ? COLORS.amber : t.subtext, fontWeight: 900 }}>{row.tiAdjustment}</td>
+                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.engine}</td>
+                <td style={{ padding: "8px 10px", color: row.colorGate.state === "EXECUTE" ? COLORS.green : row.colorGate.state === "HOLD" ? COLORS.amber : t.subtext }}>{row.colorGate.label}</td>
+                <td style={{ padding: "8px 10px", color: row.rangeGate.state === "EXECUTE" ? COLORS.green : row.rangeGate.state === "HOLD" ? COLORS.amber : t.subtext }}>{row.rangeGate.label}</td>
+                <td style={{ padding: "8px 10px", color: row.parityGate.state === "EXECUTE" ? COLORS.green : row.parityGate.state === "HOLD" ? COLORS.amber : t.subtext }}>{row.parityGate.label}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.finalExecutionMode}</td>
-                <td style={{ padding: "8px 10px" }}>{row.source}</td>
                 <td style={{ padding: "8px 10px" }}>{row.forecast}</td>
                 <td style={{ padding: "8px 10px" }}>{row.outcome}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.dimensionsCorrect}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center", color: row.winningSource === "Core" ? COLORS.green : row.winningSource !== "None" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.winningSource}</td>
-                <td style={{ padding: "8px 10px", color: t.subtext, maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis" }}>{row.reason}</td>
               </tr>
             ))}
           </tbody>
@@ -6312,17 +6054,17 @@ const StreakAnalyticsPanel = () => {
           </div>
         </div>
         <div style={{ border: `1px solid ${t.border}`, borderRadius: 12, padding: 10, background: t.panel2 }}>
-          <div style={{ fontSize: 11, color: t.subtext, fontWeight: 950, textTransform: "uppercase", marginBottom: 8 }}>Structure Heat Map</div>
+          <div style={{ fontSize: 11, color: t.subtext, fontWeight: 950, textTransform: "uppercase", marginBottom: 8 }}>Engine / Gate Heat Map</div>
           <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text }}>
-            <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}><th style={{ paddingBottom: 7 }}>Axis</th><th>Structure</th><th style={{ textAlign: "center" }}>Fails</th><th style={{ textAlign: "center" }}>Top Mode</th><th style={{ textAlign: "center" }}>TI</th><th style={{ textAlign: "center" }}>Avg Rec</th><th style={{ textAlign: "center" }}>Open</th></tr></thead>
-            <tbody>{heatRows.length === 0 ? <tr><td colSpan={7} style={{ padding: 10, color: t.subtext, fontWeight: 900 }}>No 2/3-dimension losses yet.</td></tr> : heatRows.map((row) => <tr key={row.key} style={{ borderBottom: `1px solid ${t.border}` }}><td style={{ padding: "8px 0", fontWeight: 950, color: COLORS.amber }}>{row.failedAxis}</td><td>{row.structure}</td><td style={{ textAlign: "center", fontWeight: 950, color: COLORS.red }}>{row.samples}</td><td style={{ textAlign: "center" }}>{row.topMode}</td><td style={{ textAlign: "center" }}>{row.topState} / {row.topRisk}</td><td style={{ textAlign: "center" }}>{row.avgDelay === null ? "—" : row.avgDelay.toFixed(1)}</td><td style={{ textAlign: "center", color: row.open ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.open}</td></tr>)}</tbody>
+            <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}><th style={{ paddingBottom: 7 }}>Axis</th><th>Engine</th><th style={{ textAlign: "center" }}>Fails</th><th style={{ textAlign: "center" }}>Top Mode</th><th style={{ textAlign: "center" }}>Gate State</th><th style={{ textAlign: "center" }}>Avg Rec</th><th style={{ textAlign: "center" }}>Open</th></tr></thead>
+            <tbody>{heatRows.length === 0 ? <tr><td colSpan={7} style={{ padding: 10, color: t.subtext, fontWeight: 900 }}>No 2/3-dimension losses yet.</td></tr> : heatRows.map((row) => <tr key={row.key} style={{ borderBottom: `1px solid ${t.border}` }}><td style={{ padding: "8px 0", fontWeight: 950, color: COLORS.amber }}>{row.failedAxis}</td><td>{row.engine}</td><td style={{ textAlign: "center", fontWeight: 950, color: COLORS.red }}>{row.samples}</td><td style={{ textAlign: "center" }}>{row.topMode}</td><td style={{ textAlign: "center", color: row.topGateState === "EXECUTE" ? COLORS.green : row.topGateState === "HOLD" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.topGateState}</td><td style={{ textAlign: "center" }}>{row.avgDelay === null ? "—" : row.avgDelay.toFixed(1)}</td><td style={{ textAlign: "center", color: row.open ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.open}</td></tr>)}</tbody>
           </table>
         </div>
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Failed Axis", "Structure", "Forecast", "Outcome", "Router Rec", "Final Mode", "Transition", "TI Risk", "Recovery", "Reason"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
-          <tbody>{rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No 2/3-dimension losses captured yet.</td></tr> : rows.slice(-100).reverse().map((row) => <tr key={`axis-${row.spin}-${row.failedAxis}`} style={{ borderBottom: `1px solid ${t.border}` }}><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td><td style={{ padding: "8px 10px", color: COLORS.amber, fontWeight: 950 }}>{row.failedAxis}</td><td style={{ padding: "8px 10px" }}>{row.structure}</td><td style={{ padding: "8px 10px" }}>{row.forecast}</td><td style={{ padding: "8px 10px" }}>{row.outcome}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.routerRecommendation}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.finalExecutionMode}</td><td style={{ padding: "8px 10px" }}>{row.transitionState}</td><td style={{ padding: "8px 10px", color: row.transitionRisk === "High" || row.transitionRisk === "Extreme" ? COLORS.red : row.transitionRisk === "Moderate" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.transitionRisk}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.recoveryDelayLabel}</td><td style={{ padding: "8px 10px", color: t.subtext, maxWidth: 420, overflow: "hidden", textOverflow: "ellipsis" }}>{row.reason}</td></tr>)}</tbody>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Failed Axis", "Engine", "Gate State", "Forecast", "Outcome", "Final Mode", "Recovery"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <tbody>{rows.length === 0 ? <tr><td colSpan={8} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No 2/3-dimension losses captured yet.</td></tr> : rows.slice(-100).reverse().map((row) => <tr key={`axis-${row.spin}-${row.failedAxis}`} style={{ borderBottom: `1px solid ${t.border}` }}><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td><td style={{ padding: "8px 10px", color: COLORS.amber, fontWeight: 950 }}>{row.failedAxis}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.engine}</td><td style={{ padding: "8px 10px", color: row.failedAxisGate.state === "EXECUTE" ? COLORS.green : row.failedAxisGate.state === "HOLD" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.failedAxisGate.label}</td><td style={{ padding: "8px 10px" }}>{row.forecast}</td><td style={{ padding: "8px 10px" }}>{row.outcome}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.finalExecutionMode}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.recoveryDelayLabel}</td></tr>)}</tbody>
         </table>
       </div>
     </Panel>;
@@ -6331,14 +6073,10 @@ const StreakAnalyticsPanel = () => {
   const ReportQuickAccessPanel = () => {
     const jump = (id: string) => document.getElementById(id)?.scrollIntoView({ behavior: "smooth", block: "start" });
     const links = [
-      ["report-router-audit", "Spin Audit"],
       ["report-loss-investigation", "Loss Streak Analysis"],
       ["report-axis-failure", "Axis Failure"],
-      ["report-execution-intelligence", "Execution Intelligence"],
       ["report-summary", "Summary"],
-      ["report-gap-summary", "Gap Summary"],
       ["report-bankroll", "Bankroll"],
-      ["report-gap-analytics", "Gap Analytics"],
       ["report-comparison", "Comparison"],
       ["report-session-log", "Session Log"],
     ];
@@ -6346,7 +6084,6 @@ const StreakAnalyticsPanel = () => {
   };
 
   const Analytics = () => <section style={{ display: "grid", gap: 14 }}>
-    <RouterAuditPanel />
     <LossInvestigationPanel />
     <AxisFailureAnalysisPanel />
     <DimensionPerformancePanel />
@@ -6356,11 +6093,8 @@ const StreakAnalyticsPanel = () => {
 
   const Reports = () => <section style={{ display: "grid", gap: 14 }}>
     <ReportQuickAccessPanel />
-    <div id="report-router-audit"><RouterAuditPanel /></div>
-    <div id="report-ti-regime-accuracy"></div>
     <div id="report-loss-investigation"><LossInvestigationPanel /></div>
-    
-    <div id="report-execution-intelligence"></div>
+    <div id="report-axis-failure"><AxisFailureAnalysisPanel /></div>
     <div id="report-summary"><Panel title="Report Summary"><div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8 }}><MiniMetric label="Start" value={startingBankroll} /><MiniMetric label="Ending" value={bankroll} /><MiniMetric label="Net" value={net} /><MiniMetric label="ROI" value={roi} /><MiniMetric label="Win Rate" value={winRate} /><MiniMetric label="Spins" value={history.length} /></div></Panel></div>
     
     <div id="report-bankroll"><BankrollChart /></div>
@@ -6520,7 +6254,7 @@ const StreakAnalyticsPanel = () => {
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
                 <Button variant="secondary" onClick={downloadCSV} disabled={!history.length}>Session CSV</Button>
-                <Button variant="secondary" onClick={downloadRouterAuditCSV} disabled={!history.length}>Spin Audit CSV</Button>
+                <Button variant="secondary" onClick={downloadSpinAuditCSV} disabled={!history.length}>Spin Audit CSV</Button>
                 <Button variant="secondary" onClick={downloadLossInvestigationCSV} disabled={!history.length}>Loss Analysis CSV</Button>
               </div>
             </div>
