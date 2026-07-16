@@ -2491,7 +2491,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   if (pulseEnabled) {
     const PULSE_WARMING     = 10;
     const PULSE_SWITCH_GAP  = 15; // pp gap required to trigger a switch
-    const PULSE_WINDOW      = 10; // rolling window for win rate
+    const PULSE_WINDOW      = 20; // rolling window for win rate — 20 spins gives 5pp steps (100/20=5), so the 15pp switch gap is an achievable, meaningful threshold (a 3-win edge) instead of secretly requiring a 2-win edge the way a 10-spin/10pp-step window did.
 
     // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
