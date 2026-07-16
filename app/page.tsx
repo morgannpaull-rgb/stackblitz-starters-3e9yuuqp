@@ -4783,6 +4783,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         signature: getStructureCompressionSignature(structure),
         forecast: forecastBasket ?? "",
         outcome: row.outcomeGroup,
+        outcomeGroup: row.outcomeGroup,
+        allEngineDiagnostics: row.allEngineDiagnostics ?? null,
         actualMode: row.executionMode,
         routerSelectedMode: routerRecommendation,
         routerRecommendation,
