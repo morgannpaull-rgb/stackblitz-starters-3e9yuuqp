@@ -100,8 +100,10 @@ type Step = {
     selectedEngine: string | null;
     isWarming: boolean;
     engineRates: Record<string, number>;
+    engineSamples?: Record<string, number>;
     switched: boolean;
     previousEngine: string | null;
+    switchZScore?: number | null;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -2490,8 +2492,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   //   - Inverted, Markov, Random use their existing prediction engines
   if (pulseEnabled) {
     const PULSE_WARMING     = 10;
-    const PULSE_SWITCH_GAP  = 15; // pp gap required to trigger a switch
-    const PULSE_WINDOW      = 20; // rolling window for win rate — 20 spins gives 5pp steps (100/20=5), so the 15pp switch gap is an achievable, meaningful threshold (a 3-win edge) instead of secretly requiring a 2-win edge the way a 10-spin/10pp-step window did.
+    const PULSE_WINDOW      = 40;   // much longer window — gives real sample size for a significance test instead of a raw percentage-point gap, which was chasing noise on short streaks (see Session Performance Findings).
+    const PULSE_MIN_SAMPLES = 15;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
+    const PULSE_SIG_Z       = 1.645; // one-tailed z-score for ~95% confidence that the challenger's rate is genuinely higher, not just noise.
 
     // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
@@ -2510,21 +2513,22 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
           isWarming: true,
           spinsRemaining: PULSE_WARMING - history.length,
           engineRates: {} as Record<string, number>,
+          engineSamples: {} as Record<string, number>,
         },
       };
     }
 
-    // Compute rolling win rate for each engine over last PULSE_WINDOW spins.
-    // Uses allEngineDiagnostics, which snapshots every engine's prediction
-    // every spin regardless of which one was actually selected — this is
-    // what makes a fair, apples-to-apples comparison possible. (Previously
-    // Markov/Random were only credited with a win if they had *already*
-    // been the selected engine that spin, which meant they could never
-    // accumulate any win rate once Pulse locked onto a different engine —
-    // a bug that made switching away from a bad engine nearly impossible.)
-    const computeEngineWinRate = (engineName: string): number => {
+    // Compute rolling win rate AND sample size for each engine over the last
+    // PULSE_WINDOW spins. Uses allEngineDiagnostics, which snapshots every
+    // engine's prediction every spin regardless of which one was actually
+    // selected — this is what makes a fair, apples-to-apples comparison
+    // possible. (Previously Markov/Random were only credited with a win if
+    // they had *already* been the selected engine that spin, which meant
+    // they could never accumulate any win rate once Pulse locked onto a
+    // different engine — a bug that made switching away from a bad engine
+    // nearly impossible.)
+    const computeEngineStats = (engineName: string): { rate: number; wins: number; n: number } => {
       const recent = history.slice(-PULSE_WINDOW);
-      if (recent.length < 3) return 0;
       let wins = 0;
       let evaluated = 0;
 
@@ -2560,17 +2564,37 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         }
       }
 
-      return evaluated > 0 ? Math.round(wins / evaluated * 100) : 0;
+      return { rate: evaluated > 0 ? Math.round(wins / evaluated * 100) : 0, wins, n: evaluated };
     };
 
-    const engineRates: Record<string, number> = {
-      Straight: computeEngineWinRate("Straight"),
-      Inverted: computeEngineWinRate("Inverted"),
-      Markov:   computeEngineWinRate("Markov"),
-      Random:   computeEngineWinRate("Random"),
+    const engineStats: Record<string, { rate: number; wins: number; n: number }> = {
+      Straight: computeEngineStats("Straight"),
+      Inverted: computeEngineStats("Inverted"),
+      Markov:   computeEngineStats("Markov"),
+      Random:   computeEngineStats("Random"),
+    };
+    const engineRates: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.rate]));
+    const engineSamples: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.n]));
+
+    // Two-proportion one-tailed z-test: is the challenger's win rate
+    // *statistically* higher than the current engine's, or is this gap just
+    // noise? Both engines need a real sample size before we trust either
+    // rate at all — with roulette payouts this close to 50/50, a handful of
+    // spins is not enough to tell skill from luck, which is exactly what
+    // made the old raw-percentage-gap rule chase hot streaks that were
+    // about to revert (see Session Performance Findings).
+    const zScoreForChallenger = (challenger: { wins: number; n: number }, current: { wins: number; n: number }): number | null => {
+      if (challenger.n < PULSE_MIN_SAMPLES || current.n < PULSE_MIN_SAMPLES) return null;
+      const p1 = challenger.wins / challenger.n;
+      const p2 = current.wins / current.n;
+      const pooled = (challenger.wins + current.wins) / (challenger.n + current.n);
+      const se = Math.sqrt(pooled * (1 - pooled) * (1 / challenger.n + 1 / current.n));
+      if (se === 0) return p1 > p2 ? Infinity : 0;
+      return (p1 - p2) / se;
     };
 
-    // Find the best engine
+    // Find the best engine by raw rate (for display/ranking purposes only —
+    // the actual switch decision below still requires significance).
     let bestEngine = "Straight";
     let bestRate = engineRates["Straight"];
     for (const [engine, rate] of Object.entries(engineRates)) {
@@ -2582,10 +2606,12 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
     let selectedEngine = bestEngine;
+    let switchZScore: number | null = null;
     if (currentEngine && currentEngine !== bestEngine) {
-      const currentRate = engineRates[currentEngine] ?? 0;
-      // Only switch if challenger leads by ≥ PULSE_SWITCH_GAP
-      if (bestRate - currentRate < PULSE_SWITCH_GAP) {
+      switchZScore = zScoreForChallenger(engineStats[bestEngine], engineStats[currentEngine]);
+      // Only switch if the challenger is statistically significantly better
+      // — not just numerically ahead on a small, noisy sample.
+      if (switchZScore === null || switchZScore < PULSE_SIG_Z) {
         selectedEngine = currentEngine; // stay with current
       }
     }
@@ -2620,8 +2646,10 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       isWarming: false,
       spinsRemaining: 0,
       engineRates,
+      engineSamples,
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
+      switchZScore,
     };
 
     return {
@@ -2629,7 +2657,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       source: "PULSE" as const,
       mode,
       pulseEngineTracker: tracker,
-      reason: `Pulse · ${selectedEngine} selected (${engineRates[selectedEngine]}% / ${PULSE_WINDOW} spins) · ${Object.entries(engineRates).map(([e,r]) => `${e}:${r}%`).join(" · ")}`,
+      reason: `Pulse · ${selectedEngine} selected (${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${Object.entries(engineStats).map(([e, s]) => `${e}:${s.rate}%(n=${s.n})`).join(" · ")}`,
     };
   }
 
@@ -4706,14 +4734,15 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       .map((row) => {
         const tracker = row.pulseEngineTracker!;
         const rates = tracker.engineRates || {};
+        const samples = tracker.engineSamples || {};
         const entries = Object.entries(rates) as [string, number][];
         const maxRate = entries.length ? Math.max(...entries.map(([, v]) => v)) : 0;
         const topEntries = entries.filter(([, v]) => v === maxRate);
-        // Only declare a real leader when exactly one engine has the top rate
-        // AND that rate is above 0 — an all-tied (especially all-zero) result
-        // means there's no actual signal to prefer one engine over another,
-        // so we should not flag the active engine as "stuck" in that case.
+        // "Leader" is just the raw highest rate — for display only. The
+        // actual switch decision requires a statistically significant edge
+        // (see switchZScore/PULSE_SIG_Z), not just being numerically ahead.
         const leader = maxRate > 0 && topEntries.length === 1 ? topEntries[0][0] : "—";
+        const z = typeof tracker.switchZScore === "number" ? tracker.switchZScore : null;
         return {
           spin: row.spin,
           selectedEngine: tracker.selectedEngine ?? "—",
@@ -4723,18 +4752,25 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           invertedRate: rates["Inverted"] ?? 0,
           markovRate: rates["Markov"] ?? 0,
           randomRate: rates["Random"] ?? 0,
+          straightN: samples["Straight"] ?? 0,
+          invertedN: samples["Inverted"] ?? 0,
+          markovN: samples["Markov"] ?? 0,
+          randomN: samples["Random"] ?? 0,
           leader,
-          leaderWasSelected: leader === "—" ? true : leader === (tracker.selectedEngine ?? "—"),
+          zScore: z,
+          significant: z === null ? null : z >= 1.645,
         };
       });
   };
 
   const rowsForPulseSwitchLogExport = () => [
-    ["Spin", "Selected Engine", "Switched", "Previous Engine", "Straight %", "Inverted %", "Markov %", "Random %", "Leader", "Leader Selected"],
+    ["Spin", "Selected Engine", "Switched", "Previous Engine",
+     "Straight %", "Straight n", "Inverted %", "Inverted n", "Markov %", "Markov n", "Random %", "Random n",
+     "Raw Leader", "Challenger Z-Score", "Statistically Significant"],
     ...getPulseSwitchLogRows().map((row) => [
       row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.previousEngine,
-      row.straightRate, row.invertedRate, row.markovRate, row.randomRate,
-      row.leader, row.leaderWasSelected ? "YES" : "NO",
+      row.straightRate, row.straightN, row.invertedRate, row.invertedN, row.markovRate, row.markovN, row.randomRate, row.randomN,
+      row.leader, row.zScore === null ? "—" : row.zScore.toFixed(2), row.significant === null ? "—" : row.significant ? "YES" : "NO",
     ]),
   ];
 
@@ -6235,42 +6271,44 @@ const StreakAnalyticsPanel = () => {
   const PulseSwitchLogPanel = () => {
     const rows = getPulseSwitchLogRows();
     const switches = rows.filter((row) => row.switched);
-    const stuckStreaks = (() => {
-      // Longest run where the selected engine was NOT the current rolling leader.
+    const waitingOnSignificance = (() => {
+      // Longest run where a challenger was numerically ahead but the gap
+      // wasn't statistically significant enough to justify a switch.
       let longest = 0, current = 0;
       rows.forEach((row) => {
-        if (!row.leaderWasSelected) { current += 1; longest = Math.max(longest, current); }
+        if (row.leader !== "—" && row.leader !== row.selectedEngine) { current += 1; longest = Math.max(longest, current); }
         else current = 0;
       });
       return longest;
     })();
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling 10-spin win rate for all 4 engines, every spin, plus when/why Pulse switched. Shows whether the active engine was actually still winning the race.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch now requires a real two-proportion significance test (z ≥ 1.645, both engines n ≥ 15) — not just a numerically higher rate, which was chasing noise on short streaks.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Spins Tracked" value={rows.length} />
         <MiniMetric label="Switches" value={switches.length} />
-        <MiniMetric label="Longest Stuck Streak" value={stuckStreaks} accent={stuckStreaks >= 10 ? COLORS.red : stuckStreaks >= 5 ? COLORS.amber : COLORS.green} />
+        <MiniMetric label="Longest Non-Significant Lead" value={waitingOnSignificance} accent={waitingOnSignificance >= 20 ? COLORS.amber : COLORS.green} />
         <MiniMetric label="Current Engine" value={rows.at(-1)?.selectedEngine ?? "—"} />
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Selected", "Switched", "From", "Straight %", "Inverted %", "Markov %", "Random %", "Leader", "Stuck?"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Selected", "Switched", "From", "Straight", "Inverted", "Markov", "Random", "Leader", "Z-Score", "Significant?"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={10} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
+            {rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
               <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}` }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}%</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}%</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}%</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}%</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN})</span></td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.leader}</td>
-                <td style={{ padding: "8px 10px", color: row.leaderWasSelected ? t.subtext : COLORS.amber, fontWeight: 950 }}>{row.leaderWasSelected ? "—" : "YES"}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.zScore === null ? "—" : row.zScore.toFixed(2)}</td>
+                <td style={{ padding: "8px 10px", color: row.significant === true ? COLORS.green : row.significant === false ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.significant === null ? "—" : row.significant ? "YES" : "NO"}</td>
               </tr>
             ))}
           </tbody>
