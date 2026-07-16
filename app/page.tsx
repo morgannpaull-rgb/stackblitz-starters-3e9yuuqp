@@ -104,6 +104,10 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
+    switchReason?: "significant" | "sustained-lean" | null;
+    challengerZScores?: Record<string, number | null>;
+    leanStreak?: number;
+    zTrendDelta?: number | null;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -2605,14 +2609,67 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
+    // Every non-current engine's z-score vs the current engine, computed
+    // fresh every spin — this is what lets us track each challenger's trend
+    // over time (not just whichever one happens to be "the leader" right
+    // now), and is what the sustained-lean rule below walks back through.
+    const challengerZScores: Record<string, number | null> = {};
+    if (currentEngine) {
+      for (const engine of Object.keys(engineStats)) {
+        if (engine === currentEngine) continue;
+        challengerZScores[engine] = zScoreForChallenger(engineStats[engine], engineStats[currentEngine]);
+      }
+    }
+
+    // PULSE_SIG_Z (~95% confidence, single spin) is a high bar that avoids
+    // chasing noise — but a real, sustained edge that sits just under that
+    // bar for a long stretch (as Inverted did for ~25 spins in one session:
+    // z climbing 0.27 → 0.93 → 1.19 → 1.32 → 1.62, never quite crossing
+    // 1.645) can get stuck too. So a challenger can ALSO trigger a switch by
+    // holding at least PULSE_LEAN_Z for PULSE_LEAN_SPINS consecutive spins
+    // in a row — persistence substitutes for a single very-high z-score.
+    const PULSE_LEAN_Z = 1.0;          // lower bar: "leaning" evidence, not full significance
+    const PULSE_LEAN_SPINS = 15;       // how many consecutive spins that lean must hold
+    const PULSE_TREND_LOOKBACK = 10;   // spins back to measure z-score trend/acceleration
+
+    const getConsecutiveLeanAndTrend = (engine: string): { consecutiveLean: number; trendDelta: number | null } => {
+      let consecutiveLean = 0;
+      let trendDelta: number | null = null;
+      let stepsBack = 0;
+      for (let i = history.length - 1; i >= 0; i--) {
+        const step = history[i] as any;
+        const stepTracker = step.pulseEngineTracker;
+        if (!stepTracker || stepTracker.isWarming || stepTracker.selectedEngine !== currentEngine) break;
+        const z = stepTracker.challengerZScores?.[engine];
+        stepsBack += 1;
+        if (trendDelta === null && stepsBack === PULSE_TREND_LOOKBACK && typeof z === "number") {
+          trendDelta = (challengerZScores[engine] ?? 0) - z;
+        }
+        if (typeof z === "number" && z >= PULSE_LEAN_Z) consecutiveLean += 1;
+        else break;
+      }
+      return { consecutiveLean, trendDelta };
+    };
+
     let selectedEngine = bestEngine;
     let switchZScore: number | null = null;
+    let switchReason: "significant" | "sustained-lean" | null = null;
+    let leanStreak = 0;
+    let zTrendDelta: number | null = null;
     if (currentEngine && currentEngine !== bestEngine) {
       switchZScore = zScoreForChallenger(engineStats[bestEngine], engineStats[currentEngine]);
-      // Only switch if the challenger is statistically significantly better
-      // — not just numerically ahead on a small, noisy sample.
-      if (switchZScore === null || switchZScore < PULSE_SIG_Z) {
-        selectedEngine = currentEngine; // stay with current
+      const leanInfo = getConsecutiveLeanAndTrend(bestEngine);
+      leanStreak = leanInfo.consecutiveLean;
+      zTrendDelta = leanInfo.trendDelta;
+
+      if (switchZScore !== null && switchZScore >= PULSE_SIG_Z) {
+        switchReason = "significant";
+      } else if (switchZScore !== null && switchZScore >= PULSE_LEAN_Z && leanStreak >= PULSE_LEAN_SPINS) {
+        switchReason = "sustained-lean";
+      }
+
+      if (!switchReason) {
+        selectedEngine = currentEngine; // stay with current — no significant edge, and no sustained lean either
       }
     }
 
@@ -2650,6 +2707,10 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
       switchZScore,
+      switchReason,
+      challengerZScores,
+      leanStreak,
+      zTrendDelta,
     };
 
     return {
@@ -4740,9 +4801,11 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const topEntries = entries.filter(([, v]) => v === maxRate);
         // "Leader" is just the raw highest rate — for display only. The
         // actual switch decision requires a statistically significant edge
-        // (see switchZScore/PULSE_SIG_Z), not just being numerically ahead.
+        // OR a sustained lean (see switchZScore/leanStreak below), not just
+        // being numerically ahead.
         const leader = maxRate > 0 && topEntries.length === 1 ? topEntries[0][0] : "—";
         const z = typeof tracker.switchZScore === "number" ? tracker.switchZScore : null;
+        const trend = typeof tracker.zTrendDelta === "number" ? tracker.zTrendDelta : null;
         return {
           spin: row.spin,
           selectedEngine: tracker.selectedEngine ?? "—",
@@ -4759,18 +4822,23 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           leader,
           zScore: z,
           significant: z === null ? null : z >= 1.645,
+          leanStreak: tracker.leanStreak ?? 0,
+          zTrend: trend,
+          accelerating: trend !== null && trend > 0.1,
+          switchReason: tracker.switchReason ?? null,
         };
       });
   };
 
   const rowsForPulseSwitchLogExport = () => [
-    ["Spin", "Selected Engine", "Switched", "Previous Engine",
+    ["Spin", "Selected Engine", "Switched", "Switch Reason", "Previous Engine",
      "Straight %", "Straight n", "Inverted %", "Inverted n", "Markov %", "Markov n", "Random %", "Random n",
-     "Raw Leader", "Challenger Z-Score", "Statistically Significant"],
+     "Raw Leader", "Challenger Z-Score", "Statistically Significant", "Lean Streak (spins)", "Z-Score Trend (Δ/10 spins)", "Accelerating"],
     ...getPulseSwitchLogRows().map((row) => [
-      row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.previousEngine,
+      row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
       row.straightRate, row.straightN, row.invertedRate, row.invertedN, row.markovRate, row.markovN, row.randomRate, row.randomN,
       row.leader, row.zScore === null ? "—" : row.zScore.toFixed(2), row.significant === null ? "—" : row.significant ? "YES" : "NO",
+      row.leanStreak, row.zTrend === null ? "—" : row.zTrend.toFixed(2), row.zTrend === null ? "—" : row.accelerating ? "YES" : "NO",
     ]),
   ];
 
@@ -6271,36 +6339,30 @@ const StreakAnalyticsPanel = () => {
   const PulseSwitchLogPanel = () => {
     const rows = getPulseSwitchLogRows();
     const switches = rows.filter((row) => row.switched);
-    const waitingOnSignificance = (() => {
-      // Longest run where a challenger was numerically ahead but the gap
-      // wasn't statistically significant enough to justify a switch.
-      let longest = 0, current = 0;
-      rows.forEach((row) => {
-        if (row.leader !== "—" && row.leader !== row.selectedEngine) { current += 1; longest = Math.max(longest, current); }
-        else current = 0;
-      });
-      return longest;
-    })();
+    const leanSwitches = switches.filter((row) => row.switchReason === "sustained-lean");
+    const maxLeanStreak = rows.length ? Math.max(...rows.map((row) => row.leanStreak)) : 0;
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch now requires a real two-proportion significance test (z ≥ 1.645, both engines n ≥ 15) — not just a numerically higher rate, which was chasing noise on short streaks.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch triggers on EITHER a strong single-spin significance test (z ≥ 1.645) OR a sustained lean (challenger holds z ≥ 1.0 for 15+ consecutive spins) — the latter catches a real, gradually-building edge that a single-spin test alone would keep ignoring.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Spins Tracked" value={rows.length} />
         <MiniMetric label="Switches" value={switches.length} />
-        <MiniMetric label="Longest Non-Significant Lead" value={waitingOnSignificance} accent={waitingOnSignificance >= 20 ? COLORS.amber : COLORS.green} />
+        <MiniMetric label="Sustained-Lean Switches" value={leanSwitches.length} accent={leanSwitches.length ? COLORS.cyan : t.subtext} />
+        <MiniMetric label="Longest Lean Streak" value={maxLeanStreak} accent={maxLeanStreak >= 15 ? COLORS.amber : t.subtext} />
         <MiniMetric label="Current Engine" value={rows.at(-1)?.selectedEngine ?? "—"} />
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Selected", "Switched", "From", "Straight", "Inverted", "Markov", "Random", "Leader", "Z-Score", "Significant?"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Selected", "Switched", "Reason", "From", "Straight", "Inverted", "Markov", "Random", "Leader", "Z-Score", "Lean Streak", "Trend", "Accel?"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
+            {rows.length === 0 ? <tr><td colSpan={14} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
               <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}` }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
+                <td style={{ padding: "8px 10px", color: row.switchReason === "significant" ? COLORS.green : row.switchReason === "sustained-lean" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
@@ -6308,7 +6370,9 @@ const StreakAnalyticsPanel = () => {
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN})</span></td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.leader}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.zScore === null ? "—" : row.zScore.toFixed(2)}</td>
-                <td style={{ padding: "8px 10px", color: row.significant === true ? COLORS.green : row.significant === false ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.significant === null ? "—" : row.significant ? "YES" : "NO"}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center", color: row.leanStreak >= 15 ? COLORS.amber : t.subtext, fontWeight: row.leanStreak >= 15 ? 950 : 400 }}>{row.leanStreak || "—"}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.zTrend === null ? "—" : (row.zTrend > 0 ? "+" : "") + row.zTrend.toFixed(2)}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center", color: row.accelerating ? COLORS.cyan : t.subtext, fontWeight: row.accelerating ? 950 : 400 }}>{row.zTrend === null ? "—" : row.accelerating ? "YES" : "NO"}</td>
               </tr>
             ))}
           </tbody>
