@@ -94,6 +94,23 @@ type Step = {
   pulseAudit?: PulseAudit;
   pulseDivergence?: PulseDivergenceResult;
   pulseSelectedEngine?: string | null;
+  // Full Pulse engine-tracker snapshot (all 4 rolling win rates + switch info),
+  // not just the selected engine name — needed for the Pulse switch log.
+  pulseEngineTracker?: {
+    selectedEngine: string | null;
+    isWarming: boolean;
+    engineRates: Record<string, number>;
+    switched: boolean;
+    previousEngine: string | null;
+  } | null;
+  // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
+  // which one Pulse actually selected — lets us audit engines retroactively.
+  allEngineDiagnostics?: {
+    straight: { gate: PulseDivergenceResult | null; group: GroupKey | null };
+    inverted: { axisDpi: { color: number; range: number; parity: number } | null; axisModes: { color: string; range: string; parity: string } | null; group: GroupKey | null };
+    markov: { axisConfidence: { color: number; range: number; parity: number } | null; group: GroupKey | null };
+    random: { axisDpi: { color: number; range: number; parity: number } | null; confidence: number | null; group: GroupKey | null };
+  } | null;
   // Engine config snapshot — captured at settle time so exports are accurate
   // even when viewed after the config has changed (e.g. post-autorun analysis).
   _pulseEnabled?: boolean;
@@ -2441,6 +2458,23 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   const inverted = bbInvertedForecast(history);
   const markov = markovForecast(history);
   const random = randomForecast(history);
+
+  // Snapshot every engine's per-axis diagnostic every spin, regardless of
+  // which engine ends up selected below. This is what lets us audit any
+  // engine retroactively (e.g. "what was Markov's confidence during this
+  // Inverted-driven loss streak?").
+  const allEngineDiagnostics = {
+    straight: { gate: (straight as any).pulseDivergence ?? null, group: (straight as any).group ?? null },
+    inverted: { axisDpi: (inverted as any).axisDpi ?? null, axisModes: (inverted as any).axisModes ?? null, group: (inverted as any).group ?? null },
+    markov: { axisConfidence: (markov as any).markovAxisConfidence ?? null, group: (markov as any).group ?? null },
+    random: { axisDpi: (random as any).axisDpi ?? null, confidence: (random as any).confidence ?? null, group: (random as any).group ?? null },
+  };
+
+  const decision = getActiveDecisionCore(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, straight, inverted, markov, random);
+  return { ...decision, allEngineDiagnostics };
+}
+
+function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled: boolean, randomEnabled: boolean, straight: any, inverted: any, markov: any, random: any) {
   const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
 
   // ── PULSE: Engine Performance Tracker ────────────────────────────────────
@@ -3540,6 +3574,8 @@ const active = !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine
     pulseAudit: buildPulseAuditRecord(f, lockedOutcomeGroup, lockedForecastGroup, result, active),
     pulseDivergence: (f as any).pulseDivergence ?? null,
     pulseSelectedEngine: (f as any).pulseEngineTracker?.selectedEngine ?? null,
+    pulseEngineTracker: (f as any).pulseEngineTracker ?? null,
+    allEngineDiagnostics: (f as any).allEngineDiagnostics ?? null,
     // Snapshot of engine config at time of spin
     _pulseEnabled: pulseEnabled,
     _bbStraightEnabled: bbStraightEnabled,
@@ -4589,8 +4625,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     return "—";
   };
 
-  const getGateSummaryForAxis = (row: Step, axis: "color" | "range" | "parity") => {
-    const d = (row.pulseDivergence as any)?.[axis];
+  const getGateSummaryFromDivergence = (divergence: any, axis: "color" | "range" | "parity") => {
+    const d = divergence?.[axis];
     if (!d) return { state: "—", gateName: "—", fitPct: null as number | null, label: "—" };
     const state = d.performanceState ?? "—";
     const gateName = d.selectedGate ?? "—";
@@ -4601,6 +4637,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     return { state, gateName, fitPct, label };
   };
 
+  const getGateSummaryForAxis = (row: Step, axis: "color" | "range" | "parity") => getGateSummaryFromDivergence(row.pulseDivergence, axis);
+
   const getEngineGateSummaryForRow = (row: Step) => {
     const engine = getEngineLabelForRow(row);
     const colorGate = getGateSummaryForAxis(row, "color");
@@ -4608,6 +4646,93 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const parityGate = getGateSummaryForAxis(row, "parity");
     return { engine, colorGate, rangeGate, parityGate };
   };
+
+  // ─── ALL-ENGINE DIAGNOSTICS (audit any engine, not just the active one) ────
+  // Every spin, all 4 engines are computed silently — Pulse just picks a
+  // winner. This reads the other 3 back out of history so a loss streak
+  // driven by e.g. Inverted isn't a black box: we can see what Straight,
+  // Markov, and Random would have predicted and whether they'd have won.
+  const fmtSigned = (n: number | null | undefined) => typeof n === "number" ? (n > 0 ? `+${n}` : `${n}`) : "—";
+
+  const getAllEngineDiagnosticsForRow = (row: Step) => {
+    const diag = row.allEngineDiagnostics;
+    const outcome = row.outcomeGroup as GroupKey | null;
+    const wouldWin = (predicted: GroupKey | null | undefined) => predicted && outcome ? predicted === outcome : null;
+
+    const straightGate = diag?.straight?.gate ?? null;
+    const straightAxes = {
+      color: getGateSummaryFromDivergence(straightGate, "color"),
+      range: getGateSummaryFromDivergence(straightGate, "range"),
+      parity: getGateSummaryFromDivergence(straightGate, "parity"),
+    };
+    const straightLabel = !diag?.straight ? "—" : straightAxes.color.state === "WARMING" ? "WARMING" : `C:${straightAxes.color.label} R:${straightAxes.range.label} P:${straightAxes.parity.label}`;
+
+    const invDpi = diag?.inverted?.axisDpi ?? null;
+    const invModes = diag?.inverted?.axisModes ?? null;
+    const invertedLabel = invDpi
+      ? `C:${fmtSigned(invDpi.color)}${invModes ? `(${invModes.color[0]})` : ""} R:${fmtSigned(invDpi.range)}${invModes ? `(${invModes.range[0]})` : ""} P:${fmtSigned(invDpi.parity)}${invModes ? `(${invModes.parity[0]})` : ""}`
+      : "—";
+
+    const mkvConf = diag?.markov?.axisConfidence ?? null;
+    const markovLabel = mkvConf ? `C:${mkvConf.color}% R:${mkvConf.range}% P:${mkvConf.parity}%` : "—";
+
+    const rndDpi = diag?.random?.axisDpi ?? null;
+    const rndConfidence = diag?.random?.confidence ?? null;
+    const randomLabel = rndDpi
+      ? `C:${fmtSigned(rndDpi.color)} R:${fmtSigned(rndDpi.range)} P:${fmtSigned(rndDpi.parity)}${typeof rndConfidence === "number" ? ` (${rndConfidence}%)` : ""}`
+      : "—";
+
+    return {
+      straight: { label: straightLabel, group: diag?.straight?.group ?? null, wouldWin: wouldWin(diag?.straight?.group) },
+      inverted: { label: invertedLabel, group: diag?.inverted?.group ?? null, wouldWin: wouldWin(diag?.inverted?.group) },
+      markov: { label: markovLabel, group: diag?.markov?.group ?? null, wouldWin: wouldWin(diag?.markov?.group) },
+      random: { label: randomLabel, group: diag?.random?.group ?? null, wouldWin: wouldWin(diag?.random?.group) },
+    };
+  };
+
+  // Compact per-row indicator: which of the 4 engines would have won this spin.
+  const getAllEngineCompactLabel = (row: Step) => {
+    const d = getAllEngineDiagnosticsForRow(row);
+    const mark = (e: { wouldWin: boolean | null }) => e.wouldWin === true ? "✓" : e.wouldWin === false ? "✗" : "—";
+    return `S${mark(d.straight)} I${mark(d.inverted)} M${mark(d.markov)} R${mark(d.random)}`;
+  };
+
+  // ─── PULSE SWITCH LOG ───────────────────────────────────────────────────────
+  // Full rolling win-rate horse race between all 4 engines, per spin, plus
+  // when/why Pulse switched. Answers: was the active engine actually still
+  // winning the race, or stuck without a challenger clearing the 15pp gap?
+  const getPulseSwitchLogRows = () => {
+    return history
+      .filter((row) => row.pulseEngineTracker && !row.pulseEngineTracker.isWarming)
+      .map((row) => {
+        const tracker = row.pulseEngineTracker!;
+        const rates = tracker.engineRates || {};
+        const leader = Object.entries(rates).sort((a, b) => (b[1] as number) - (a[1] as number))[0]?.[0] ?? "—";
+        return {
+          spin: row.spin,
+          selectedEngine: tracker.selectedEngine ?? "—",
+          switched: tracker.switched,
+          previousEngine: tracker.previousEngine ?? "—",
+          straightRate: rates["Straight"] ?? 0,
+          invertedRate: rates["Inverted"] ?? 0,
+          markovRate: rates["Markov"] ?? 0,
+          randomRate: rates["Random"] ?? 0,
+          leader,
+          leaderWasSelected: leader === (tracker.selectedEngine ?? "—"),
+        };
+      });
+  };
+
+  const rowsForPulseSwitchLogExport = () => [
+    ["Spin", "Selected Engine", "Switched", "Previous Engine", "Straight %", "Inverted %", "Markov %", "Random %", "Leader", "Leader Selected"],
+    ...getPulseSwitchLogRows().map((row) => [
+      row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.previousEngine,
+      row.straightRate, row.invertedRate, row.markovRate, row.randomRate,
+      row.leader, row.leaderWasSelected ? "YES" : "NO",
+    ]),
+  ];
+
+  const downloadPulseSwitchLogCSV = () => downloadRowsAsCSV(rowsForPulseSwitchLogExport(), "edgelab_pulse_switch_log.csv");
 
   const getSpinAuditRows = () => {
     return history.map((row, index) => {
@@ -4757,13 +4882,16 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   };
 
   const rowsForLossInvestigationExport = () => [
-    ["Streak ID", "Start Spin", "End Spin", "Length", "Avg Dim Correct", "Spin", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Forecast", "Outcome", "Dimensions Correct", "Color", "Range", "Parity", "Core Hit", "Winning Source"],
+    ["Streak ID", "Start Spin", "End Spin", "Length", "Avg Dim Correct", "Spin", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Forecast", "Outcome", "Dimensions Correct", "Color", "Range", "Parity", "Core Hit", "Winning Source",
+     "Straight Predicted", "Straight Would Win", "Straight Diagnostic", "Inverted Predicted", "Inverted Would Win", "Inverted Diagnostic", "Markov Predicted", "Markov Would Win", "Markov Diagnostic", "Random Predicted", "Random Would Win", "Random Diagnostic"],
     ...getLossInvestigationRows().map((row) => {
       const fc = row.forecast ? groupToBits(row.forecast as GroupKey) : null;
       const oc = row.outcome ? groupToBits(row.outcome as GroupKey) : null;
       const colorHit  = fc && oc ? (fc[0]===oc[0]?"C":"I") : "—";
       const rangeHit  = fc && oc ? (fc[1]===oc[1]?"C":"I") : "—";
       const parityHit = fc && oc ? (fc[2]===oc[2]?"C":"I") : "—";
+      const allEngines = getAllEngineDiagnosticsForRow(row);
+      const winLabel = (v: boolean | null) => v === true ? "YES" : v === false ? "NO" : "—";
       return [
         row.streakId, row.startSpin, row.endSpin, row.length,
         row.avgDim.toFixed(2), row.spin,
@@ -4771,9 +4899,14 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         row.forecast, row.outcome, row.dimensionsCorrect,
         colorHit, rangeHit, parityHit,
         row.coreHit, row.winningSource,
+        allEngines.straight.group ?? "—", winLabel(allEngines.straight.wouldWin), allEngines.straight.label,
+        allEngines.inverted.group ?? "—", winLabel(allEngines.inverted.wouldWin), allEngines.inverted.label,
+        allEngines.markov.group ?? "—", winLabel(allEngines.markov.wouldWin), allEngines.markov.label,
+        allEngines.random.group ?? "—", winLabel(allEngines.random.wouldWin), allEngines.random.label,
       ];
     }),
   ];
+
 
   const downloadSpinAuditCSV = () => downloadRowsAsCSV(rowsForSpinAuditExport(), "edgelab_spin_audit.csv");
   const downloadLossInvestigationCSV = () => downloadRowsAsCSV(rowsForLossInvestigationExport(), "edgelab_loss_investigation.csv");
@@ -4852,21 +4985,30 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   };
 
   const rowsForAxisFailureExport = () => [
-    ["Spin", "Failed Axis", "Engine", "Gate State", "Forecast", "Outcome", "Final Execution Mode", "Color Correct", "Range Correct", "Parity Correct", "Recovery Spin", "Recovery Delay"],
-    ...getAxisFailureRows().map((row) => [
-      row.spin,
-      row.failedAxis,
-      row.engine,
-      row.failedAxisGate.label,
-      row.forecast,
-      row.outcome,
-      row.finalExecutionMode,
-      row.colorCorrect === null ? "—" : row.colorCorrect ? "YES" : "NO",
-      row.rangeCorrect === null ? "—" : row.rangeCorrect ? "YES" : "NO",
-      row.parityCorrect === null ? "—" : row.parityCorrect ? "YES" : "NO",
-      row.recoverySpin,
-      row.recoveryDelayLabel,
-    ]),
+    ["Spin", "Failed Axis", "Engine", "Gate State", "Forecast", "Outcome", "Final Execution Mode", "Color Correct", "Range Correct", "Parity Correct", "Recovery Spin", "Recovery Delay",
+     "Straight Predicted", "Straight Would Win", "Inverted Predicted", "Inverted Would Win", "Markov Predicted", "Markov Would Win", "Random Predicted", "Random Would Win"],
+    ...getAxisFailureRows().map((row) => {
+      const allEngines = getAllEngineDiagnosticsForRow(row);
+      const winLabel = (v: boolean | null) => v === true ? "YES" : v === false ? "NO" : "—";
+      return [
+        row.spin,
+        row.failedAxis,
+        row.engine,
+        row.failedAxisGate.label,
+        row.forecast,
+        row.outcome,
+        row.finalExecutionMode,
+        row.colorCorrect === null ? "—" : row.colorCorrect ? "YES" : "NO",
+        row.rangeCorrect === null ? "—" : row.rangeCorrect ? "YES" : "NO",
+        row.parityCorrect === null ? "—" : row.parityCorrect ? "YES" : "NO",
+        row.recoverySpin,
+        row.recoveryDelayLabel,
+        allEngines.straight.group ?? "—", winLabel(allEngines.straight.wouldWin),
+        allEngines.inverted.group ?? "—", winLabel(allEngines.inverted.wouldWin),
+        allEngines.markov.group ?? "—", winLabel(allEngines.markov.wouldWin),
+        allEngines.random.group ?? "—", winLabel(allEngines.random.wouldWin),
+      ];
+    }),
   ];
 
   const downloadAxisFailureCSV = () => downloadRowsAsCSV(rowsForAxisFailureExport(), "edgelab_axis_failure_analysis.csv");
@@ -5380,6 +5522,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
                 <th style={{ padding: "8px 10px" }}>Color Gate</th>
                 <th style={{ padding: "8px 10px" }}>Range Gate</th>
                 <th style={{ padding: "8px 10px" }}>Parity Gate</th>
+                <th style={{ padding: "8px 10px" }}>All Engines</th>
                 <th style={{ padding: "8px 10px" }}>Net</th>
                 <th style={{ padding: "8px 10px" }}>Mode</th>
               </tr>
@@ -5390,6 +5533,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
                 const outcomeLabel = `${String(row.outcome)}(${row.outcomeGroup})`;
                 const auditRow = audit.auditRows.find((candidate) => candidate.spin === row.spin);
                 const gateColor = (state?: string) => state === "EXECUTE" ? COLORS.green : state === "HOLD" ? COLORS.amber : t.subtext;
+                const allEngines = getAllEngineDiagnosticsForRow(row);
+                const tooltip = `Straight: ${allEngines.straight.label} (${allEngines.straight.group ?? "—"})\nInverted: ${allEngines.inverted.label} (${allEngines.inverted.group ?? "—"})\nMarkov: ${allEngines.markov.label} (${allEngines.markov.group ?? "—"})\nRandom: ${allEngines.random.label} (${allEngines.random.group ?? "—"})`;
                 return <tr key={`audit-${row.spin}`} style={{ borderBottom: `1px solid ${t.border}`, background: row.result === "win" ? "rgba(34,197,94,0.07)" : row.result === "loss" ? "rgba(239,68,68,0.06)" : "rgba(245,158,11,0.05)" }}>
                   <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                   <td style={{ padding: "8px 10px", color: COLORS.cyan, fontWeight: 950 }}>{forecastLabel}</td>
@@ -5399,6 +5544,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
                   <td style={{ padding: "8px 10px", fontWeight: 900, color: gateColor(auditRow?.colorGate.state) }}>{auditRow?.colorGate.label ?? "—"}</td>
                   <td style={{ padding: "8px 10px", fontWeight: 900, color: gateColor(auditRow?.rangeGate.state) }}>{auditRow?.rangeGate.label ?? "—"}</td>
                   <td style={{ padding: "8px 10px", fontWeight: 900, color: gateColor(auditRow?.parityGate.state) }}>{auditRow?.parityGate.label ?? "—"}</td>
+                  <td style={{ padding: "8px 10px", fontFamily: "ui-monospace, monospace", cursor: "help" }} title={tooltip}>{getAllEngineCompactLabel(row)}</td>
                   <td style={{ padding: "8px 10px", color: row.net > 0 ? COLORS.green : row.net < 0 ? COLORS.red : t.subtext, fontWeight: 900 }}>{row.net}</td>
                   <td style={{ padding: "8px 10px", color: t.subtext, maxWidth: 240, overflow: "hidden", textOverflow: "ellipsis" }}>{row.executionMode}</td>
                 </tr>;
@@ -5547,7 +5693,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       </table>
     </CollapsiblePanel>;
   };
-  const ControlsPanel = () => <section style={{ marginBottom: 14, display: "grid", gap: 10 }}><button onClick={() => setControlsOpen(v => !v)} style={{ height: 42, borderRadius: 14, border: `1px solid ${t.border}`, background: t.panel, color: t.text, fontWeight: 950, cursor: "pointer", textAlign: "left", padding: "0 14px" }}>{controlsOpen ? "▾" : "▸"} Controls</button>{controlsOpen ? <Panel><div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr)) repeat(3, 118px)", gap: 10, alignItems: "end" }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Starting Bankroll</div><Input type="number" value={startingBankroll} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_STARTING_BANKROLL; setStartingBankroll(n); rebuild(n, baseUnit, strategy); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Base Unit / Number</div><Input type="number" value={baseUnit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_BASE_UNIT; setBaseUnit(n); rebuild(startingBankroll, n, strategy); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Strategy</div><Select value={strategy} onChange={(e: any) => { const s = e.target.value as Strategy; setStrategy(s); rebuild(startingBankroll, baseUnit, s); }} options={STRATEGIES} /></div><div style={{ position: "relative" }}>{pulseEnabled ? <div style={{ position: "absolute", left: 0, top: -15, color: COLORS.cyan, fontSize: 10, fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", width: "100%" }}>{`Pulse Auto: ${effectiveExecutionMode}`}</div> : null}<div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Execution Mode</div><Select value={executionMode} onChange={(e: any) => applyExecutionMode(e.target.value as ExecutionMode)} options={visibleExecutionModes} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Auto Spins</div><Input type="number" value={autoSpins} onChange={(e: any) => setAutoSpins(Number(e.target.value) || DEFAULT_AUTO_SPINS)} /></div><Button onClick={runAuto} disabled={autoRunning}>{autoRunning ? "Running..." : "Run Auto"}</Button><Button variant="secondary" onClick={() => setHistory(h => h.slice(0, -1))} disabled={!history.length}>Undo</Button><Button variant="secondary" onClick={reset}>Reset</Button></div></Panel> : null}</section>;
+  const ControlsPanel = () => <section style={{ marginBottom: 14, display: "grid", gap: 10 }}><button onClick={() => setControlsOpen(v => !v)} style={{ height: 42, borderRadius: 14, border: `1px solid ${t.border}`, background: t.panel, color: t.text, fontWeight: 950, cursor: "pointer", textAlign: "left", padding: "0 14px" }}>{controlsOpen ? "▾" : "▸"} Controls</button>{controlsOpen ? <Panel><div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr)) repeat(3, 118px)", gap: 10, alignItems: "end" }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Starting Bankroll</div><Input type="number" value={startingBankroll} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_STARTING_BANKROLL; setStartingBankroll(n); rebuild(n, baseUnit, strategy); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Base Unit / Number</div><Input type="number" value={baseUnit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_BASE_UNIT; setBaseUnit(n); rebuild(startingBankroll, n, strategy); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Strategy</div><Select value={strategy} onChange={(e: any) => { const s = e.target.value as Strategy; setStrategy(s); rebuild(startingBankroll, baseUnit, s); }} options={STRATEGIES} /></div><div style={{ position: "relative" }}><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Execution Mode</div><Select value={executionMode} onChange={(e: any) => applyExecutionMode(e.target.value as ExecutionMode)} options={visibleExecutionModes} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Auto Spins</div><Input type="number" value={autoSpins} onChange={(e: any) => setAutoSpins(Number(e.target.value) || DEFAULT_AUTO_SPINS)} /></div><Button onClick={runAuto} disabled={autoRunning}>{autoRunning ? "Running..." : "Run Auto"}</Button><Button variant="secondary" onClick={() => setHistory(h => h.slice(0, -1))} disabled={!history.length}>Undo</Button><Button variant="secondary" onClick={reset}>Reset</Button></div></Panel> : null}</section>;
 
   const DimensionPerformancePanel = () => {
     const rows = buildDimensionPerformance(history);
@@ -5996,9 +6142,12 @@ const StreakAnalyticsPanel = () => {
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Streak", "Spin", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Final Execution", "Forecast", "Outcome", "Dim", "Win Src"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Streak", "Spin", "Engine", "Color Gate", "Range Gate", "Parity Gate", "All Engines", "Final Execution", "Forecast", "Outcome", "Dim", "Win Src"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No loss streak of 5+ yet.</td></tr> : rows.slice(-80).reverse().map((row) => (
+            {rows.length === 0 ? <tr><td colSpan={12} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No loss streak of 5+ yet.</td></tr> : rows.slice(-80).reverse().map((row) => {
+              const allEngines = getAllEngineDiagnosticsForRow(row);
+              const tooltip = `Straight: ${allEngines.straight.label} (${allEngines.straight.group ?? "—"})\nInverted: ${allEngines.inverted.label} (${allEngines.inverted.group ?? "—"})\nMarkov: ${allEngines.markov.label} (${allEngines.markov.group ?? "—"})\nRandom: ${allEngines.random.label} (${allEngines.random.group ?? "—"})`;
+              return (
               <tr key={`${row.streakId}-${row.spin}`} style={{ borderBottom: `1px solid ${t.border}` }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>L{row.length}</td>
                 <td style={{ padding: "8px 10px" }}>{row.spin}</td>
@@ -6006,13 +6155,14 @@ const StreakAnalyticsPanel = () => {
                 <td style={{ padding: "8px 10px", color: row.colorGate.state === "EXECUTE" ? COLORS.green : row.colorGate.state === "HOLD" ? COLORS.amber : t.subtext }}>{row.colorGate.label}</td>
                 <td style={{ padding: "8px 10px", color: row.rangeGate.state === "EXECUTE" ? COLORS.green : row.rangeGate.state === "HOLD" ? COLORS.amber : t.subtext }}>{row.rangeGate.label}</td>
                 <td style={{ padding: "8px 10px", color: row.parityGate.state === "EXECUTE" ? COLORS.green : row.parityGate.state === "HOLD" ? COLORS.amber : t.subtext }}>{row.parityGate.label}</td>
+                <td style={{ padding: "8px 10px", fontFamily: "ui-monospace, monospace", cursor: "help" }} title={tooltip}>{getAllEngineCompactLabel(row)}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.finalExecutionMode}</td>
                 <td style={{ padding: "8px 10px" }}>{row.forecast}</td>
                 <td style={{ padding: "8px 10px" }}>{row.outcome}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.dimensionsCorrect}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center", color: row.winningSource === "Core" ? COLORS.green : row.winningSource !== "None" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.winningSource}</td>
               </tr>
-            ))}
+            );})}
           </tbody>
         </table>
       </div>
@@ -6063,8 +6213,59 @@ const StreakAnalyticsPanel = () => {
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Failed Axis", "Engine", "Gate State", "Forecast", "Outcome", "Final Mode", "Recovery"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
-          <tbody>{rows.length === 0 ? <tr><td colSpan={8} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No 2/3-dimension losses captured yet.</td></tr> : rows.slice(-100).reverse().map((row) => <tr key={`axis-${row.spin}-${row.failedAxis}`} style={{ borderBottom: `1px solid ${t.border}` }}><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td><td style={{ padding: "8px 10px", color: COLORS.amber, fontWeight: 950 }}>{row.failedAxis}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.engine}</td><td style={{ padding: "8px 10px", color: row.failedAxisGate.state === "EXECUTE" ? COLORS.green : row.failedAxisGate.state === "HOLD" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.failedAxisGate.label}</td><td style={{ padding: "8px 10px" }}>{row.forecast}</td><td style={{ padding: "8px 10px" }}>{row.outcome}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.finalExecutionMode}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.recoveryDelayLabel}</td></tr>)}</tbody>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Failed Axis", "Engine", "Gate State", "All Engines", "Forecast", "Outcome", "Final Mode", "Recovery"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <tbody>{rows.length === 0 ? <tr><td colSpan={9} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No 2/3-dimension losses captured yet.</td></tr> : rows.slice(-100).reverse().map((row) => {
+            const allEngines = getAllEngineDiagnosticsForRow(row);
+            const tooltip = `Straight: ${allEngines.straight.label} (${allEngines.straight.group ?? "—"})\nInverted: ${allEngines.inverted.label} (${allEngines.inverted.group ?? "—"})\nMarkov: ${allEngines.markov.label} (${allEngines.markov.group ?? "—"})\nRandom: ${allEngines.random.label} (${allEngines.random.group ?? "—"})`;
+            return <tr key={`axis-${row.spin}-${row.failedAxis}`} style={{ borderBottom: `1px solid ${t.border}` }}><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td><td style={{ padding: "8px 10px", color: COLORS.amber, fontWeight: 950 }}>{row.failedAxis}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.engine}</td><td style={{ padding: "8px 10px", color: row.failedAxisGate.state === "EXECUTE" ? COLORS.green : row.failedAxisGate.state === "HOLD" ? COLORS.amber : t.subtext, fontWeight: 950 }}>{row.failedAxisGate.label}</td><td style={{ padding: "8px 10px", fontFamily: "ui-monospace, monospace", cursor: "help" }} title={tooltip}>{getAllEngineCompactLabel(row)}</td><td style={{ padding: "8px 10px" }}>{row.forecast}</td><td style={{ padding: "8px 10px" }}>{row.outcome}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.finalExecutionMode}</td><td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.recoveryDelayLabel}</td></tr>;
+          })}</tbody>
+        </table>
+      </div>
+    </Panel>;
+  };
+
+  const PulseSwitchLogPanel = () => {
+    const rows = getPulseSwitchLogRows();
+    const switches = rows.filter((row) => row.switched);
+    const stuckStreaks = (() => {
+      // Longest run where the selected engine was NOT the current rolling leader.
+      let longest = 0, current = 0;
+      rows.forEach((row) => {
+        if (!row.leaderWasSelected) { current += 1; longest = Math.max(longest, current); }
+        else current = 0;
+      });
+      return longest;
+    })();
+    return <Panel title="PULSE SWITCH LOG">
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling 10-spin win rate for all 4 engines, every spin, plus when/why Pulse switched. Shows whether the active engine was actually still winning the race.</div>
+        <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+        <MiniMetric label="Spins Tracked" value={rows.length} />
+        <MiniMetric label="Switches" value={switches.length} />
+        <MiniMetric label="Longest Stuck Streak" value={stuckStreaks} accent={stuckStreaks >= 10 ? COLORS.red : stuckStreaks >= 5 ? COLORS.amber : COLORS.green} />
+        <MiniMetric label="Current Engine" value={rows.at(-1)?.selectedEngine ?? "—"} />
+      </div>
+      <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
+        <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Selected", "Switched", "From", "Straight %", "Inverted %", "Markov %", "Random %", "Leader", "Stuck?"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <tbody>
+            {rows.length === 0 ? <tr><td colSpan={10} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
+              <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}` }}>
+                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
+                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
+                <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
+                <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}%</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}%</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}%</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}%</td>
+                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.leader}</td>
+                <td style={{ padding: "8px 10px", color: row.leaderWasSelected ? t.subtext : COLORS.amber, fontWeight: 950 }}>{row.leaderWasSelected ? "—" : "YES"}</td>
+              </tr>
+            ))}
+          </tbody>
         </table>
       </div>
     </Panel>;
@@ -6075,6 +6276,7 @@ const StreakAnalyticsPanel = () => {
     const links = [
       ["report-loss-investigation", "Loss Streak Analysis"],
       ["report-axis-failure", "Axis Failure"],
+      ["report-pulse-switch-log", "Pulse Switch Log"],
       ["report-summary", "Summary"],
       ["report-bankroll", "Bankroll"],
       ["report-comparison", "Comparison"],
@@ -6086,6 +6288,7 @@ const StreakAnalyticsPanel = () => {
   const Analytics = () => <section style={{ display: "grid", gap: 14 }}>
     <LossInvestigationPanel />
     <AxisFailureAnalysisPanel />
+    <PulseSwitchLogPanel />
     <DimensionPerformancePanel />
     <StreakAnalyticsPanel />
     <ComparisonTable title="Strategy Stability Matrix" />
@@ -6095,6 +6298,7 @@ const StreakAnalyticsPanel = () => {
     <ReportQuickAccessPanel />
     <div id="report-loss-investigation"><LossInvestigationPanel /></div>
     <div id="report-axis-failure"><AxisFailureAnalysisPanel /></div>
+    <div id="report-pulse-switch-log"><PulseSwitchLogPanel /></div>
     <div id="report-summary"><Panel title="Report Summary"><div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8 }}><MiniMetric label="Start" value={startingBankroll} /><MiniMetric label="Ending" value={bankroll} /><MiniMetric label="Net" value={net} /><MiniMetric label="ROI" value={roi} /><MiniMetric label="Win Rate" value={winRate} /><MiniMetric label="Spins" value={history.length} /></div></Panel></div>
     
     <div id="report-bankroll"><BankrollChart /></div>
