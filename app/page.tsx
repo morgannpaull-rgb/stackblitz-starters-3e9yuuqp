@@ -2496,7 +2496,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   //   - Inverted, Markov, Random use their existing prediction engines
   if (pulseEnabled) {
     const PULSE_WARMING     = 10;
-    const PULSE_WINDOW      = 25;   // rolling window for win rate — narrowed from 40 for faster reaction to real regime changes (Moderate preset), still wide enough to keep the significance test meaningful.
+    const PULSE_WINDOW      = 15;   // rolling window for win rate — narrowed further from 25 for faster reaction. Note: with PULSE_MIN_SAMPLES=10, this leaves little headroom above the trust floor, and a smaller window means noisier rates and more "leader" churn between engines, which can make the lean-streak mechanism harder to build (see Session Performance Findings).
     const PULSE_MIN_SAMPLES = 10;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
     const PULSE_SIG_Z       = 1.28; // one-tailed z-score for ~90% confidence that the challenger's rate is genuinely higher, not just noise (Moderate preset — was 1.645/~95%).
 
