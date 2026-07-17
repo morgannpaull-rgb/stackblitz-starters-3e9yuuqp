@@ -104,7 +104,7 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
-    switchReason?: "significant" | "sustained-lean" | null;
+    switchReason?: "significant" | "sustained-lean" | "accelerating-lean" | null;
     challengerZScores?: Record<string, number | null>;
     leanStreak?: number;
     zTrendDelta?: number | null;
@@ -2597,12 +2597,24 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       return (p1 - p2) / se;
     };
 
-    // Find the best engine by raw rate (for display/ranking purposes only —
-    // the actual switch decision below still requires significance).
+    // Find the best engine by raw rate — but only among engines that have
+    // enough samples to trust at all (n ≥ PULSE_MIN_SAMPLES). This matters
+    // most for the very FIRST engine pick right after warmup: with no
+    // currentEngine yet, there's no switch-decision gate to fall back on, so
+    // without this floor, whichever engine got randomly lucky on a handful
+    // of spins (e.g. 2-for-4 = "50%") would get selected outright and then
+    // benefit from the very protections meant to stop noisy switching —
+    // locking in a coin-flip result for an entire session. If nobody has
+    // enough samples yet, default to Straight as a neutral baseline rather
+    // than picking on pure noise.
     let bestEngine = "Straight";
-    let bestRate = engineRates["Straight"];
-    for (const [engine, rate] of Object.entries(engineRates)) {
-      if (rate > bestRate) { bestRate = rate; bestEngine = engine; }
+    let bestRate = -1;
+    for (const [engine, stats] of Object.entries(engineStats)) {
+      if (stats.n >= PULSE_MIN_SAMPLES && stats.rate > bestRate) { bestRate = stats.rate; bestEngine = engine; }
+    }
+    if (bestRate === -1) {
+      bestEngine = "Straight";
+      bestRate = engineRates["Straight"];
     }
 
     // Check if current selected engine (from last step) should switch
@@ -2628,9 +2640,18 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // 1.645) can get stuck too. So a challenger can ALSO trigger a switch by
     // holding at least PULSE_LEAN_Z for PULSE_LEAN_SPINS consecutive spins
     // in a row — persistence substitutes for a single very-high z-score.
+    // A SECOND, faster path exists for a lean that isn't just sitting still
+    // but actively climbing: if it's already reached a moderate bar AND
+    // gained real ground over the last 10 spins, that acceleration is its
+    // own evidence, and doesn't need the full 15-spin hold to trust (a
+    // session ending at spin 80 with a lean at 10/15 spins and climbing
+    // 1.06 → 1.49 is exactly the case this is for).
     const PULSE_LEAN_Z = 1.0;          // lower bar: "leaning" evidence, not full significance
-    const PULSE_LEAN_SPINS = 15;       // how many consecutive spins that lean must hold
+    const PULSE_LEAN_SPINS = 15;       // how many consecutive spins a flat lean must hold
     const PULSE_TREND_LOOKBACK = 10;   // spins back to measure z-score trend/acceleration
+    const PULSE_ACCEL_MIN_STREAK = 8;  // shorter hold required when the lean is also accelerating
+    const PULSE_ACCEL_MIN_Z = 1.2;     // higher instantaneous bar than plain lean, to compensate for the shorter hold
+    const PULSE_ACCEL_MIN_TREND = 1.0; // must have gained at least this much z over the last 10 spins
 
     const getConsecutiveLeanAndTrend = (engine: string): { consecutiveLean: number; trendDelta: number | null } => {
       let consecutiveLean = 0;
@@ -2653,7 +2674,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
 
     let selectedEngine = bestEngine;
     let switchZScore: number | null = null;
-    let switchReason: "significant" | "sustained-lean" | null = null;
+    let switchReason: "significant" | "sustained-lean" | "accelerating-lean" | null = null;
     let leanStreak = 0;
     let zTrendDelta: number | null = null;
     if (currentEngine && currentEngine !== bestEngine) {
@@ -2664,6 +2685,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
 
       if (switchZScore !== null && switchZScore >= PULSE_SIG_Z) {
         switchReason = "significant";
+      } else if (switchZScore !== null && switchZScore >= PULSE_ACCEL_MIN_Z && leanStreak >= PULSE_ACCEL_MIN_STREAK && zTrendDelta !== null && zTrendDelta >= PULSE_ACCEL_MIN_TREND) {
+        switchReason = "accelerating-lean";
       } else if (switchZScore !== null && switchZScore >= PULSE_LEAN_Z && leanStreak >= PULSE_LEAN_SPINS) {
         switchReason = "sustained-lean";
       }
@@ -6339,11 +6362,11 @@ const StreakAnalyticsPanel = () => {
   const PulseSwitchLogPanel = () => {
     const rows = getPulseSwitchLogRows();
     const switches = rows.filter((row) => row.switched);
-    const leanSwitches = switches.filter((row) => row.switchReason === "sustained-lean");
+    const leanSwitches = switches.filter((row) => row.switchReason === "sustained-lean" || row.switchReason === "accelerating-lean");
     const maxLeanStreak = rows.length ? Math.max(...rows.map((row) => row.leanStreak)) : 0;
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch triggers on EITHER a strong single-spin significance test (z ≥ 1.645) OR a sustained lean (challenger holds z ≥ 1.0 for 15+ consecutive spins) — the latter catches a real, gradually-building edge that a single-spin test alone would keep ignoring.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch triggers on: a strong single-spin significance test (z ≥ 1.645), OR a sustained lean (challenger holds z ≥ 1.0 for 15+ consecutive spins), OR an accelerating lean (z ≥ 1.2, held 8+ spins, and gained ≥ 1.0 over the last 10 spins — for a real edge that's climbing fast, not just sitting still). The very first engine pick after warmup also now requires n ≥ 15 before it counts, so a lucky small-sample start can't lock in for the whole session.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
@@ -6362,7 +6385,7 @@ const StreakAnalyticsPanel = () => {
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
-                <td style={{ padding: "8px 10px", color: row.switchReason === "significant" ? COLORS.green : row.switchReason === "sustained-lean" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
+                <td style={{ padding: "8px 10px", color: row.switchReason === "significant" ? COLORS.green : row.switchReason === "accelerating-lean" ? COLORS.amber : row.switchReason === "sustained-lean" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
