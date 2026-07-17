@@ -2496,9 +2496,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   //   - Inverted, Markov, Random use their existing prediction engines
   if (pulseEnabled) {
     const PULSE_WARMING     = 10;
-    const PULSE_WINDOW      = 40;   // much longer window — gives real sample size for a significance test instead of a raw percentage-point gap, which was chasing noise on short streaks (see Session Performance Findings).
-    const PULSE_MIN_SAMPLES = 15;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
-    const PULSE_SIG_Z       = 1.645; // one-tailed z-score for ~95% confidence that the challenger's rate is genuinely higher, not just noise.
+    const PULSE_WINDOW      = 25;   // rolling window for win rate — narrowed from 40 for faster reaction to real regime changes (Moderate preset), still wide enough to keep the significance test meaningful.
+    const PULSE_MIN_SAMPLES = 10;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
+    const PULSE_SIG_Z       = 1.28; // one-tailed z-score for ~90% confidence that the challenger's rate is genuinely higher, not just noise (Moderate preset — was 1.645/~95%).
 
     // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
@@ -2647,11 +2647,11 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // session ending at spin 80 with a lean at 10/15 spins and climbing
     // 1.06 → 1.49 is exactly the case this is for).
     const PULSE_LEAN_Z = 1.0;          // lower bar: "leaning" evidence, not full significance
-    const PULSE_LEAN_SPINS = 15;       // how many consecutive spins a flat lean must hold
+    const PULSE_LEAN_SPINS = 10;       // how many consecutive spins a flat lean must hold (Moderate preset — was 15)
     const PULSE_TREND_LOOKBACK = 10;   // spins back to measure z-score trend/acceleration
-    const PULSE_ACCEL_MIN_STREAK = 8;  // shorter hold required when the lean is also accelerating
-    const PULSE_ACCEL_MIN_Z = 1.2;     // higher instantaneous bar than plain lean, to compensate for the shorter hold
-    const PULSE_ACCEL_MIN_TREND = 1.0; // must have gained at least this much z over the last 10 spins
+    const PULSE_ACCEL_MIN_STREAK = 5;  // shorter hold required when the lean is also accelerating (Moderate preset — was 8)
+    const PULSE_ACCEL_MIN_Z = 1.0;     // instantaneous bar for the accelerating path (Moderate preset — was 1.2)
+    const PULSE_ACCEL_MIN_TREND = 0.7; // must have gained at least this much z over the last 10 spins (Moderate preset — was 1.0)
 
     const getConsecutiveLeanAndTrend = (engine: string): { consecutiveLean: number; trendDelta: number | null } => {
       let consecutiveLean = 0;
@@ -4819,6 +4819,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const tracker = row.pulseEngineTracker!;
         const rates = tracker.engineRates || {};
         const samples = tracker.engineSamples || {};
+        const czs = tracker.challengerZScores || {};
         const entries = Object.entries(rates) as [string, number][];
         const maxRate = entries.length ? Math.max(...entries.map(([, v]) => v)) : 0;
         const topEntries = entries.filter(([, v]) => v === maxRate);
@@ -4829,6 +4830,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const leader = maxRate > 0 && topEntries.length === 1 ? topEntries[0][0] : "—";
         const z = typeof tracker.switchZScore === "number" ? tracker.switchZScore : null;
         const trend = typeof tracker.zTrendDelta === "number" ? tracker.zTrendDelta : null;
+        const engineZ = (engine: string) => tracker.selectedEngine === engine ? null : (typeof czs[engine] === "number" ? czs[engine] as number : null);
         return {
           spin: row.spin,
           selectedEngine: tracker.selectedEngine ?? "—",
@@ -4842,9 +4844,13 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           invertedN: samples["Inverted"] ?? 0,
           markovN: samples["Markov"] ?? 0,
           randomN: samples["Random"] ?? 0,
+          straightZ: engineZ("Straight"),
+          invertedZ: engineZ("Inverted"),
+          markovZ: engineZ("Markov"),
+          randomZ: engineZ("Random"),
           leader,
           zScore: z,
-          significant: z === null ? null : z >= 1.645,
+          significant: z === null ? null : z >= 1.28,
           leanStreak: tracker.leanStreak ?? 0,
           zTrend: trend,
           accelerating: trend !== null && trend > 0.1,
@@ -4855,15 +4861,20 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const rowsForPulseSwitchLogExport = () => [
     ["Spin", "Selected Engine", "Switched", "Switch Reason", "Previous Engine",
-     "Straight %", "Straight n", "Inverted %", "Inverted n", "Markov %", "Markov n", "Random %", "Random n",
-     "Raw Leader", "Challenger Z-Score", "Statistically Significant", "Lean Streak (spins)", "Z-Score Trend (Δ/10 spins)", "Accelerating"],
+     "Straight %", "Straight n", "Straight Z (vs current)", "Inverted %", "Inverted n", "Inverted Z (vs current)",
+     "Markov %", "Markov n", "Markov Z (vs current)", "Random %", "Random n", "Random Z (vs current)",
+     "Raw Leader", "Best Challenger Z-Score", "Statistically Significant", "Lean Streak (spins)", "Z-Score Trend (Δ/10 spins)", "Accelerating"],
     ...getPulseSwitchLogRows().map((row) => [
       row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
-      row.straightRate, row.straightN, row.invertedRate, row.invertedN, row.markovRate, row.markovN, row.randomRate, row.randomN,
+      row.straightRate, row.straightN, row.straightZ === null ? "—" : row.straightZ.toFixed(2),
+      row.invertedRate, row.invertedN, row.invertedZ === null ? "—" : row.invertedZ.toFixed(2),
+      row.markovRate, row.markovN, row.markovZ === null ? "—" : row.markovZ.toFixed(2),
+      row.randomRate, row.randomN, row.randomZ === null ? "—" : row.randomZ.toFixed(2),
       row.leader, row.zScore === null ? "—" : row.zScore.toFixed(2), row.significant === null ? "—" : row.significant ? "YES" : "NO",
       row.leanStreak, row.zTrend === null ? "—" : row.zTrend.toFixed(2), row.zTrend === null ? "—" : row.accelerating ? "YES" : "NO",
     ]),
   ];
+
 
   const downloadPulseSwitchLogCSV = () => downloadRowsAsCSV(rowsForPulseSwitchLogExport(), "edgelab_pulse_switch_log.csv");
 
@@ -6366,7 +6377,7 @@ const StreakAnalyticsPanel = () => {
     const maxLeanStreak = rows.length ? Math.max(...rows.map((row) => row.leanStreak)) : 0;
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch triggers on: a strong single-spin significance test (z ≥ 1.645), OR a sustained lean (challenger holds z ≥ 1.0 for 15+ consecutive spins), OR an accelerating lean (z ≥ 1.2, held 8+ spins, and gained ≥ 1.0 over the last 10 spins — for a real edge that's climbing fast, not just sitting still). The very first engine pick after warmup also now requires n ≥ 15 before it counts, so a lucky small-sample start can't lock in for the whole session.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch triggers on: a strong single-spin significance test (z ≥ 1.28, ~90% confidence), OR a sustained lean (challenger holds z ≥ 1.0 for 10+ consecutive spins), OR an accelerating lean (z ≥ 1.0, held 5+ spins, and gained ≥ 0.7 over the last 10 spins — for a real edge that's climbing fast, not just sitting still). The very first engine pick after warmup also requires n ≥ 10 before it counts, so a lucky small-sample start can't lock in for the whole session.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
