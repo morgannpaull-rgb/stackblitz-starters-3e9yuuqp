@@ -2498,7 +2498,6 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const PULSE_WARMING     = 10;
     const PULSE_WINDOW      = 15;   // rolling window for win rate — narrowed further from 25 for faster reaction. Note: with PULSE_MIN_SAMPLES=10, this leaves little headroom above the trust floor, and a smaller window means noisier rates and more "leader" churn between engines, which can make the lean-streak mechanism harder to build (see Session Performance Findings).
     const PULSE_MIN_SAMPLES = 10;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
-    const PULSE_SIG_Z       = 1.28; // one-tailed z-score for ~90% confidence that the challenger's rate is genuinely higher, not just noise (Moderate preset — was 1.645/~95%).
 
     // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
@@ -2633,12 +2632,13 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       }
     }
 
-    // PULSE_SIG_Z (~95% confidence, single spin) is a high bar that avoids
-    // chasing noise — but a real, sustained edge that sits just under that
-    // bar for a long stretch (as Inverted did for ~25 spins in one session:
-    // z climbing 0.27 → 0.93 → 1.19 → 1.32 → 1.62, never quite crossing
-    // 1.645) can get stuck too. So a challenger can ALSO trigger a switch by
-    // holding at least PULSE_LEAN_Z for PULSE_LEAN_SPINS consecutive spins
+    // A single-spin significance test (the "Significant" path) used to sit
+    // here as a high bar for an immediate switch — it was removed because at
+    // small windows it fires on pure noise nearly as easily as on a real
+    // edge, and testing showed it repeatedly switching onto an engine right
+    // before that engine went cold. Now a challenger can ONLY trigger a
+    // switch by demonstrating its edge over multiple spins: either holding
+    // at least PULSE_LEAN_Z for PULSE_LEAN_SPINS consecutive spins
     // in a row — persistence substitutes for a single very-high z-score.
     // A SECOND, faster path exists for a lean that isn't just sitting still
     // but actively climbing: if it's already reached a moderate bar AND
@@ -2683,16 +2683,22 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       leanStreak = leanInfo.consecutiveLean;
       zTrendDelta = leanInfo.trendDelta;
 
-      if (switchZScore !== null && switchZScore >= PULSE_SIG_Z) {
-        switchReason = "significant";
-      } else if (switchZScore !== null && switchZScore >= PULSE_ACCEL_MIN_Z && leanStreak >= PULSE_ACCEL_MIN_STREAK && zTrendDelta !== null && zTrendDelta >= PULSE_ACCEL_MIN_TREND) {
+      // The single-spin "significant" trigger (z ≥ PULSE_SIG_Z on one snapshot)
+      // was removed: at small windows it fires on pure noise as easily as on
+      // a real edge, and testing showed it repeatedly switching onto an
+      // engine right before that engine went cold (see Session Performance
+      // Findings). Both remaining paths require the edge to be demonstrated
+      // over multiple spins — persistence (sustained-lean) or persistence
+      // AND upward movement (accelerating-lean) — rather than a one-off
+      // reading, which is a much harder bar for noise to clear by chance.
+      if (switchZScore !== null && switchZScore >= PULSE_ACCEL_MIN_Z && leanStreak >= PULSE_ACCEL_MIN_STREAK && zTrendDelta !== null && zTrendDelta >= PULSE_ACCEL_MIN_TREND) {
         switchReason = "accelerating-lean";
       } else if (switchZScore !== null && switchZScore >= PULSE_LEAN_Z && leanStreak >= PULSE_LEAN_SPINS) {
         switchReason = "sustained-lean";
       }
 
       if (!switchReason) {
-        selectedEngine = currentEngine; // stay with current — no significant edge, and no sustained lean either
+        selectedEngine = currentEngine; // stay with current — no sustained or accelerating lean yet
       }
     }
 
@@ -4850,7 +4856,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           randomZ: engineZ("Random"),
           leader,
           zScore: z,
-          significant: z === null ? null : z >= 1.28,
+          strongSnapshot: z === null ? null : z >= 1.28,
           leanStreak: tracker.leanStreak ?? 0,
           zTrend: trend,
           accelerating: trend !== null && trend > 0.1,
@@ -4863,14 +4869,14 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     ["Spin", "Selected Engine", "Switched", "Switch Reason", "Previous Engine",
      "Straight %", "Straight n", "Straight Z (vs current)", "Inverted %", "Inverted n", "Inverted Z (vs current)",
      "Markov %", "Markov n", "Markov Z (vs current)", "Random %", "Random n", "Random Z (vs current)",
-     "Raw Leader", "Best Challenger Z-Score", "Statistically Significant", "Lean Streak (spins)", "Z-Score Trend (Δ/10 spins)", "Accelerating"],
+     "Raw Leader", "Best Challenger Z-Score", "Strong Single-Spin Z (info only, not a trigger)", "Lean Streak (spins)", "Z-Score Trend (Δ/10 spins)", "Accelerating"],
     ...getPulseSwitchLogRows().map((row) => [
       row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
       row.straightRate, row.straightN, row.straightZ === null ? "—" : row.straightZ.toFixed(2),
       row.invertedRate, row.invertedN, row.invertedZ === null ? "—" : row.invertedZ.toFixed(2),
       row.markovRate, row.markovN, row.markovZ === null ? "—" : row.markovZ.toFixed(2),
       row.randomRate, row.randomN, row.randomZ === null ? "—" : row.randomZ.toFixed(2),
-      row.leader, row.zScore === null ? "—" : row.zScore.toFixed(2), row.significant === null ? "—" : row.significant ? "YES" : "NO",
+      row.leader, row.zScore === null ? "—" : row.zScore.toFixed(2), row.strongSnapshot === null ? "—" : row.strongSnapshot ? "YES" : "NO",
       row.leanStreak, row.zTrend === null ? "—" : row.zTrend.toFixed(2), row.zTrend === null ? "—" : row.accelerating ? "YES" : "NO",
     ]),
   ];
@@ -6377,7 +6383,7 @@ const StreakAnalyticsPanel = () => {
     const maxLeanStreak = rows.length ? Math.max(...rows.map((row) => row.leanStreak)) : 0;
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch triggers on: a strong single-spin significance test (z ≥ 1.28, ~90% confidence), OR a sustained lean (challenger holds z ≥ 1.0 for 10+ consecutive spins), OR an accelerating lean (z ≥ 1.0, held 5+ spins, and gained ≥ 0.7 over the last 10 spins — for a real edge that's climbing fast, not just sitting still). The very first engine pick after warmup also requires n ≥ 10 before it counts, so a lucky small-sample start can't lock in for the whole session.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch now requires the edge to be demonstrated over multiple spins, not a one-off snapshot: either a sustained lean (challenger holds z ≥ 1.0 for 10+ consecutive spins) OR an accelerating lean (z ≥ 1.0, held 5+ spins, and gained ≥ 0.7 over the last 10 spins — for a real edge that's climbing fast). The single-spin significance trigger was removed — at small windows it fired on noise nearly as easily as on a real edge. The very first engine pick after warmup also requires n ≥ 10 before it counts, so a lucky small-sample start can't lock in for the whole session.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
@@ -6396,7 +6402,7 @@ const StreakAnalyticsPanel = () => {
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
-                <td style={{ padding: "8px 10px", color: row.switchReason === "significant" ? COLORS.green : row.switchReason === "accelerating-lean" ? COLORS.amber : row.switchReason === "sustained-lean" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
+                <td style={{ padding: "8px 10px", color: row.switchReason === "accelerating-lean" ? COLORS.amber : row.switchReason === "sustained-lean" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
