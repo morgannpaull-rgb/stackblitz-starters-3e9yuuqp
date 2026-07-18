@@ -2654,7 +2654,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const PULSE_ACCEL_MIN_TREND = 0.7; // must have gained at least this much z over the last 10 spins (Moderate preset — was 1.0)
 
     const getConsecutiveLeanAndTrend = (engine: string): { consecutiveLean: number; trendDelta: number | null } => {
+      // These two are intentionally NOT coupled to the same "unbroken" walk.
+      // consecutiveLean needs an uninterrupted run of z ≥ PULSE_LEAN_Z.
+      // trendDelta just needs this engine's z-score from exactly
+      // PULSE_TREND_LOOKBACK settled spins ago, dips in between don't matter.
+      // Coupling them (as the original version did, by breaking the whole
+      // walk the moment z dipped below the lean bar) meant trend could never
+      // be computed before ~PULSE_TREND_LOOKBACK consecutive qualifying
+      // spins had already elapsed — which is roughly the same length as the
+      // sustained-lean bar itself, making the "faster" accelerating-lean
+      // path unable to ever fire meaningfully earlier than sustained-lean
+      // (confirmed in testing: it fired at most 1 spin sooner, not 5).
       let consecutiveLean = 0;
+      let leanBroken = false;
       let trendDelta: number | null = null;
       let stepsBack = 0;
       for (let i = history.length - 1; i >= 0; i--) {
@@ -2663,11 +2675,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         if (!stepTracker || stepTracker.isWarming || stepTracker.selectedEngine !== currentEngine) break;
         const z = stepTracker.challengerZScores?.[engine];
         stepsBack += 1;
+
         if (trendDelta === null && stepsBack === PULSE_TREND_LOOKBACK && typeof z === "number") {
           trendDelta = (challengerZScores[engine] ?? 0) - z;
         }
-        if (typeof z === "number" && z >= PULSE_LEAN_Z) consecutiveLean += 1;
-        else break;
+
+        if (!leanBroken) {
+          if (typeof z === "number" && z >= PULSE_LEAN_Z) consecutiveLean += 1;
+          else leanBroken = true;
+        }
+
+        // Once we have both answers (or can no longer improve them within
+        // this engine's active run), stop walking further back.
+        if (stepsBack >= PULSE_TREND_LOOKBACK) break;
       }
       return { consecutiveLean, trendDelta };
     };
