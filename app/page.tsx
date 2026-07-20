@@ -2533,8 +2533,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // they could never accumulate any win rate once Pulse locked onto a
     // different engine — a bug that made switching away from a bad engine
     // nearly impossible.)
-    const computeEngineStats = (engineName: string): { rate: number; wins: number; n: number } => {
-      const recent = history.slice(-PULSE_WINDOW);
+    const computeEngineStatsFor = (engineName: string, sourceHistory: Step[]): { rate: number; wins: number; n: number } => {
+      const recent = sourceHistory.slice(-PULSE_WINDOW);
       let wins = 0;
       let evaluated = 0;
 
@@ -2572,6 +2572,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
 
       return { rate: evaluated > 0 ? Math.round(wins / evaluated * 100) : 0, wins, n: evaluated };
     };
+    const computeEngineStats = (engineName: string) => computeEngineStatsFor(engineName, history);
 
     const engineStats: Record<string, { rate: number; wins: number; n: number }> = {
       Straight: computeEngineStats("Straight"),
@@ -2657,10 +2658,28 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const PULSE_ACCEL_MIN_TREND = 0.7; // must have gained at least this much z over the last 10 spins (Moderate preset — was 1.0)
 
     const getConsecutiveLeanAndTrend = (engine: string): { consecutiveLean: number; trendDelta: number | null } => {
-      // Trend is computed independently of the lean-streak walk (see prior
-      // fix) — it just needs this engine's z-score from exactly
-      // PULSE_TREND_LOOKBACK settled spins ago, dips in between don't matter.
+      // Trend is recomputed directly "as of PULSE_TREND_LOOKBACK spins ago"
+      // (same fix as deceleration's getCurrentEngineRateTrend, and for the
+      // same reason) rather than reading each row's cached z-score — those
+      // caches only exist once Pulse is actively running an engine, so they
+      // could never reach into the warmup/push period even though that data
+      // is real and usable (see Session Performance Findings).
       let trendDelta: number | null = null;
+      const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
+      if (pastHistoryForTrend.length >= 3 && currentEngine) {
+        const pastChallengerStats = computeEngineStatsFor(engine, pastHistoryForTrend);
+        const pastCurrentStats = computeEngineStatsFor(currentEngine, pastHistoryForTrend);
+        const pastZ = zScoreForChallenger(pastChallengerStats, pastCurrentStats);
+        const nowZ = challengerZScores[engine];
+        if (pastZ !== null && typeof nowZ === "number") {
+          trendDelta = nowZ - pastZ;
+        }
+      }
+
+      // The lean-streak count is a live, decision-time concept — "how many
+      // consecutive spins has THIS specific active run observed the
+      // challenger above the bar" — so it stays anchored to real settled
+      // spins under the current engine, unlike trend above.
       let stepsBack = 0;
       const zHistory: (number | null)[] = []; // most-recent-first, oldest cut off at PULSE_TREND_LOOKBACK
       for (let i = history.length - 1; i >= 0; i--) {
@@ -2670,11 +2689,6 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         const z = stepTracker.challengerZScores?.[engine];
         stepsBack += 1;
         zHistory.push(typeof z === "number" ? z : null);
-
-        if (trendDelta === null && stepsBack === PULSE_TREND_LOOKBACK && typeof z === "number") {
-          trendDelta = (challengerZScores[engine] ?? 0) - z;
-        }
-
         if (stepsBack >= PULSE_TREND_LOOKBACK) break;
       }
 
@@ -2753,18 +2767,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
 
     const getCurrentEngineRateTrend = (): number | null => {
       if (!currentEngine) return null;
-      let stepsBack = 0;
-      for (let i = history.length - 1; i >= 0; i--) {
-        const step = history[i] as any;
-        const stepTracker = step.pulseEngineTracker;
-        if (!stepTracker || stepTracker.isWarming || stepTracker.selectedEngine !== currentEngine) break;
-        stepsBack += 1;
-        if (stepsBack === PULSE_TREND_LOOKBACK) {
-          const pastRate = stepTracker.engineRates?.[currentEngine];
-          return typeof pastRate === "number" ? engineRates[currentEngine] - pastRate : null;
-        }
-      }
-      return null; // not enough same-engine history yet to measure
+      // Recompute the rate directly as of PULSE_TREND_LOOKBACK spins ago,
+      // the same way "now" is computed — rather than walking back through
+      // each row's cached tracker data (which only exists once Pulse is
+      // actively running an engine, meaning it could never reach into the
+      // warmup/push period even though those spins carry real hypothetical
+      // performance data for every engine — see Session Performance
+      // Findings). This lets deceleration become measurable as early as the
+      // window allows, instead of always waiting PULSE_TREND_LOOKBACK spins
+      // past the current engine's own first selection.
+      const pastHistory = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
+      if (pastHistory.length < 3) return null; // not enough history yet to measure a "back then" rate at all
+      const pastRate = computeEngineStatsFor(currentEngine, pastHistory).rate;
+      return engineRates[currentEngine] - pastRate;
     };
 
     let isPaused = false;
