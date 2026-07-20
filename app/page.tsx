@@ -104,7 +104,7 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
-    switchReason?: "significant" | "sustained-lean" | "accelerating-lean" | null;
+    switchReason?: "highest-score" | "tie-break-trend" | null;
     challengerZScores?: Record<string, number | null>;
     leanStreak?: number;
     zTrendDelta?: number | null;
@@ -2642,198 +2642,75 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       return (p1 - p2) / se;
     };
 
-    // Find the best engine by raw rate — but only among engines that have
-    // enough samples to trust at all (n ≥ PULSE_MIN_SAMPLES). This matters
-    // most for the very FIRST engine pick right after warmup: with no
-    // currentEngine yet, there's no switch-decision gate to fall back on, so
-    // without this floor, whichever engine got randomly lucky on a handful
-    // of spins (e.g. 2-for-4 = "50%") would get selected outright and then
-    // benefit from the very protections meant to stop noisy switching —
-    // locking in a coin-flip result for an entire session. If nobody has
-    // enough samples yet, default to Straight as a neutral baseline rather
-    // than picking on pure noise.
-    let bestEngine = "Straight";
-    let bestRate = -1;
-    for (const [engine, stats] of Object.entries(engineStats)) {
-      if (stats.n >= PULSE_MIN_SAMPLES && stats.rate > bestRate) { bestRate = stats.rate; bestEngine = engine; }
-    }
-    if (bestRate === -1) {
-      bestEngine = "Straight";
-      bestRate = engineRates["Straight"];
+    // ─── LEADER SELECTION (highest score wins, no hold requirement) ─────────
+    // Every spin, whichever engine has the best rate becomes active
+    // immediately — no minimum streak, no dip tolerance, no significance
+    // test. The only floor kept is PULSE_MIN_SAMPLES, which exists purely to
+    // stop a 2-for-4 lucky start from counting as a real rate — it protects
+    // against noise in the DATA, not against switching itself.
+    const PULSE_TREND_LOOKBACK = 10;   // spins back to measure trend, used for both tie-breaking and decline detection
+    const PULSE_DECEL_THRESHOLD = -15; // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
+
+    const eligible = Object.entries(engineStats).filter(([, s]) => s.n >= PULSE_MIN_SAMPLES);
+    const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
+    const getTrendFor = (engine: string): number | null => {
+      if (pastHistoryForTrend.length < 3) return null;
+      const pastRate = computeEngineStatsFor(engine, pastHistoryForTrend).rate;
+      return engineStats[engine].rate - pastRate;
+    };
+
+    let leader = "Straight";
+    let leaderReason: "highest-score" | "tie-break-trend" | null = null;
+    if (eligible.length === 0) {
+      leader = "Straight"; // nobody has enough samples yet — neutral default, same as before
+    } else {
+      const maxRate = Math.max(...eligible.map(([, s]) => s.rate));
+      const tied = eligible.filter(([, s]) => s.rate === maxRate).map(([e]) => e);
+      if (tied.length === 1) {
+        leader = tied[0];
+        leaderReason = "highest-score";
+      } else {
+        // Tie: whoever's rising fastest over the last PULSE_TREND_LOOKBACK
+        // spins wins the tie-break — "accelerated or recently rising."
+        let bestTrend = -Infinity;
+        leader = tied[0];
+        for (const engine of tied) {
+          const trend = getTrendFor(engine) ?? 0;
+          if (trend > bestTrend) { bestTrend = trend; leader = engine; }
+        }
+        leaderReason = "tie-break-trend";
+      }
     }
 
-    // Check if current selected engine (from last step) should switch
+    // Check if current selected engine (from last step) is changing
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
-    // Every non-current engine's z-score vs the current engine, computed
-    // fresh every spin — this is what lets us track each challenger's trend
-    // over time (not just whichever one happens to be "the leader" right
-    // now), and is what the sustained-lean rule below walks back through.
+    // Informational only now — not a gate. Each engine's z-score against
+    // whichever engine is leading this spin, kept for transparency in the
+    // Switch Log (so you can still see how far ahead/behind everyone is).
     const challengerZScores: Record<string, number | null> = {};
-    if (currentEngine) {
-      for (const engine of Object.keys(engineStats)) {
-        if (engine === currentEngine) continue;
-        challengerZScores[engine] = zScoreForChallenger(engineStats[engine], engineStats[currentEngine]);
-      }
+    for (const engine of Object.keys(engineStats)) {
+      if (engine === leader) continue;
+      challengerZScores[engine] = zScoreForChallenger(engineStats[engine], engineStats[leader]);
     }
 
-    // A single-spin significance test (the "Significant" path) used to sit
-    // here as a high bar for an immediate switch — it was removed because at
-    // small windows it fires on pure noise nearly as easily as on a real
-    // edge, and testing showed it repeatedly switching onto an engine right
-    // before that engine went cold. Now a challenger can ONLY trigger a
-    // switch by demonstrating its edge over multiple spins: either holding
-    // at least PULSE_LEAN_Z for PULSE_LEAN_SPINS consecutive spins
-    // in a row — persistence substitutes for a single very-high z-score.
-    // A SECOND, faster path exists for a lean that isn't just sitting still
-    // but actively climbing: if it's already reached a moderate bar AND
-    // gained real ground over the last 10 spins, that acceleration is its
-    // own evidence, and doesn't need the full 15-spin hold to trust (a
-    // session ending at spin 80 with a lean at 10/15 spins and climbing
-    // 1.06 → 1.49 is exactly the case this is for).
-    const PULSE_LEAN_Z = 1.0;          // lower bar: "leaning" evidence, not full significance
-    const PULSE_LEAN_SPINS = 7;        // how many consecutive spins a flat lean must hold — lowered from 10, which was nearly the whole PULSE_WINDOW (15) and left almost no room for the accelerating path to matter
-    const PULSE_TREND_LOOKBACK = 10;   // spins back to measure z-score trend/acceleration
-    const PULSE_ACCEL_MIN_STREAK = 5;  // shorter hold required when the lean is also accelerating (Moderate preset — was 8)
-    const PULSE_ACCEL_MIN_Z = 1.0;     // instantaneous bar for the accelerating path (Moderate preset — was 1.2)
-    const PULSE_ACCEL_MIN_TREND = 0.7; // must have gained at least this much z over the last 10 spins (Moderate preset — was 1.0)
-
-    const getConsecutiveLeanAndTrend = (engine: string): { consecutiveLean: number; trendDelta: number | null } => {
-      // Trend is recomputed directly "as of PULSE_TREND_LOOKBACK spins ago"
-      // (same fix as deceleration's getCurrentEngineRateTrend, and for the
-      // same reason) rather than reading each row's cached z-score — those
-      // caches only exist once Pulse is actively running an engine, so they
-      // could never reach into the warmup/push period even though that data
-      // is real and usable (see Session Performance Findings).
-      let trendDelta: number | null = null;
-      const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
-      if (pastHistoryForTrend.length >= 3 && currentEngine) {
-        const pastChallengerStats = computeEngineStatsFor(engine, pastHistoryForTrend);
-        const pastCurrentStats = computeEngineStatsFor(currentEngine, pastHistoryForTrend);
-        const pastZ = zScoreForChallenger(pastChallengerStats, pastCurrentStats);
-        const nowZ = challengerZScores[engine];
-        if (pastZ !== null && typeof nowZ === "number") {
-          trendDelta = nowZ - pastZ;
-        }
-      }
-
-      // The lean-streak count is a live, decision-time concept — "how many
-      // consecutive spins has THIS specific active run observed the
-      // challenger above the bar" — so it stays anchored to real settled
-      // spins under the current engine, unlike trend above.
-      let stepsBack = 0;
-      const zHistory: (number | null)[] = []; // most-recent-first, oldest cut off at PULSE_TREND_LOOKBACK
-      for (let i = history.length - 1; i >= 0; i--) {
-        const step = history[i] as any;
-        const stepTracker = step.pulseEngineTracker;
-        if (!stepTracker || stepTracker.isWarming || stepTracker.selectedEngine !== currentEngine) break;
-        const z = stepTracker.challengerZScores?.[engine];
-        stepsBack += 1;
-        zHistory.push(typeof z === "number" ? z : null);
-        if (stepsBack >= PULSE_TREND_LOOKBACK) break;
-      }
-
-      // Walk the collected window forward in time (oldest → newest) to count
-      // the lean streak, tolerating a single ISOLATED dip below PULSE_LEAN_Z
-      // without wiping the whole count — two dips back-to-back still resets
-      // it for real. This stops one noisy spin from erasing several spins of
-      // otherwise real, accumulating evidence (a real 19-spin losing streak
-      // showed the lean count build to 4, dip once, and get reset all the
-      // way to 0, delaying a switch by ~10+ spins beyond when the evidence
-      // first became visible — see Session Performance Findings).
-      let consecutiveLean = 0;
-      let graceAvailable = true;
-      for (let idx = zHistory.length - 1; idx >= 0; idx--) {
-        const z = zHistory[idx];
-        const qualifies = typeof z === "number" && z >= PULSE_LEAN_Z;
-        if (qualifies) {
-          consecutiveLean += 1;
-          graceAvailable = true; // grace refills once back above the bar
-        } else if (graceAvailable) {
-          graceAvailable = false; // spend the one allowed dip — streak holds, doesn't grow this spin
-        } else {
-          consecutiveLean = 0; // second dip in a row — a real break, not noise
-          graceAvailable = true;
-        }
-      }
-
-      return { consecutiveLean, trendDelta };
-    };
-
-    let selectedEngine = bestEngine;
-    let switchZScore: number | null = null;
-    let switchReason: "significant" | "sustained-lean" | "accelerating-lean" | null = null;
-    let leanStreak = 0;
-    let zTrendDelta: number | null = null;
-    if (currentEngine && currentEngine !== bestEngine) {
-      switchZScore = zScoreForChallenger(engineStats[bestEngine], engineStats[currentEngine]);
-      const leanInfo = getConsecutiveLeanAndTrend(bestEngine);
-      leanStreak = leanInfo.consecutiveLean;
-      zTrendDelta = leanInfo.trendDelta;
-
-      // The single-spin "significant" trigger (z ≥ PULSE_SIG_Z on one snapshot)
-      // was removed: at small windows it fires on pure noise as easily as on
-      // a real edge, and testing showed it repeatedly switching onto an
-      // engine right before that engine went cold (see Session Performance
-      // Findings). Both remaining paths require the edge to be demonstrated
-      // over multiple spins — persistence (sustained-lean) or persistence
-      // AND upward movement (accelerating-lean) — rather than a one-off
-      // reading, which is a much harder bar for noise to clear by chance.
-      if (switchZScore !== null && switchZScore >= PULSE_ACCEL_MIN_Z && leanStreak >= PULSE_ACCEL_MIN_STREAK && zTrendDelta !== null && zTrendDelta >= PULSE_ACCEL_MIN_TREND) {
-        switchReason = "accelerating-lean";
-      } else if (switchZScore !== null && switchZScore >= PULSE_LEAN_Z && leanStreak >= PULSE_LEAN_SPINS) {
-        switchReason = "sustained-lean";
-      }
-
-      if (!switchReason) {
-        selectedEngine = currentEngine; // stay with current — no sustained or accelerating lean yet
-      }
-    }
-
-    // ─── DECELERATION / PAUSE ───────────────────────────────────────────────
-    // The accelerating-lean path asks "is a challenger getting better?" This
-    // asks the other question: "is our CURRENT pick getting worse?" Those are
-    // not the same thing — a losing streak alone doesn't mean decline, since
-    // that happens constantly from pure variance. This measures the current
-    // engine's own rolling rate now vs. PULSE_TREND_LOOKBACK spins ago,
-    // within its own active run.
-    //
-    // Deliberately does NOT lower the switch bar when decline is detected —
-    // that would repeat the exact mistake already made twice this project
-    // (loosening thresholds specifically because things are going badly).
-    // Instead: if the current engine is really declining AND no challenger
-    // has cleared its own unchanged bar, Pulse places no bet at all rather
-    // than forcing a bet on either a fading pick or an unproven guess.
-    const PULSE_DECEL_THRESHOLD = -15; // rate must have dropped at least this many points over the lookback to count as real decline, not noise
-
-    const getCurrentEngineRateTrend = (): number | null => {
-      if (!currentEngine) return null;
-      // Recompute the rate directly as of PULSE_TREND_LOOKBACK spins ago,
-      // the same way "now" is computed — rather than walking back through
-      // each row's cached tracker data (which only exists once Pulse is
-      // actively running an engine, meaning it could never reach into the
-      // warmup/push period even though those spins carry real hypothetical
-      // performance data for every engine — see Session Performance
-      // Findings). This lets deceleration become measurable as early as the
-      // window allows, instead of always waiting PULSE_TREND_LOOKBACK spins
-      // past the current engine's own first selection.
-      const pastHistory = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
-      if (pastHistory.length < 3) return null; // not enough history yet to measure a "back then" rate at all
-      const pastRate = computeEngineStatsFor(currentEngine, pastHistory).rate;
-      return engineRates[currentEngine] - pastRate;
-    };
-
+    // ─── DECELERATION / PAUSE — applies to the LEADER, not just "current" ───
+    // A leader can be losing badly and still be numerically ahead of three
+    // other weak engines — nobody has to actually overtake it for that
+    // decline to be real. So this checks the leader's OWN rate trend
+    // directly, regardless of whether anyone else is close enough to have
+    // crossed over. If it's declining hard, pause rather than keep betting
+    // on a fading "leader" just because the other three are worse still.
+    const leaderTrend = getTrendFor(leader);
     let isPaused = false;
     let pauseReason: string | null = null;
-    let currentEngineTrend: number | null = null;
-    if (!switchReason && currentEngine) {
-      currentEngineTrend = getCurrentEngineRateTrend();
-      if (currentEngineTrend !== null && currentEngineTrend <= PULSE_DECEL_THRESHOLD) {
-        isPaused = true;
-        pauseReason = `${currentEngine} decelerating (${currentEngineTrend}pp/${PULSE_TREND_LOOKBACK} spins) — no challenger qualified yet`;
-      }
+    if (leaderTrend !== null && leaderTrend <= PULSE_DECEL_THRESHOLD) {
+      isPaused = true;
+      pauseReason = `${leader} declining (${leaderTrend}pp/${PULSE_TREND_LOOKBACK} spins) despite still leading — no clear alternative has emerged`;
     }
+
+    const selectedEngine = leader;
 
     // Get prediction from selected engine
     let engineForecast: any;
@@ -2870,14 +2747,14 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       engineSamples,
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
-      switchZScore,
-      switchReason,
+      switchZScore: null as number | null,
+      switchReason: leaderReason,
       challengerZScores,
-      leanStreak,
-      zTrendDelta,
+      leanStreak: 0,
+      zTrendDelta: leaderTrend,
       isPaused,
       pauseReason,
-      currentEngineTrend,
+      currentEngineTrend: leaderTrend,
     };
 
     return {
@@ -4966,17 +4843,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const rates = tracker.engineRates || {};
         const samples = tracker.engineSamples || {};
         const czs = tracker.challengerZScores || {};
-        const entries = Object.entries(rates) as [string, number][];
-        const maxRate = entries.length ? Math.max(...entries.map(([, v]) => v)) : 0;
-        const topEntries = entries.filter(([, v]) => v === maxRate);
-        // "Leader" is just the raw highest rate — for display only. The
-        // actual switch decision requires a statistically significant edge
-        // OR a sustained lean (see switchZScore/leanStreak below), not just
-        // being numerically ahead.
-        const leader = maxRate > 0 && topEntries.length === 1 ? topEntries[0][0] : "—";
-        const z = typeof tracker.switchZScore === "number" ? tracker.switchZScore : null;
-        const trend = typeof tracker.zTrendDelta === "number" ? tracker.zTrendDelta : null;
         const engineZ = (engine: string) => tracker.selectedEngine === engine ? null : (typeof czs[engine] === "number" ? czs[engine] as number : null);
+        const leaderTrend = typeof tracker.currentEngineTrend === "number" ? tracker.currentEngineTrend : null;
         return {
           spin: row.spin,
           selectedEngine: tracker.selectedEngine ?? "—",
@@ -4994,35 +4862,27 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           invertedZ: engineZ("Inverted"),
           markovZ: engineZ("Markov"),
           randomZ: engineZ("Random"),
-          leader,
-          zScore: z,
-          strongSnapshot: z === null ? null : z >= 1.28,
-          leanStreak: tracker.leanStreak ?? 0,
-          zTrend: trend,
-          accelerating: trend !== null && trend > 0.1,
+          leader: tracker.selectedEngine ?? "—", // leader always equals selected engine now — no hold requirement means nothing to lag behind
           switchReason: tracker.switchReason ?? null,
+          leaderTrend,
           isPaused: tracker.isPaused ?? false,
           pauseReason: tracker.pauseReason ?? null,
-          currentEngineTrend: typeof tracker.currentEngineTrend === "number" ? tracker.currentEngineTrend : null,
         };
       });
   };
 
   const rowsForPulseSwitchLogExport = () => [
-    ["Spin", "Selected Engine", "Paused (No Bet)", "Switched", "Switch Reason", "Previous Engine",
-     "Straight %", "Straight n", "Straight Z (vs current)", "Inverted %", "Inverted n", "Inverted Z (vs current)",
-     "Markov %", "Markov n", "Markov Z (vs current)", "Random %", "Random n", "Random Z (vs current)",
-     "Raw Leader", "Best Challenger Z-Score", "Strong Single-Spin Z (info only, not a trigger)", "Lean Streak (spins)", "Z-Score Trend (Δ/10 spins)", "Accelerating",
-     "Current Engine Trend (Δpp/10 spins)", "Pause Reason"],
+    ["Spin", "Selected Engine (= Leader)", "Paused (No Bet)", "Switched", "Switch Reason", "Previous Engine",
+     "Straight %", "Straight n", "Straight Z (vs leader)", "Inverted %", "Inverted n", "Inverted Z (vs leader)",
+     "Markov %", "Markov n", "Markov Z (vs leader)", "Random %", "Random n", "Random Z (vs leader)",
+     "Leader Trend (Δpp/10 spins)", "Pause Reason"],
     ...getPulseSwitchLogRows().map((row) => [
       row.spin, row.selectedEngine, row.isPaused ? "YES" : "NO", row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
       row.straightRate, row.straightN, row.straightZ === null ? "—" : row.straightZ.toFixed(2),
       row.invertedRate, row.invertedN, row.invertedZ === null ? "—" : row.invertedZ.toFixed(2),
       row.markovRate, row.markovN, row.markovZ === null ? "—" : row.markovZ.toFixed(2),
       row.randomRate, row.randomN, row.randomZ === null ? "—" : row.randomZ.toFixed(2),
-      row.leader, row.zScore === null ? "—" : row.zScore.toFixed(2), row.strongSnapshot === null ? "—" : row.strongSnapshot ? "YES" : "NO",
-      row.leanStreak, row.zTrend === null ? "—" : row.zTrend.toFixed(2), row.zTrend === null ? "—" : row.accelerating ? "YES" : "NO",
-      row.currentEngineTrend === null ? "—" : row.currentEngineTrend.toFixed(1), row.pauseReason ?? "—",
+      row.leaderTrend === null ? "—" : row.leaderTrend.toFixed(1), row.pauseReason ?? "—",
     ]),
   ];
 
@@ -6539,43 +6399,37 @@ const StreakAnalyticsPanel = () => {
   const PulseSwitchLogPanel = () => {
     const rows = getPulseSwitchLogRows();
     const switches = rows.filter((row) => row.switched);
-    const leanSwitches = switches.filter((row) => row.switchReason === "sustained-lean" || row.switchReason === "accelerating-lean");
-    const maxLeanStreak = rows.length ? Math.max(...rows.map((row) => row.leanStreak)) : 0;
+    const tieBreaks = switches.filter((row) => row.switchReason === "tie-break-trend");
     const pausedSpins = rows.filter((row) => row.isPaused);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. A switch requires the edge to be demonstrated over multiple spins: a sustained lean (challenger holds z ≥ 1.0 for 7+ consecutive spins, one isolated dip tolerated) OR an accelerating lean (z ≥ 1.0, held 5+ spins, gained ≥ 0.7 over the last 10). Separately, if the CURRENT engine's own rate is declining (≥15pp drop over 10 spins) and no challenger has qualified yet, Pulse places no bet at all rather than betting on a fading pick or an unproven guess — it does not lower the switch bar just because it's losing.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. Whichever engine has the highest rate (n ≥ 10) is active immediately — no hold requirement. Ties go to whoever's rising fastest over the last 10 spins. The only protection: if the LEADER's own rate drops 15+ points over 10 spins — even while still ranked #1 — Pulse pauses rather than keep betting on a fading leader just because the other three are worse still.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Spins Tracked" value={rows.length} />
         <MiniMetric label="Switches" value={switches.length} />
-        <MiniMetric label="Sustained-Lean Switches" value={leanSwitches.length} accent={leanSwitches.length ? COLORS.cyan : t.subtext} />
-        <MiniMetric label="Longest Lean Streak" value={maxLeanStreak} accent={maxLeanStreak >= 15 ? COLORS.amber : t.subtext} />
+        <MiniMetric label="Tie-Breaks" value={tieBreaks.length} accent={tieBreaks.length ? COLORS.cyan : t.subtext} />
         <MiniMetric label="Paused (No Bet)" value={pausedSpins.length} accent={pausedSpins.length ? COLORS.amber : t.subtext} />
-        <MiniMetric label="Current Engine" value={rows.at(-1)?.selectedEngine ?? "—"} />
+        <MiniMetric label="Current Leader" value={rows.at(-1)?.selectedEngine ?? "—"} />
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Selected", "Paused", "Switched", "Reason", "From", "Straight", "Inverted", "Markov", "Random", "Leader", "Z-Score", "Lean Streak", "Trend", "Accel?"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Leader", "Paused", "Switched", "Reason", "From", "Straight", "Inverted", "Markov", "Random", "Leader Trend"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={15} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
+            {rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
               <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}`, background: row.isPaused ? "rgba(245,158,11,0.06)" : undefined }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.isPaused ? COLORS.amber : t.subtext, fontWeight: row.isPaused ? 950 : 400 }} title={row.pauseReason ?? undefined}>{row.isPaused ? "YES" : "—"}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
-                <td style={{ padding: "8px 10px", color: row.switchReason === "accelerating-lean" ? COLORS.amber : row.switchReason === "sustained-lean" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
+                <td style={{ padding: "8px 10px", color: row.switchReason === "tie-break-trend" ? COLORS.amber : row.switchReason === "highest-score" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN})</span></td>
-                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.leader}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.zScore === null ? "—" : row.zScore.toFixed(2)}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center", color: row.leanStreak >= 15 ? COLORS.amber : t.subtext, fontWeight: row.leanStreak >= 15 ? 950 : 400 }}>{row.leanStreak || "—"}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.zTrend === null ? "—" : (row.zTrend > 0 ? "+" : "") + row.zTrend.toFixed(2)}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center", color: row.accelerating ? COLORS.cyan : t.subtext, fontWeight: row.accelerating ? 950 : 400 }}>{row.zTrend === null ? "—" : row.accelerating ? "YES" : "NO"}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center", color: row.leaderTrend !== null && row.leaderTrend <= -15 ? COLORS.red : t.subtext, fontWeight: row.leaderTrend !== null && row.leaderTrend <= -15 ? 950 : 400 }}>{row.leaderTrend === null ? "—" : (row.leaderTrend > 0 ? "+" : "") + row.leaderTrend.toFixed(1)}</td>
               </tr>
             ))}
           </tbody>
