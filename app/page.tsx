@@ -5122,19 +5122,26 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   // no TI/structure/routing columns (those belonged to the removed
   // routing/transition-intelligence governance stack).
   const rowsForSpinAuditExport = () => [
-    ["Spin", "Forecast", "Outcome", "Execution Mode", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Dimensions Correct", "Color", "Range", "Parity", "Result", "Winning Source"],
+    ["Spin", "Forecast", "Outcome", "Execution Mode", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Dimensions Correct", "Color", "Range", "Parity", "Result", "Winning Source",
+     "Straight Predicted", "Straight Would Win", "Straight Diagnostic", "Inverted Predicted", "Inverted Would Win", "Inverted Diagnostic", "Markov Predicted", "Markov Would Win", "Markov Diagnostic", "Random Predicted", "Random Would Win", "Random Diagnostic"],
     ...getSpinAuditRows().map((row) => {
       const fc = row.forecast ? groupToBits(row.forecast as GroupKey) : null;
       const oc = row.outcome ? groupToBits(row.outcome as GroupKey) : null;
       const colorHit  = fc && oc ? (fc[0]===oc[0]?"C":"I") : "—";
       const rangeHit  = fc && oc ? (fc[1]===oc[1]?"C":"I") : "—";
       const parityHit = fc && oc ? (fc[2]===oc[2]?"C":"I") : "—";
+      const allEngines = getAllEngineDiagnosticsForRow(row);
+      const winLabel = (v: boolean | null) => v === true ? "YES" : v === false ? "NO" : "—";
       return [
         row.spin, row.forecast, row.outcome, row.finalExecutionMode,
         row.engine, row.colorGate.label, row.rangeGate.label, row.parityGate.label,
         row.dimensionsCorrect,
         colorHit, rangeHit, parityHit,
         row.result, row.winningSource,
+        allEngines.straight.group ?? "—", winLabel(allEngines.straight.wouldWin), allEngines.straight.label,
+        allEngines.inverted.group ?? "—", winLabel(allEngines.inverted.wouldWin), allEngines.inverted.label,
+        allEngines.markov.group ?? "—", winLabel(allEngines.markov.wouldWin), allEngines.markov.label,
+        allEngines.random.group ?? "—", winLabel(allEngines.random.wouldWin), allEngines.random.label,
       ];
     }),
   ];
@@ -6812,7 +6819,7 @@ const StreakAnalyticsPanel = () => {
     </div> : null}
     <aside style={{ background: t.railBg, borderRight: `1px solid ${t.border}`, padding: "14px 9px", display: "grid", gridTemplateRows: "auto 1fr auto", gap: 14 }}><div aria-label="Menu" role="img" style={{ width: 48, height: 48, borderRadius: 14, background: isDark ? "rgba(2,6,23,0.34)" : "rgba(255,255,255,0.70)", border: `1px solid ${t.borderStrong}`, display: "flex", alignItems: "center", justifyContent: "center", margin: "0 auto", boxShadow: sidebarIconShadow }}><div style={{ display: "grid", gap: 5, width: 28 }}><span style={{ display: "block", width: 28, height: 3, borderRadius: 3, background: headerLogoFill }} /><span style={{ display: "block", width: 28, height: 3, borderRadius: 3, background: headerLogoFill }} /><span style={{ display: "block", width: 28, height: 3, borderRadius: 3, background: headerLogoFill }} /></div></div><nav style={{ display: "grid", gap: 8, alignContent: "start" }}>{VIEWS.map(v => <button key={v} onClick={() => setActiveView(v)} style={{ width: "100%", minHeight: 50, borderRadius: 14, border: `1px solid ${activeView === v ? "rgba(34,199,243,0.42)" : "transparent"}`, background: activeView === v ? "rgba(34,199,243,0.14)" : "transparent", color: activeView === v ? headerAccent : t.subtext, fontWeight: 900, fontSize: 10, cursor: "pointer" }}>{v}</button>)}</nav><div style={{ display: "grid", gap: 8 }}><button onClick={() => setShowSettings(true)} style={{ height: 42, borderRadius: 12, border: `1px solid ${t.border}`, background: "transparent", color: t.subtext, fontWeight: 900, cursor: "pointer" }}>⚙</button><button onClick={() => setShowGlossary(true)} style={{ height: 42, borderRadius: 12, border: `1px solid ${t.border}`, background: "transparent", color: t.subtext, fontWeight: 900, cursor: "pointer" }}>?</button></div></aside>
     <main style={{ padding: 16, overflowX: "auto", overflowY: "visible" }}><TerminalHeader />
-      <ControlsPanel />
+      {ControlsPanel()}
       {activeView === "Dashboard" ? <Dashboard /> : null}{activeView === "Analytics" ? <Analytics /> : null}{activeView === "Reports" ? <Reports /> : null}{activeView === "Sessions" ? <Sessions /> : null}
 
     </main>
