@@ -104,7 +104,7 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
-    switchReason?: "highest-score" | "tie-break-trend" | null;
+    switchReason?: "highest-score" | "tie-hold-current" | "tie-break-trend" | null;
     challengerZScores?: Record<string, number | null>;
     leanStreak?: number;
     zTrendDelta?: number | null;
@@ -2648,8 +2648,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // test. The only floor kept is PULSE_MIN_SAMPLES, which exists purely to
     // stop a 2-for-4 lucky start from counting as a real rate — it protects
     // against noise in the DATA, not against switching itself.
-    const PULSE_TREND_LOOKBACK = 10;   // spins back to measure trend, used for both tie-breaking and decline detection
-    const PULSE_DECEL_THRESHOLD = -15; // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
+    const PULSE_TREND_LOOKBACK = 10;     // spins back to measure trend, used for the first-pick tie-break and decline detection
+    const PULSE_DECEL_THRESHOLD = -15;   // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
+    const PULSE_SESSION_FLOOR = 15;      // if the LEADER's raw rate itself is at or below this, nobody has real signal — pause even with no decline to point to (a leader that's always been mediocre never triggers the decline check above, since there's nothing to decline from)
 
     const eligible = Object.entries(engineStats).filter(([, s]) => s.n >= PULSE_MIN_SAMPLES);
     const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
@@ -2659,8 +2660,12 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       return engineStats[engine].rate - pastRate;
     };
 
+    // Check what's currently active (from last step) — needed for the tie-break below
+    const lastStep = history[history.length - 1];
+    const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
+
     let leader = "Straight";
-    let leaderReason: "highest-score" | "tie-break-trend" | null = null;
+    let leaderReason: "highest-score" | "tie-hold-current" | "tie-break-trend" | null = null;
     if (eligible.length === 0) {
       leader = "Straight"; // nobody has enough samples yet — neutral default, same as before
     } else {
@@ -2669,9 +2674,18 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       if (tied.length === 1) {
         leader = tied[0];
         leaderReason = "highest-score";
+      } else if (currentEngine && tied.includes(currentEngine)) {
+        // A tie is, by definition, no evidence in either direction — the
+        // challenger hasn't actually beaten the current engine, just
+        // matched it. Switching on that isn't acting on a real signal, it's
+        // picking a direction on noise. So on a tie, stay put.
+        leader = currentEngine;
+        leaderReason = "tie-hold-current";
       } else {
-        // Tie: whoever's rising fastest over the last PULSE_TREND_LOOKBACK
-        // spins wins the tie-break — "accelerated or recently rising."
+        // Current engine isn't even among the tied leaders (it's been
+        // outright surpassed), or this is the very first pick with no
+        // current engine yet — there's nothing to "stay" with, so fall back
+        // to whoever's rising fastest among the tied engines.
         let bestTrend = -Infinity;
         leader = tied[0];
         for (const engine of tied) {
@@ -2682,10 +2696,6 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       }
     }
 
-    // Check if current selected engine (from last step) is changing
-    const lastStep = history[history.length - 1];
-    const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
-
     // Informational only now — not a gate. Each engine's z-score against
     // whichever engine is leading this spin, kept for transparency in the
     // Switch Log (so you can still see how far ahead/behind everyone is).
@@ -2695,19 +2705,25 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       challengerZScores[engine] = zScoreForChallenger(engineStats[engine], engineStats[leader]);
     }
 
-    // ─── DECELERATION / PAUSE — applies to the LEADER, not just "current" ───
-    // A leader can be losing badly and still be numerically ahead of three
-    // other weak engines — nobody has to actually overtake it for that
-    // decline to be real. So this checks the leader's OWN rate trend
-    // directly, regardless of whether anyone else is close enough to have
-    // crossed over. If it's declining hard, pause rather than keep betting
-    // on a fading "leader" just because the other three are worse still.
+    // ─── PAUSE — two independent conditions, either one holds ──────────────
+    // 1. DECLINE: the leader can be losing badly and still be numerically
+    //    ahead of three other weak engines — nobody has to actually overtake
+    //    it for that decline to be real.
+    // 2. SESSION FLOOR: a leader that's been consistently mediocre the whole
+    //    time never triggers the decline check (there's no drop to measure —
+    //    it just never was any good). This catches that case directly: if
+    //    the leader's raw rate itself is at or below PULSE_SESSION_FLOOR,
+    //    that's nobody having real signal, regardless of trend.
     const leaderTrend = getTrendFor(leader);
+    const leaderRate = engineStats[leader]?.rate ?? 0;
     let isPaused = false;
     let pauseReason: string | null = null;
     if (leaderTrend !== null && leaderTrend <= PULSE_DECEL_THRESHOLD) {
       isPaused = true;
       pauseReason = `${leader} declining (${leaderTrend}pp/${PULSE_TREND_LOOKBACK} spins) despite still leading — no clear alternative has emerged`;
+    } else if (leaderRate <= PULSE_SESSION_FLOOR && eligible.length > 0) {
+      isPaused = true;
+      pauseReason = `${leader} leading at only ${leaderRate}% — no engine has real signal this session, not just a temporary dip`;
     }
 
     const selectedEngine = leader;
@@ -6400,19 +6416,22 @@ const StreakAnalyticsPanel = () => {
     const rows = getPulseSwitchLogRows();
     const switches = rows.filter((row) => row.switched);
     const tieBreaks = switches.filter((row) => row.switchReason === "tie-break-trend");
+    const tiesHeld = rows.filter((row) => row.switchReason === "tie-hold-current");
     const pausedSpins = rows.filter((row) => row.isPaused);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. Whichever engine has the highest rate (n ≥ 10) is active immediately — no hold requirement. Ties go to whoever's rising fastest over the last 10 spins. The only protection: if the LEADER's own rate drops 15+ points over 10 spins — even while still ranked #1 — Pulse pauses rather than keep betting on a fading leader just because the other three are worse still.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. Whichever engine has the highest rate (n ≥ 10) is active immediately — no hold requirement. On a tie, Pulse stays with whoever's already active (a tie is no evidence either way) — trend only breaks a tie when there's no current engine to default to, e.g. the very first pick. Pause fires on either of two conditions: the leader's own rate drops 15+ points over 10 spins (declining despite still ranked #1), or the leader's rate is at/below 15% outright (nobody has real signal this session, not just a temporary dip).</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Spins Tracked" value={rows.length} />
         <MiniMetric label="Switches" value={switches.length} />
-        <MiniMetric label="Tie-Breaks" value={tieBreaks.length} accent={tieBreaks.length ? COLORS.cyan : t.subtext} />
+        <MiniMetric label="Tie-Breaks (trend)" value={tieBreaks.length} accent={tieBreaks.length ? COLORS.amber : t.subtext} />
+        <MiniMetric label="Ties Held (stayed put)" value={tiesHeld.length} accent={tiesHeld.length ? COLORS.cyan : t.subtext} />
         <MiniMetric label="Paused (No Bet)" value={pausedSpins.length} accent={pausedSpins.length ? COLORS.amber : t.subtext} />
         <MiniMetric label="Current Leader" value={rows.at(-1)?.selectedEngine ?? "—"} />
       </div>
+      <div style={{ color: t.subtext, fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Reason color key: <span style={{ color: COLORS.cyan }}>highest-score</span> = clean win, <span style={{ color: t.text }}>tie-hold-current</span> = tie, stayed put, <span style={{ color: COLORS.amber }}>tie-break-trend</span> = tie with no current to default to</div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
           <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Leader", "Paused", "Switched", "Reason", "From", "Straight", "Inverted", "Markov", "Random", "Leader Trend"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
@@ -6423,7 +6442,7 @@ const StreakAnalyticsPanel = () => {
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.isPaused ? COLORS.amber : t.subtext, fontWeight: row.isPaused ? 950 : 400 }} title={row.pauseReason ?? undefined}>{row.isPaused ? "YES" : "—"}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
-                <td style={{ padding: "8px 10px", color: row.switchReason === "tie-break-trend" ? COLORS.amber : row.switchReason === "highest-score" ? COLORS.cyan : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
+                <td style={{ padding: "8px 10px", color: row.switchReason === "tie-break-trend" ? COLORS.amber : row.switchReason === "highest-score" ? COLORS.cyan : row.switchReason === "tie-hold-current" ? t.text : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
                 <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
