@@ -2745,6 +2745,18 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const PULSE_DECEL_THRESHOLD = -15;   // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
     const PULSE_SESSION_FLOOR = 15;      // if the LEADER's raw rate itself is at or below this, nobody has real signal — pause even with no decline to point to (a leader that's always been mediocre never triggers the decline check above, since there's nothing to decline from)
 
+    // EXPERIMENT (see chat, July 20): the decline check mostly overlapped
+    // with the session floor in the sessions reviewed so far, and its
+    // trend calc is noisiest exactly when it fires most often — early in an
+    // engine's sample window, when the "10 spins ago" endpoint still has a
+    // tiny n. It also never addresses the failure mode that actually cost
+    // the most (switching INTO an engine on a lucky upswing) since it only
+    // fires once a rate is already falling. Set to true to restore the
+    // original two-condition behavior; false = floor-only pause, for A/B
+    // testing against sessions already on record before deciding whether to
+    // keep, tune, or remove the decline check for good.
+    const PULSE_DECLINE_CHECK_ENABLED = false;
+
     const eligible = Object.entries(engineStats).filter(([, s]) => s.n >= PULSE_MIN_SAMPLES);
     const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
     const getTrendFor = (engine: string): number | null => {
@@ -2811,7 +2823,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const leaderRate = engineStats[leader]?.rate ?? 0;
     let isPaused = false;
     let pauseReason: string | null = null;
-    if (leaderTrend !== null && leaderTrend <= PULSE_DECEL_THRESHOLD) {
+    if (PULSE_DECLINE_CHECK_ENABLED && leaderTrend !== null && leaderTrend <= PULSE_DECEL_THRESHOLD) {
       isPaused = true;
       pauseReason = `${leader} declining (${leaderTrend}pp/${PULSE_TREND_LOOKBACK} spins) despite still leading — no clear alternative has emerged`;
     } else if (leaderRate <= PULSE_SESSION_FLOOR && eligible.length > 0) {
