@@ -167,6 +167,99 @@ type SavedControlSettings = {
   appearance: Appearance;
 };
 
+// ─── Types reverse-engineered from actual usage (previously undeclared) ────
+// These names were referenced throughout the file but never defined
+// anywhere in the project — TypeScript was silently falling back to
+// implicit `any` at every use site. Shapes below are derived directly from
+// how each is constructed and consumed, not guessed.
+type PulseDivergenceState = "OFF_PATTERN" | "DIVERGING" | "ON_PATTERN";
+
+type PulseDivergenceCycle =
+  | "NONE" | "ALTERNATING"
+  | "CYCLE_3_001" | "CYCLE_3_011" | "CYCLE_3_110"
+  | "CYCLE_3_100" | "CYCLE_3_010" | "CYCLE_3_101"
+  | "STREAK_0" | "STREAK_1";
+
+type DimensionPerformanceState = "WARMING" | "HOLD" | "EXECUTE";
+
+type PulseDriftAxisKey = "color" | "range" | "parity";
+
+type PulseAxisDivergence = {
+  andPrediction: 0 | 1;
+  overrideBit: 0 | 1;
+  overrideActive: boolean;
+  overrideReason: string;
+  axisDpi: number;
+  axisConfidence: number;
+  spread: number;
+  spreadActive: boolean;
+  cadenceActive: boolean;
+  cadencePattern: (0 | 1)[];
+  cadenceIndex: number;
+  cadenceBreakBit: (0 | 1) | null;
+  lossProtection: { active: boolean; severe: boolean; lossRun: number; penalty: number; observe: boolean; status: string };
+  entropy: { score: number; penalty: number; random: boolean; elevated: boolean; status: string };
+  persistence: { score: number; flipRate: number; unstable: boolean; breakingDown: boolean; penalty: number; status: string };
+  consensus: { agrees: number; recentWin: boolean; reEntryReady: boolean; lift: number; status: string };
+  dpiStructural: { forceObserve: boolean; penalty: number; status: string; velocity: number };
+  cadenceAssist: { penalty: number; observe: boolean; status: string };
+  neuralGovernance: { hold: boolean; reason: string };
+  performanceState: DimensionPerformanceState;
+  adjustedConfidence: number;
+  isHold: boolean;
+  isWarming: boolean;
+  state: PulseDivergenceState;
+  conformanceScore: number;
+  conformanceWindow: number;
+  mismatchStreak: number;
+  detectedCycle: PulseDivergenceCycle;
+  cycleConfidence: number;
+  cyclePosition: number;
+  rollingAccuracy: number;
+  rollingWindow: number;
+  consecutiveBelowThreshold: number;
+  performanceFlipActive: boolean;
+  selectedGate: string;
+  gateFitScore: number;
+  allGateScores: Record<BooleanGate, number>;
+  summary: string;
+};
+
+type PulseDivergenceResult = {
+  color: PulseAxisDivergence;
+  range: PulseAxisDivergence;
+  parity: PulseAxisDivergence;
+  colorBit: 0 | 1;
+  rangeBit: 0 | 1;
+  parityBit: 0 | 1;
+  group: GroupKey;
+  overrideCount: number;
+  holdCount: number;
+  isWarming: boolean;
+  label: string;
+};
+
+type LabAxisForecast = {
+  bit: 0 | 1;
+  confidence: number;
+  regime: string;
+  survivor: string | null;
+  trust: number;
+  replayAccuracy: number;
+  margin: number;
+  reliability: number;
+  agreement: number;
+  score0: number;
+  score1: number;
+  leaders: string;
+};
+
+type TierExecutionSettings = {
+  executeWeak: boolean;
+  executeObservation: boolean;
+};
+const DEFAULT_TIER_EXECUTION: TierExecutionSettings = { executeWeak: true, executeObservation: false };
+
 const DEFAULT_STARTING_BANKROLL = 5000;
 const DEFAULT_BASE_UNIT = 25;
 const DEFAULT_AUTO_SPINS = 80;
@@ -2904,12 +2997,29 @@ function getNeuralCalibratedPulse(history: Step[], decision: any) {
   return decision;
 }
 
-function getPulseDriftDestinationCore(history: Step[]) {
-  return { active: false, direction: null as GroupKey | null };
+// Diagnostics-only component (feeds Neural Assist / Strategy Comparison
+// display panels, never the live betting decision). This is one of the
+// removed governance components — kept as a neutral no-op stub, same as
+// the null* placeholders in analyseAxis, but with the FULL shape its
+// callers actually read (they were previously reading undefined off a
+// truncated { active, direction } stub, which is what produced the
+// "Property does not exist" / implicit-any errors in this cluster).
+function getPulseDriftDestinationCore(history: Step[], labPulseBits?: [0 | 1, 0 | 1, 0 | 1]) {
+  return {
+    active: false,
+    direction: null as GroupKey | null,
+    adjustedGroup: null as GroupKey | null,
+    activeAxes: [] as AxisKey[],
+    mode: "OBSERVE" as AdaptiveTDAMode,
+    axes: [] as { axis: PulseDriftAxisKey; action: "EXECUTE" | "HOLD" }[],
+    score: 0,
+    summary: "Neural Assist — diagnostics only, inactive",
+    modeLabel: "Observe",
+  };
 }
 
-function getLabLeader(history: Step[]) {
-  return null;
+function getLabLeader(regime: string) {
+  return null as string | null;
 }
 
 function isProtectionHoldRow(row: Step) {
@@ -3754,7 +3864,8 @@ function getShadowDecision(history: Step[], engine: ShadowEngine) {
       : "Inverted Shadow";
 
   if (engine === "PULSE") {
-    const pulse = getNeuralCalibratedPulse(history);
+    const decision = getActiveDecision(history, true, false, false, false, false);
+    const pulse = getNeuralCalibratedPulse(history, decision);
     return {
       ...pulse,
       source: "PULSE" as const,
@@ -5597,7 +5708,83 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   };
 
     const AxisDirectionalAccuracyPanel = () => {
-    return null;
+    const diag = (f as any).allEngineDiagnostics;
+    if (!diag) return null;
+
+    const AXES: { key: "color" | "range" | "parity"; name: string; labels: [string, string] }[] = [
+      { key: "color", name: "Color", labels: ["Black", "Red"] },
+      { key: "range", name: "Range", labels: ["High", "Low"] },
+      { key: "parity", name: "Parity", labels: ["Even", "Odd"] },
+    ];
+    const ENGINES: { key: "straight" | "inverted" | "markov" | "random"; label: string }[] = [
+      { key: "straight", label: "Straight" },
+      { key: "inverted", label: "Inverted" },
+      { key: "markov", label: "Markov" },
+      { key: "random", label: "Random" },
+    ];
+
+    type Cell = { label: string; pct: number; value: string; tier: "strong" | "moderate" | "weak" | "none" };
+    const cellFor = (engine: "straight" | "inverted" | "markov" | "random", axisKey: "color" | "range" | "parity", labels: [string, string]): Cell => {
+      if (engine === "straight") {
+        const gate = diag.straight?.gate;
+        const axis = gate ? (gate as any)[axisKey] as PulseAxisDivergence : null;
+        if (!axis || axis.isWarming || axis.isHold) return { label: "—", pct: 0, value: axis?.isWarming ? "Warming" : "Hold", tier: "none" };
+        const pct = Math.round(axis.gateFitScore * 100);
+        return { label: labels[axis.overrideBit], pct, value: `${pct}%`, tier: pct >= 70 ? "strong" : pct >= 60 ? "moderate" : "weak" };
+      }
+      if (engine === "markov") {
+        const conf = diag.markov?.axisConfidence?.[axisKey];
+        const group = diag.markov?.group;
+        if (typeof conf !== "number" || !group) return { label: "—", pct: 0, value: "—", tier: "none" };
+        const bits = groupToBits(group as GroupKey);
+        const bitIdx = axisKey === "color" ? 0 : axisKey === "range" ? 1 : 2;
+        const pct = Math.round(conf);
+        return { label: labels[bits[bitIdx]], pct, value: `${pct}%`, tier: pct >= 70 ? "strong" : pct >= 60 ? "moderate" : "weak" };
+      }
+      // inverted / random — DPI-based directional pressure
+      const dpi = engine === "inverted" ? diag.inverted?.axisDpi?.[axisKey] : diag.random?.axisDpi?.[axisKey];
+      const group = engine === "inverted" ? diag.inverted?.group : diag.random?.group;
+      if (typeof dpi !== "number" || !group) return { label: "—", pct: 0, value: "—", tier: "none" };
+      const bits = groupToBits(group as GroupKey);
+      const bitIdx = axisKey === "color" ? 0 : axisKey === "range" ? 1 : 2;
+      const pct = Math.min(100, Math.round((Math.abs(dpi) / 10) * 100));
+      return { label: labels[bits[bitIdx]], pct, value: `DPI ${dpi > 0 ? "+" : ""}${dpi}`, tier: pct >= 70 ? "strong" : pct >= 50 ? "moderate" : "weak" };
+    };
+    const tierColor = (tier: Cell["tier"]) => tier === "strong" ? COLORS.green : tier === "moderate" ? COLORS.amber : tier === "weak" ? COLORS.red : t.subtext;
+
+    return (
+      <CollapsiblePanel id="engineDirection" title="Engine Direction">
+        <div style={{ color: t.subtext, fontSize: 11, fontWeight: 800, marginBottom: 10 }}>
+          Every engine's current lean per axis, right now — bar length is signal strength (gate fit% for Straight/Markov, DPI magnitude for Inverted/Random).
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "62px repeat(3, 1fr)", gap: 8, alignItems: "end", marginBottom: 6 }}>
+          <div />
+          {AXES.map((a) => <div key={a.key} style={{ fontSize: 10, fontWeight: 950, color: t.subtext, textTransform: "uppercase", textAlign: "center" }}>{a.name}</div>)}
+        </div>
+        <div style={{ display: "grid", gap: 8 }}>
+          {ENGINES.map((eng) => (
+            <div key={eng.key} style={{ display: "grid", gridTemplateColumns: "62px repeat(3, 1fr)", gap: 8, alignItems: "center" }}>
+              <div style={{ fontSize: 11, fontWeight: 950 }}>{eng.label}</div>
+              {AXES.map((a) => {
+                const cell = cellFor(eng.key, a.key, a.labels);
+                const color = tierColor(cell.tier);
+                return (
+                  <div key={a.key} style={{ minWidth: 0 }}>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 800, marginBottom: 3, gap: 4 }}>
+                      <span style={{ color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{cell.label}</span>
+                      <span style={{ color: t.subtext, whiteSpace: "nowrap" }}>{cell.value}</span>
+                    </div>
+                    <div style={{ height: 4, borderRadius: 999, background: t.input, border: `1px solid ${t.border}`, overflow: "hidden" }}>
+                      <div style={{ width: `${cell.pct}%`, height: "100%", background: color, borderRadius: 999 }} />
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+        </div>
+      </CollapsiblePanel>
+    );
   };
 
   const BankrollChart = () => {
@@ -6193,7 +6380,7 @@ const StreakAnalyticsPanel = () => {
     </CollapsiblePanel>;
   };
 
-  const Dashboard = () => <section style={{ display: "grid", gridTemplateColumns: "minmax(320px, 360px) minmax(520px, 1fr) minmax(360px, 430px)", gap: 14, alignItems: "start", minWidth: 1240, overflow: "visible" }}><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><SignalPanel /><CompactMetrics /><RouletteWheelPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, overflow: "hidden", alignContent: "start" }}><RouletteTable /><Last20SpinsStrip /><BankrollChart /><DimensionPatternPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><RecentLog /><ComparisonTable compact /></div></section>;
+  const Dashboard = () => <section style={{ display: "grid", gridTemplateColumns: "minmax(320px, 360px) minmax(520px, 1fr) minmax(360px, 430px)", gap: 14, alignItems: "start", minWidth: 1240, overflow: "visible" }}><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><SignalPanel /><CompactMetrics /><RouletteWheelPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, overflow: "hidden", alignContent: "start" }}><RouletteTable /><Last20SpinsStrip /><BankrollChart /><DimensionPatternPanel /><AxisDirectionalAccuracyPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><RecentLog /><ComparisonTable compact /></div></section>;
 
 
 
