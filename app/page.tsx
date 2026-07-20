@@ -1641,6 +1641,7 @@ const GATE_3_NAMES: Record<number, string> = {
   204: "C-ONLY",  // lag-1 predictor
   232: "MAJ3",    // majority vote: output 1 if 2+ inputs are 1
 };
+const GATE_3_NAMES_REVERSE: Map<string, number> = new Map(Object.entries(GATE_3_NAMES).map(([id, name]) => [name, parseInt(id, 10)]));
 
 function apply3InputGate(truthTable: number, a: 0|1, b: 0|1, c: 0|1): 0|1 {
   const idx = a*4 + b*2 + c;
@@ -1649,6 +1650,47 @@ function apply3InputGate(truthTable: number, a: 0|1, b: 0|1, c: 0|1): 0|1 {
 
 function getGate3Name(id: number): string {
   return GATE_3_NAMES[id] ?? `G${id}`;
+}
+
+// Describes what an UNNAMED gate actually does, in plain terms, instead of
+// just showing its raw ID (which means nothing without deep truth-table
+// knowledge). Named gates (AND3, MAJ3, etc.) are returned as-is — they're
+// already short and recognizable. For everything else, this checks how
+// strongly the gate's output tracks (or contradicts) each individual input
+// — the outcome from 1, 2, or 3 spins back — across all 8 possible input
+// combinations, and describes whichever relationship is strongest.
+function describeGateBehavior(selectedGateLabel: string): { label: string; id: number | null } {
+  if (GATE_3_NAMES_REVERSE.has(selectedGateLabel)) {
+    return { label: selectedGateLabel, id: GATE_3_NAMES_REVERSE.get(selectedGateLabel)! };
+  }
+  const match = /^G(\d+)$/.exec(selectedGateLabel);
+  if (!match) return { label: selectedGateLabel, id: null }; // legacy/unrecognized format — show as-is
+  const id = parseInt(match[1], 10);
+
+  let matchA = 0, matchB = 0, matchC = 0;
+  for (let a = 0; a <= 1; a++) for (let b = 0; b <= 1; b++) for (let c = 0; c <= 1; c++) {
+    const out = apply3InputGate(id, a as 0|1, b as 0|1, c as 0|1);
+    if (out === a) matchA++;
+    if (out === b) matchB++;
+    if (out === c) matchC++;
+  }
+
+  const candidates = [
+    { label: "Follows Most Recent Spin", strength: matchC },
+    { label: "Contrarian to Most Recent Spin", strength: 8 - matchC },
+    { label: "Follows Spin 2 Back", strength: matchB },
+    { label: "Contrarian to Spin 2 Back", strength: 8 - matchB },
+    { label: "Follows Spin 3 Back", strength: matchA },
+    { label: "Contrarian to Spin 3 Back", strength: 8 - matchA },
+  ];
+  candidates.sort((x, y) => y.strength - x.strength);
+  const top = candidates[0];
+
+  const label = top.strength >= 7 ? top.label
+    : top.strength === 6 ? `Leans: ${top.label}`
+    : "Mixed Pattern";
+
+  return { label, id };
 }
 
 // Score all 256 3-input truth tables against the last `window+3` outcomes.
@@ -1907,8 +1949,8 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
     : holdCount>0
     ? `${holdCount}/3 HOLD · ${execCount} EXECUTE · ${cadenceCount} CADENCE`
     : cadenceCount>0
-    ? `Cadence Active · ${cadenceCount}/3 dimensions · spread < ${SPREAD_THRESHOLD}`
-    : `BB Straight · All EXECUTE · spread ≥ ${SPREAD_THRESHOLD}`;
+    ? `Cadence Active · ${cadenceCount}/3 dimensions`
+    : `Straight · All EXECUTE`;
 
   return { color,range,parity,colorBit,rangeBit,parityBit,group,overrideCount,holdCount,isWarming:false,label };
 }
@@ -5356,14 +5398,21 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     [rawOutcomes, strategy, baseUnit, startingBankroll, executionMode, tableLimit, perNumberLimit, tierExecution]
   );
 
-  const Panel = ({ title, children, style = {} }: any) => (
+  // These are wrapped in useMemo so their identity stays stable across
+  // renders (only changing when the theme actually changes). Without this,
+  // each of these was a brand-new function on every render, which made
+  // React treat it as a different component and remount the underlying DOM
+  // node every time — the exact cause of Input fields only accepting one
+  // digit at a time (each keystroke triggered a state update -> re-render ->
+  // new Input identity -> DOM <input> remounted -> focus lost).
+  const Panel = useMemo(() => ({ title, children, style = {} }: any) => (
     <div style={{ background: t.panel, border: `1px solid ${t.border}`, borderRadius: 16, padding: 12, boxShadow: t.shadow, color: t.text, ...style }}>
       {title ? <div style={{ fontSize: 11, fontWeight: 950, color: t.subtext, marginBottom: 10, letterSpacing: 0.8, textTransform: "uppercase" }}>{title}</div> : null}
       {children}
     </div>
-  );
+  ), [appearance]);
 
-  const CollapsiblePanel = ({ id, title, children, style = {} }: any) => {
+  const CollapsiblePanel = useMemo(() => ({ id, title, children, style = {} }: any) => {
     const collapsed = !!collapsedPanels[id];
     const collapsedStyle = collapsed
       ? { minHeight: "unset", height: "auto", maxHeight: "none" }
@@ -5396,15 +5445,15 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         {!collapsed ? <div style={{ marginTop: 10 }}>{children}</div> : null}
       </div>
     );
-  };
-  const Button = ({ children, onClick, variant = "primary", disabled = false }: any) => {
+  }, [appearance, collapsedPanels, togglePanel]);
+  const Button = useMemo(() => ({ children, onClick, variant = "primary", disabled = false }: any) => {
     const bg = variant === "primary" ? COLORS.blue : variant === "danger" ? COLORS.red : t.input;
     return <button onClick={onClick} disabled={disabled} style={{ width: "100%", minWidth: 112, height: 38, borderRadius: 10, background: disabled ? "#94a3b8" : bg, color: variant === "secondary" ? t.text : "#fff", border: variant === "secondary" ? `1px solid ${t.borderStrong}` : `1px solid ${bg}`, cursor: disabled ? "not-allowed" : "pointer", fontWeight: 900, fontSize: 12 }}>{children}</button>;
-  };
-  const Input = (props: any) => <input {...props} style={{ width: "100%", height: 38, padding: "0 10px", borderRadius: 10, border: `1px solid ${t.borderStrong}`, background: t.input, color: t.text, fontSize: 13, outline: "none", boxSizing: "border-box" }} />;
-  const Select = ({ value, onChange, options }: any) => <select value={value} onChange={onChange} style={{ width: "100%", height: 38, padding: "0 10px", borderRadius: 10, border: `1px solid ${t.borderStrong}`, background: t.input, color: t.text, fontSize: 13 }}>{options.map((o: string) => <option key={o} value={o}>{o || "Select Saved Session"}</option>)}</select>;
-  const MiniMetric = ({ label, value, accent }: any) => <div style={{ border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: "9px 10px", minWidth: 0 }}><div style={{ fontSize: 10, color: t.subtext, textTransform: "uppercase", fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{label}</div><div style={{ marginTop: 4, color: accent || t.text, fontSize: 18, fontWeight: 950, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div></div>;
-  const Modal = ({ open, children }: any) => !open ? null : <div style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.62)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}><div style={{ width: "100%", maxWidth: 470, background: t.panel, borderRadius: 16, border: `1px solid ${t.borderStrong}`, boxShadow: t.shadow, padding: 18, color: t.text }}>{children}</div></div>;
+  }, [appearance]);
+  const Input = useMemo(() => (props: any) => <input {...props} style={{ width: "100%", height: 38, padding: "0 10px", borderRadius: 10, border: `1px solid ${t.borderStrong}`, background: t.input, color: t.text, fontSize: 13, outline: "none", boxSizing: "border-box" }} />, [appearance]);
+  const Select = useMemo(() => ({ value, onChange, options }: any) => <select value={value} onChange={onChange} style={{ width: "100%", height: 38, padding: "0 10px", borderRadius: 10, border: `1px solid ${t.borderStrong}`, background: t.input, color: t.text, fontSize: 13 }}>{options.map((o: string) => <option key={o} value={o}>{o || "Select Saved Session"}</option>)}</select>, [appearance]);
+  const MiniMetric = useMemo(() => ({ label, value, accent, wrap = false }: any) => <div style={{ border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: "9px 10px", minWidth: 0 }}><div style={{ fontSize: 10, color: t.subtext, textTransform: "uppercase", fontWeight: 900, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{label}</div><div style={wrap ? { marginTop: 4, color: accent || t.text, fontSize: 15, fontWeight: 950, whiteSpace: "normal", wordBreak: "break-word", lineHeight: 1.25 } : { marginTop: 4, color: accent || t.text, fontSize: 18, fontWeight: 950, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{value}</div></div>, [appearance]);
+  const Modal = useMemo(() => ({ open, children }: any) => !open ? null : <div style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.62)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100, padding: 20 }}><div style={{ width: "100%", maxWidth: 470, background: t.panel, borderRadius: 16, border: `1px solid ${t.borderStrong}`, boxShadow: t.shadow, padding: 18, color: t.text }}>{children}</div></div>, [appearance]);
   const rouletteButtonStyle = (value: SpinValue): React.CSSProperties => {
     const isZero = value === 0 || value === "00";
     const bg = isZero ? "#15803d" : RED_NUMBERS.has(value) ? "#991b1b" : "#111827";
@@ -5530,13 +5579,15 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       const pc = perfColor(axis.performanceState);
       const fitPct = Math.round(axis.gateFitScore * 100);
       const fitColor = fitPct >= 70 ? COLORS.green : fitPct >= 60 ? COLORS.amber : COLORS.red;
+      const gateInfo = axis.isWarming ? null : describeGateBehavior(axis.selectedGate);
 
       // Last 20 AND conformance sequence
       const dimIndex = name === "Color" ? 0 : name === "Range" ? 1 : 2;
       const recentBits = groupSeries(history).map(groupToBits).map((b) => b[dimIndex]);
-      const seq: boolean[] = [];
+      const seq: { match: boolean; bit: 0 | 1 }[] = [];
       for (let i = 1; i < recentBits.length; i++) {
-        seq.push(getStraightNextBit(recentBits.slice(0,i) as (0|1)[]) === recentBits[i]);
+        const actualBit = recentBits[i] as 0 | 1;
+        seq.push({ match: getStraightNextBit(recentBits.slice(0,i) as (0|1)[]) === actualBit, bit: actualBit });
       }
       const recent20 = seq.slice(-20);
 
@@ -5547,9 +5598,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
             <div style={{ fontWeight: 950, fontSize: 13 }}>{name}</div>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              {!axis.isWarming && !axis.isHold && (
+              {!axis.isWarming && !axis.isHold && gateInfo && (
                 <div style={{ background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: COLORS.cyan }}>
-                  {axis.selectedGate} #{axis.allGateScores ? "" : ""}
+                  {gateInfo.label}{gateInfo.id !== null ? <span style={{ opacity: 0.6, fontWeight: 700 }}> #{gateInfo.id}</span> : null}
                 </div>
               )}
               <div style={{ background: `${pc}18`, border: `1px solid ${pc}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: pc }}>
@@ -5572,7 +5623,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
             </div>
             <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
               <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Selected Gate</div>
-              <div style={{ fontSize: 13, fontWeight: 950, color: COLORS.cyan, marginTop: 3 }}>{axis.isWarming ? "—" : axis.selectedGate}</div>
+              <div style={{ fontSize: 13, fontWeight: 950, color: COLORS.cyan, marginTop: 3 }}>
+                {axis.isWarming || !gateInfo ? "—" : <>{gateInfo.label}{gateInfo.id !== null ? <span style={{ fontSize: 10, opacity: 0.6, fontWeight: 700, marginLeft: 4 }}>#{gateInfo.id}</span> : null}</>}
+              </div>
             </div>
           </div>
 
@@ -5614,12 +5667,12 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           {/* AND conformance sequence — kept as reference */}
           <div>
             <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 5 }}>
-              Last 20 Pattern Sequence (C=match, I=deviation)
+              Last 20 Outcomes · Green = Gate Matched, Red = Gate Missed
             </div>
             <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
-              {recent20.map((match, i) => (
-                <div key={i} style={{ width:22, height:22, borderRadius:5, background:match?"rgba(16,185,129,0.15)":"rgba(239,68,68,0.15)", border:`1px solid ${match?"rgba(16,185,129,0.40)":"rgba(239,68,68,0.40)"}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:950, color:match?COLORS.green:COLORS.red }}>
-                  {match?"C":"I"}
+              {recent20.map((entry, i) => (
+                <div key={i} style={{ width:22, height:22, borderRadius:5, background:entry.match?"rgba(16,185,129,0.15)":"rgba(239,68,68,0.15)", border:`1px solid ${entry.match?"rgba(16,185,129,0.40)":"rgba(239,68,68,0.40)"}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:950, color:entry.match?COLORS.green:COLORS.red }}>
+                  {labels[entry.bit][0]}
                 </div>
               ))}
               {recent20.length === 0 && <span style={{ color: t.subtext, fontSize: 11 }}>Need more spins</span>}
@@ -5641,9 +5694,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     return (
       <CollapsiblePanel id="dimensionPattern" title="Dimension Pattern">
-        <div style={{ color: t.subtext, fontSize: 11, fontWeight: 900, marginBottom: 10 }}>
-          3-input Boolean gate selector · 256 truth tables scored per axis · Best fit ≥ 55% → EXECUTE · Below → HOLD
-        </div>
         {divergence && (
           <div style={{ border:`1px solid ${divergence.isWarming?t.border:divergence.holdCount===3?COLORS.red+"55":COLORS.green+"44"}`, borderRadius:10, padding:"9px 12px", marginBottom:12, background:divergence.holdCount===3?"rgba(239,68,68,0.06)":"rgba(16,185,129,0.04)", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
             <div style={{ fontWeight:950, fontSize:12, color:divergence.isWarming?t.subtext:divergence.holdCount===3?COLORS.red:COLORS.green }}>
@@ -6127,10 +6177,10 @@ const StreakAnalyticsPanel = () => {
     ];
 
     return <CollapsiblePanel id="rouletteWheelOverlay" title="Wheel Neighbor Overlay">
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Group" value={f.group ?? "—"} accent={COLORS.red} />
         <MiniMetric label="Last" value={winning !== undefined ? String(winning) : "—"} accent={winning !== undefined ? (winning === 0 || winning === "00" ? COLORS.green : RED_NUMBERS.has(winning) ? COLORS.red : t.text) : undefined} />
-        <MiniMetric label="Execution" value={effectiveExecutionMode} accent={effectiveExecutionMode === "Stream Direct" ? COLORS.cyan : effectiveExecutionMode === "Neighbor Expansion" ? COLORS.amber : COLORS.blue} />
+        <MiniMetric label="Execution" value={effectiveExecutionMode} accent={effectiveExecutionMode === "Stream Direct" ? COLORS.cyan : effectiveExecutionMode === "Neighbor Expansion" ? COLORS.amber : COLORS.blue} wrap />
         <MiniMetric label="Align" value={`${wheelAlignment}%`} accent={streamConflict ? COLORS.amber : COLORS.cyan} />
       </div>
       {effectiveExecutionMode === "Dimension Compression" ? <div style={{ border: `1px solid ${t.border}`, borderRadius: 12, background: t.panel2, padding: 9, marginBottom: 10, fontSize: 11, fontWeight: 900, lineHeight: 1.55 }}>
