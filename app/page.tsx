@@ -2743,7 +2743,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // against noise in the DATA, not against switching itself.
     const PULSE_TREND_LOOKBACK = 10;     // spins back to measure trend, used for the first-pick tie-break and decline detection
     const PULSE_DECEL_THRESHOLD = -15;   // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
-    const PULSE_SESSION_FLOOR = 15;      // if the LEADER's raw rate itself is at or below this, nobody has real signal — pause even with no decline to point to (a leader that's always been mediocre never triggers the decline check above, since there's nothing to decline from)
+    const PULSE_SESSION_FLOOR = 10;      // if the LEADER's raw rate itself is at or below this, nobody has real signal — pause even with no decline to point to (a leader that's always been mediocre never triggers the decline check above, since there's nothing to decline from). Lowered from 15 on July 20 to let more spins clear the floor — untested against a batch of sessions yet, so watch whether the extra bets this unlocks are net positive or just more volume at a lower quality bar.
 
     const eligible = Object.entries(engineStats).filter(([, s]) => s.n >= PULSE_MIN_SAMPLES);
     const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
