@@ -104,7 +104,7 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
-    switchReason?: "highest-score" | "tie-hold-current" | "tie-break-trend" | null;
+    switchReason?: "highest-z" | null;
     challengerZScores?: Record<string, number | null>;
     leanStreak?: number;
     zTrendDelta?: number | null;
@@ -2634,8 +2634,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   //   - Inverted, Markov, Random use their existing prediction engines
   if (pulseEnabled) {
     const PULSE_WARMING     = 10;
-    const PULSE_WINDOW      = 15;   // rolling window for win rate — narrowed further from 25 for faster reaction. Note: with PULSE_MIN_SAMPLES=10, this leaves little headroom above the trust floor, and a smaller window means noisier rates and more "leader" churn between engines, which can make the lean-streak mechanism harder to build (see Session Performance Findings).
-    const PULSE_MIN_SAMPLES = 10;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
+    const PULSE_WINDOW      = 15;   // rolling window for win rate
 
     // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
@@ -2718,106 +2717,58 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const engineRates: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.rate]));
     const engineSamples: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.n]));
 
-    // Two-proportion one-tailed z-test: is the challenger's win rate
-    // *statistically* higher than the current engine's, or is this gap just
-    // noise? Both engines need a real sample size before we trust either
-    // rate at all — with roulette payouts this close to 50/50, a handful of
-    // spins is not enough to tell skill from luck, which is exactly what
-    // made the old raw-percentage-gap rule chase hot streaks that were
-    // about to revert (see Session Performance Findings).
-    const zScoreForChallenger = (challenger: { wins: number; n: number }, current: { wins: number; n: number }): number | null => {
-      if (challenger.n < PULSE_MIN_SAMPLES || current.n < PULSE_MIN_SAMPLES) return null;
-      const p1 = challenger.wins / challenger.n;
-      const p2 = current.wins / current.n;
-      const pooled = (challenger.wins + current.wins) / (challenger.n + current.n);
-      const se = Math.sqrt(pooled * (1 - pooled) * (1 / challenger.n + 1 / current.n));
-      if (se === 0) return p1 > p2 ? Infinity : 0;
-      return (p1 - p2) / se;
+    // ─── Z-SCORE vs a fixed baseline — the ONLY input to engine selection ───
+    // Per request (July 20): decisions are based purely on which engine has
+    // the highest one-sample z-score against a fixed baseline win rate, with
+    // no other gating — no hold, no pause, no decline check, no session
+    // floor, no tie-hold-on-current-engine. This is a deliberate return to
+    // something close to the original z-test system from before the
+    // "highest-score-wins" redesign, minus its hold-streak requirement, and
+    // scored against a fixed baseline instead of pairwise vs. a challenger.
+    // Known risk carried over from that earlier system (see Session
+    // Performance Findings): z-tests need real sample size to move, so this
+    // can sit on one engine for a long stretch while it waits for a gap to
+    // become statistically distinguishable from baseline — this is an
+    // intentional trade-off requested in chat, not an oversight. Treat this
+    // as a fresh starting point to validate against real sessions.
+    const PULSE_Z_BASELINE = 0.125; // fixed baseline win probability (~1/8 — chance odds of a 3-axis coincidence), same constant used as the shrinkage prior tested earlier
+
+    const zScoreVsBaseline = (s: { wins: number; n: number }): number | null => {
+      if (s.n < 1) return null; // undefined with zero evaluated spins — not a policy choice, just undefined math
+      const phat = s.wins / s.n;
+      const se = Math.sqrt(PULSE_Z_BASELINE * (1 - PULSE_Z_BASELINE) / s.n);
+      if (se === 0) return 0;
+      return (phat - PULSE_Z_BASELINE) / se;
     };
 
-    // ─── LEADER SELECTION (highest score wins, no hold requirement) ─────────
-    // Every spin, whichever engine has the best rate becomes active
-    // immediately — no minimum streak, no dip tolerance, no significance
-    // test. The only floor kept is PULSE_MIN_SAMPLES, which exists purely to
-    // stop a 2-for-4 lucky start from counting as a real rate — it protects
-    // against noise in the DATA, not against switching itself.
-    const PULSE_TREND_LOOKBACK = 10;     // spins back to measure trend, used for the first-pick tie-break and decline detection
-    const PULSE_DECEL_THRESHOLD = -15;   // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
-    const PULSE_SESSION_FLOOR = 10;      // if the LEADER's raw rate itself is at or below this, nobody has real signal — pause even with no decline to point to (a leader that's always been mediocre never triggers the decline check above, since there's nothing to decline from). Lowered from 15 on July 20 to let more spins clear the floor — untested against a batch of sessions yet, so watch whether the extra bets this unlocks are net positive or just more volume at a lower quality bar.
+    const engineZScores: Record<string, number | null> = Object.fromEntries(
+      Object.entries(engineStats).map(([engine, s]) => [engine, zScoreVsBaseline(s)])
+    );
 
-    const eligible = Object.entries(engineStats).filter(([, s]) => s.n >= PULSE_MIN_SAMPLES);
-    const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
-    const getTrendFor = (engine: string): number | null => {
-      if (pastHistoryForTrend.length < 3) return null;
-      const pastRate = computeEngineStatsFor(engine, pastHistoryForTrend).rate;
-      return engineStats[engine].rate - pastRate;
-    };
+    // ─── LEADER SELECTION — highest Z-score, no other conditions ────────────
+    const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random"] as const;
+    const eligible = ENGINE_ORDER.filter((e) => engineZScores[e] !== null);
 
-    // Check what's currently active (from last step) — needed for the tie-break below
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
     let leader = "Straight";
-    let leaderReason: "highest-score" | "tie-hold-current" | "tie-break-trend" | null = null;
+    let leaderReason: "highest-z" | null = null;
     if (eligible.length === 0) {
-      leader = "Straight"; // nobody has enough samples yet — neutral default, same as before
+      leader = "Straight"; // nobody has an evaluated prediction yet — neutral default
     } else {
-      const maxRate = Math.max(...eligible.map(([, s]) => s.rate));
-      const tied = eligible.filter(([, s]) => s.rate === maxRate).map(([e]) => e);
-      if (tied.length === 1) {
-        leader = tied[0];
-        leaderReason = "highest-score";
-      } else if (currentEngine && tied.includes(currentEngine)) {
-        // A tie is, by definition, no evidence in either direction — the
-        // challenger hasn't actually beaten the current engine, just
-        // matched it. Switching on that isn't acting on a real signal, it's
-        // picking a direction on noise. So on a tie, stay put.
-        leader = currentEngine;
-        leaderReason = "tie-hold-current";
-      } else {
-        // Current engine isn't even among the tied leaders (it's been
-        // outright surpassed), or this is the very first pick with no
-        // current engine yet — there's nothing to "stay" with, so fall back
-        // to whoever's rising fastest among the tied engines.
-        let bestTrend = -Infinity;
-        leader = tied[0];
-        for (const engine of tied) {
-          const trend = getTrendFor(engine) ?? 0;
-          if (trend > bestTrend) { bestTrend = trend; leader = engine; }
-        }
-        leaderReason = "tie-break-trend";
+      let bestZ = -Infinity;
+      for (const engine of eligible) {
+        const z = engineZScores[engine]!;
+        if (z > bestZ) { bestZ = z; leader = engine; }
       }
+      leaderReason = "highest-z";
     }
 
-    // Informational only now — not a gate. Each engine's z-score against
-    // whichever engine is leading this spin, kept for transparency in the
-    // Switch Log (so you can still see how far ahead/behind everyone is).
-    const challengerZScores: Record<string, number | null> = {};
-    for (const engine of Object.keys(engineStats)) {
-      if (engine === leader) continue;
-      challengerZScores[engine] = zScoreForChallenger(engineStats[engine], engineStats[leader]);
-    }
-
-    // ─── PAUSE — two independent conditions, either one holds ──────────────
-    // 1. DECLINE: the leader can be losing badly and still be numerically
-    //    ahead of three other weak engines — nobody has to actually overtake
-    //    it for that decline to be real.
-    // 2. SESSION FLOOR: a leader that's been consistently mediocre the whole
-    //    time never triggers the decline check (there's no drop to measure —
-    //    it just never was any good). This catches that case directly: if
-    //    the leader's raw rate itself is at or below PULSE_SESSION_FLOOR,
-    //    that's nobody having real signal, regardless of trend.
-    const leaderTrend = getTrendFor(leader);
-    const leaderRate = engineStats[leader]?.rate ?? 0;
-    let isPaused = false;
-    let pauseReason: string | null = null;
-    if (leaderTrend !== null && leaderTrend <= PULSE_DECEL_THRESHOLD) {
-      isPaused = true;
-      pauseReason = `${leader} declining (${leaderTrend}pp/${PULSE_TREND_LOOKBACK} spins) despite still leading — no clear alternative has emerged`;
-    } else if (leaderRate <= PULSE_SESSION_FLOOR && eligible.length > 0) {
-      isPaused = true;
-      pauseReason = `${leader} leading at only ${leaderRate}% — no engine has real signal this session, not just a temporary dip`;
-    }
+    // No pause conditions of any kind — every spin with at least one
+    // eligible engine places a bet.
+    const isPaused = false;
+    const pauseReason: string | null = null;
 
     const selectedEngine = leader;
 
@@ -2856,14 +2807,14 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       engineSamples,
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
-      switchZScore: null as number | null,
+      switchZScore: engineZScores[selectedEngine] ?? null,
       switchReason: leaderReason,
-      challengerZScores,
+      challengerZScores: engineZScores, // now each engine's z vs. the fixed baseline, including the leader itself — not pairwise vs. leader
       leanStreak: 0,
-      zTrendDelta: leaderTrend,
+      zTrendDelta: null as number | null,
       isPaused,
       pauseReason,
-      currentEngineTrend: leaderTrend,
+      currentEngineTrend: null as number | null,
     };
 
     return {
@@ -2871,9 +2822,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       source: "PULSE" as const,
       mode,
       pulseEngineTracker: tracker,
-      reason: isPaused
-        ? `Pulse · PAUSED — ${pauseReason} · ${Object.entries(engineStats).map(([e, s]) => `${e}:${s.rate}%(n=${s.n})`).join(" · ")}`
-        : `Pulse · ${selectedEngine} selected (${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${Object.entries(engineStats).map(([e, s]) => `${e}:${s.rate}%(n=${s.n})`).join(" · ")}`,
+      reason: `Pulse · ${selectedEngine} selected (Z=${engineZScores[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_Z_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${Object.entries(engineStats).map(([e, s]) => `${e}:${s.rate}%(n=${s.n}, Z=${engineZScores[e]?.toFixed(2) ?? "—"})`).join(" · ")}`,
     };
   }
 
@@ -4970,7 +4919,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const rates = tracker.engineRates || {};
         const samples = tracker.engineSamples || {};
         const czs = tracker.challengerZScores || {};
-        const engineZ = (engine: string) => tracker.selectedEngine === engine ? null : (typeof czs[engine] === "number" ? czs[engine] as number : null);
+        const engineZ = (engine: string) => (typeof czs[engine] === "number" ? czs[engine] as number : null);
         const leaderTrend = typeof tracker.currentEngineTrend === "number" ? tracker.currentEngineTrend : null;
         return {
           spin: row.spin,
@@ -5000,8 +4949,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const rowsForPulseSwitchLogExport = () => [
     ["Spin", "Selected Engine (= Leader)", "Paused (No Bet)", "Switched", "Switch Reason", "Previous Engine",
-     "Straight %", "Straight n", "Straight Z (vs leader)", "Inverted %", "Inverted n", "Inverted Z (vs leader)",
-     "Markov %", "Markov n", "Markov Z (vs leader)", "Random %", "Random n", "Random Z (vs leader)",
+     "Straight %", "Straight n", "Straight Z (vs 12.5% baseline)", "Inverted %", "Inverted n", "Inverted Z (vs 12.5% baseline)",
+     "Markov %", "Markov n", "Markov Z (vs 12.5% baseline)", "Random %", "Random n", "Random Z (vs 12.5% baseline)",
      "Leader Trend (Δpp/10 spins)", "Pause Reason"],
     ...getPulseSwitchLogRows().map((row) => [
       row.spin, row.selectedEngine, row.isPaused ? "YES" : "NO", row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
@@ -6602,40 +6551,30 @@ const StreakAnalyticsPanel = () => {
   const PulseSwitchLogPanel = () => {
     const rows = getPulseSwitchLogRows();
     const switches = rows.filter((row) => row.switched);
-    const tieBreaks = switches.filter((row) => row.switchReason === "tie-break-trend");
-    const tiesHeld = rows.filter((row) => row.switchReason === "tie-hold-current");
-    const pausedSpins = rows.filter((row) => row.isPaused);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Rolling win rate + sample size for all 4 engines, every spin. Whichever engine has the highest rate (n ≥ 10) is active immediately — no hold requirement. On a tie, Pulse stays with whoever's already active (a tie is no evidence either way) — trend only breaks a tie when there's no current engine to default to, e.g. the very first pick. Pause fires on either of two conditions: the leader's own rate drops 15+ points over 10 spins (declining despite still ranked #1), or the leader's rate is at/below 15% outright (nobody has real signal this session, not just a temporary dip).</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Each engine's win rate is scored as a one-sample z-score against a fixed 12.5% baseline. Whichever engine has the highest z-score is active immediately, every spin — no hold, no tie-break, no pause of any kind. This is a deliberate no-restrictions build (July 20) — validate against real sessions before trusting it.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(6, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Spins Tracked" value={rows.length} />
         <MiniMetric label="Switches" value={switches.length} />
-        <MiniMetric label="Tie-Breaks (trend)" value={tieBreaks.length} accent={tieBreaks.length ? COLORS.amber : t.subtext} />
-        <MiniMetric label="Ties Held (stayed put)" value={tiesHeld.length} accent={tiesHeld.length ? COLORS.cyan : t.subtext} />
-        <MiniMetric label="Paused (No Bet)" value={pausedSpins.length} accent={pausedSpins.length ? COLORS.amber : t.subtext} />
         <MiniMetric label="Current Leader" value={rows.at(-1)?.selectedEngine ?? "—"} />
       </div>
-      <div style={{ color: t.subtext, fontSize: 11, fontWeight: 800, marginBottom: 8 }}>Reason color key: <span style={{ color: COLORS.cyan }}>highest-score</span> = clean win, <span style={{ color: t.text }}>tie-hold-current</span> = tie, stayed put, <span style={{ color: COLORS.amber }}>tie-break-trend</span> = tie with no current to default to</div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Leader", "Paused", "Switched", "Reason", "From", "Straight", "Inverted", "Markov", "Random", "Leader Trend"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Leader", "Switched", "From", "Straight", "Inverted", "Markov", "Random"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={11} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
-              <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}`, background: row.isPaused ? "rgba(245,158,11,0.06)" : undefined }}>
+            {rows.length === 0 ? <tr><td colSpan={8} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
+              <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}` }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
-                <td style={{ padding: "8px 10px", color: row.isPaused ? COLORS.amber : t.subtext, fontWeight: row.isPaused ? 950 : 400 }} title={row.pauseReason ?? undefined}>{row.isPaused ? "YES" : "—"}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
-                <td style={{ padding: "8px 10px", color: row.switchReason === "tie-break-trend" ? COLORS.amber : row.switchReason === "highest-score" ? COLORS.cyan : row.switchReason === "tie-hold-current" ? t.text : t.subtext, fontWeight: 900 }}>{row.switchReason ?? "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center", color: row.leaderTrend !== null && row.leaderTrend <= -15 ? COLORS.red : t.subtext, fontWeight: row.leaderTrend !== null && row.leaderTrend <= -15 ? 950 : 400 }}>{row.leaderTrend === null ? "—" : (row.leaderTrend > 0 ? "+" : "") + row.leaderTrend.toFixed(1)}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN}, Z={row.straightZ === null ? "—" : row.straightZ.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN}, Z={row.invertedZ === null ? "—" : row.invertedZ.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN}, Z={row.markovZ === null ? "—" : row.markovZ.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN}, Z={row.randomZ === null ? "—" : row.randomZ.toFixed(2)})</span></td>
               </tr>
             ))}
           </tbody>
