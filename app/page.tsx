@@ -101,6 +101,7 @@ type Step = {
     isWarming: boolean;
     engineRates: Record<string, number>;
     engineSamples?: Record<string, number>;
+    engineScores?: Record<string, number>; // Bayesian-shrunk rate used for leader selection — see PULSE_PRIOR_RATE/PULSE_PRIOR_KAPPA
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
@@ -2636,6 +2637,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const PULSE_WARMING     = 10;
     const PULSE_WINDOW      = 15;   // rolling window for win rate — narrowed further from 25 for faster reaction. Note: with PULSE_MIN_SAMPLES=10, this leaves little headroom above the trust floor, and a smaller window means noisier rates and more "leader" churn between engines, which can make the lean-streak mechanism harder to build (see Session Performance Findings).
     const PULSE_MIN_SAMPLES = 10;   // neither engine's rate is trusted at all below this many evaluated spins in the window — too few samples for the normal approximation behind the z-test to be valid.
+    const PULSE_PRIOR_RATE  = 12.5; // fixed neutral prior (~1/8 — baseline odds of a 3-axis coincidence), used to shrink small-sample rates toward a stable baseline before ranking engines. Fixed rather than session-adaptive: an adaptive prior built from the same small-sample engine rates it's meant to correct for is circular. See chat, July 20.
+    const PULSE_PRIOR_KAPPA = 10;   // "phantom trials" of weight given to the prior — set on par with PULSE_MIN_SAMPLES, so an engine needs roughly that much real evidence beyond the trust floor before its own observed rate dominates the shrunk estimate. Lower = reacts faster but shrinks less; higher = more conservative.
 
     // Not enough history yet — use Straight as fallback so chart still draws
     if (history.length < PULSE_WARMING) {
@@ -2718,6 +2721,22 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const engineRates: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.rate]));
     const engineSamples: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.n]));
 
+    // Bayesian posterior mean per engine: (wins + κ·p₀) / (n + κ), where p₀ is
+    // PULSE_PRIOR_RATE and κ is PULSE_PRIOR_KAPPA. Pulls small-sample rates
+    // toward the prior — a 2-for-2 (100%) gets shrunk hard, a 3-for-15 (20%)
+    // barely moves — so a lucky short streak can't outrank a larger, more
+    // trustworthy sample just because its raw percentage is higher. This is
+    // used ONLY for leader selection/tie-breaking below. engineRates (the raw
+    // observed rate) is unchanged and still what's shown in the UI and Switch
+    // Log, and still what the decline/session-floor pause checks read — this
+    // only changes which engine is treated as "ahead." See chat, July 20.
+    const engineScores: Record<string, number> = Object.fromEntries(
+      Object.entries(engineStats).map(([engine, s]) => {
+        const posterior = (s.wins + PULSE_PRIOR_KAPPA * (PULSE_PRIOR_RATE / 100)) / (s.n + PULSE_PRIOR_KAPPA);
+        return [engine, Math.round(posterior * 1000) / 10]; // one decimal place, kept visually distinct from the whole-percent raw rate
+      })
+    );
+
     // Two-proportion one-tailed z-test: is the challenger's win rate
     // *statistically* higher than the current engine's, or is this gap just
     // noise? Both engines need a real sample size before we trust either
@@ -2745,17 +2764,11 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const PULSE_DECEL_THRESHOLD = -15;   // leader's own rate must have dropped at least this many points over the lookback to trigger a pause, even while still ranked #1
     const PULSE_SESSION_FLOOR = 15;      // if the LEADER's raw rate itself is at or below this, nobody has real signal — pause even with no decline to point to (a leader that's always been mediocre never triggers the decline check above, since there's nothing to decline from)
 
-    // EXPERIMENT (see chat, July 20): the decline check mostly overlapped
-    // with the session floor in the sessions reviewed so far, and its
-    // trend calc is noisiest exactly when it fires most often — early in an
-    // engine's sample window, when the "10 spins ago" endpoint still has a
-    // tiny n. It also never addresses the failure mode that actually cost
-    // the most (switching INTO an engine on a lucky upswing) since it only
-    // fires once a rate is already falling. Set to true to restore the
-    // original two-condition behavior; false = floor-only pause, for A/B
-    // testing against sessions already on record before deciding whether to
-    // keep, tune, or remove the decline check for good.
-    const PULSE_DECLINE_CHECK_ENABLED = false;
+    // Tested floor-only (decline check disabled) vs. the original
+    // two-condition pause on July 20 — the two-condition version performed
+    // better, so decline check is back on. Toggle preserved in case this
+    // needs revisiting with more session data later.
+    const PULSE_DECLINE_CHECK_ENABLED = true;
 
     const eligible = Object.entries(engineStats).filter(([, s]) => s.n >= PULSE_MIN_SAMPLES);
     const pastHistoryForTrend = history.slice(0, Math.max(0, history.length - PULSE_TREND_LOOKBACK));
@@ -2774,8 +2787,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     if (eligible.length === 0) {
       leader = "Straight"; // nobody has enough samples yet — neutral default, same as before
     } else {
-      const maxRate = Math.max(...eligible.map(([, s]) => s.rate));
-      const tied = eligible.filter(([, s]) => s.rate === maxRate).map(([e]) => e);
+      const maxScore = Math.max(...eligible.map(([e]) => engineScores[e]));
+      const tied = eligible.filter(([e]) => engineScores[e] === maxScore).map(([e]) => e);
       if (tied.length === 1) {
         leader = tied[0];
         leaderReason = "highest-score";
@@ -2866,6 +2879,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       spinsRemaining: 0,
       engineRates,
       engineSamples,
+      engineScores,
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
       switchZScore: null as number | null,
@@ -4981,6 +4995,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const tracker = row.pulseEngineTracker!;
         const rates = tracker.engineRates || {};
         const samples = tracker.engineSamples || {};
+        const scores = tracker.engineScores || {};
         const czs = tracker.challengerZScores || {};
         const engineZ = (engine: string) => tracker.selectedEngine === engine ? null : (typeof czs[engine] === "number" ? czs[engine] as number : null);
         const leaderTrend = typeof tracker.currentEngineTrend === "number" ? tracker.currentEngineTrend : null;
@@ -4997,6 +5012,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           invertedN: samples["Inverted"] ?? 0,
           markovN: samples["Markov"] ?? 0,
           randomN: samples["Random"] ?? 0,
+          straightScore: scores["Straight"] ?? 0,
+          invertedScore: scores["Inverted"] ?? 0,
+          markovScore: scores["Markov"] ?? 0,
+          randomScore: scores["Random"] ?? 0,
           straightZ: engineZ("Straight"),
           invertedZ: engineZ("Inverted"),
           markovZ: engineZ("Markov"),
@@ -5012,15 +5031,17 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const rowsForPulseSwitchLogExport = () => [
     ["Spin", "Selected Engine (= Leader)", "Paused (No Bet)", "Switched", "Switch Reason", "Previous Engine",
-     "Straight %", "Straight n", "Straight Z (vs leader)", "Inverted %", "Inverted n", "Inverted Z (vs leader)",
-     "Markov %", "Markov n", "Markov Z (vs leader)", "Random %", "Random n", "Random Z (vs leader)",
+     "Straight %", "Straight n", "Straight Score (shrunk)", "Straight Z (vs leader)",
+     "Inverted %", "Inverted n", "Inverted Score (shrunk)", "Inverted Z (vs leader)",
+     "Markov %", "Markov n", "Markov Score (shrunk)", "Markov Z (vs leader)",
+     "Random %", "Random n", "Random Score (shrunk)", "Random Z (vs leader)",
      "Leader Trend (Δpp/10 spins)", "Pause Reason"],
     ...getPulseSwitchLogRows().map((row) => [
       row.spin, row.selectedEngine, row.isPaused ? "YES" : "NO", row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
-      row.straightRate, row.straightN, row.straightZ === null ? "—" : row.straightZ.toFixed(2),
-      row.invertedRate, row.invertedN, row.invertedZ === null ? "—" : row.invertedZ.toFixed(2),
-      row.markovRate, row.markovN, row.markovZ === null ? "—" : row.markovZ.toFixed(2),
-      row.randomRate, row.randomN, row.randomZ === null ? "—" : row.randomZ.toFixed(2),
+      row.straightRate, row.straightN, row.straightScore, row.straightZ === null ? "—" : row.straightZ.toFixed(2),
+      row.invertedRate, row.invertedN, row.invertedScore, row.invertedZ === null ? "—" : row.invertedZ.toFixed(2),
+      row.markovRate, row.markovN, row.markovScore, row.markovZ === null ? "—" : row.markovZ.toFixed(2),
+      row.randomRate, row.randomN, row.randomScore, row.randomZ === null ? "—" : row.randomZ.toFixed(2),
       row.leaderTrend === null ? "—" : row.leaderTrend.toFixed(1), row.pauseReason ?? "—",
     ]),
   ];
