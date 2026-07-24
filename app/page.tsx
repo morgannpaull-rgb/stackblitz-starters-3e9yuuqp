@@ -4186,6 +4186,7 @@ function randomSpin(): SpinValue {
 
 export default function Page() {
   const [history, setHistory] = useState<Step[]>([]);
+  const [archivedSessionCount, setArchivedSessionCount] = useState(0); // cheap counter for the multi-session archive badge — loaded once on mount, updated only when the archive actually changes, never re-read from localStorage during ordinary render
   const [startingBankroll, setStartingBankroll] = useState(DEFAULT_STARTING_BANKROLL);
   const [baseUnit, setBaseUnit] = useState(DEFAULT_BASE_UNIT);
   const [tableLimit, setTableLimit] = useState(DEFAULT_TABLE_LIMIT);
@@ -4306,6 +4307,18 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   React.useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) setSavedSessions((JSON.parse(raw) as SavedSession[]).map((session) => ({ ...session, strategy: normalizeStrategyName(session.strategy) })));
+  }, []);
+
+  // Multi-session archive counter — reads only the small integer counter,
+  // never the full archived-rows array, and only once on mount. Previously
+  // this count was recomputed on every render by parsing the ENTIRE
+  // archived-rows JSON blob (multiple times, inline in JSX) — that's what
+  // caused the page to lock up. Now it's plain state, updated only when the
+  // archive actually changes (see archiveCurrentSession/clearSessionArchive).
+  React.useEffect(() => {
+    if (typeof window === "undefined") return;
+    const raw = window.localStorage.getItem("edgelab_session_counter_v1");
+    setArchivedSessionCount(raw ? parseInt(raw, 10) : 0);
   }, []);
 
   React.useEffect(() => {
@@ -4683,6 +4696,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     try {
       window.localStorage.setItem(SESSION_ARCHIVE_KEY, JSON.stringify(updated));
       window.localStorage.setItem(SESSION_COUNTER_KEY, String(sessionId));
+      setArchivedSessionCount(sessionId);
     } catch {
       // storage full or unavailable — fail quietly, don't block reset
     }
@@ -4692,12 +4706,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     if (typeof window === "undefined") return;
     window.localStorage.removeItem(SESSION_ARCHIVE_KEY);
     window.localStorage.removeItem(SESSION_COUNTER_KEY);
-  };
-
-  const getArchivedSessionCount = (): number => {
-    const rows = getArchivedRows();
-    const ids = new Set(rows.map((row) => row[0]));
-    return ids.size;
+    setArchivedSessionCount(0);
   };
 
   // Combines every archived (already-reset) session with whatever is
@@ -6870,11 +6879,11 @@ const StreakAnalyticsPanel = () => {
               </div>
               <div style={{ borderTop: `1px solid ${t.border}`, marginTop: 4, paddingTop: 10 }}>
                 <div style={{ fontSize: 11, color: t.subtext, fontWeight: 900, marginBottom: 6 }}>
-                  Multi-session archive: {getArchivedSessionCount()} session{getArchivedSessionCount() === 1 ? "" : "s"} saved (auto-saved on Reset) + current session in progress. Combines into one CSV with a Session ID column — run several sessions back-to-back, then export once instead of juggling files per session.
+                  Multi-session archive: {archivedSessionCount} session{archivedSessionCount === 1 ? "" : "s"} saved (auto-saved on Reset) + current session in progress. Combines into one CSV with a Session ID column — run several sessions back-to-back, then export once instead of juggling files per session.
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
-                  <Button variant="secondary" onClick={downloadAllSessionsCSV} disabled={getArchivedSessionCount() === 0 && !history.length}>Export All Sessions CSV</Button>
-                  <Button variant="danger" onClick={clearSessionArchive} disabled={getArchivedSessionCount() === 0}>Clear Session Archive</Button>
+                  <Button variant="secondary" onClick={downloadAllSessionsCSV} disabled={archivedSessionCount === 0 && !history.length}>Export All Sessions CSV</Button>
+                  <Button variant="danger" onClick={clearSessionArchive} disabled={archivedSessionCount === 0}>Clear Session Archive</Button>
                 </div>
               </div>
             </div>
