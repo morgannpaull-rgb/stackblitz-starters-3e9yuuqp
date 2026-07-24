@@ -4186,7 +4186,6 @@ function randomSpin(): SpinValue {
 
 export default function Page() {
   const [history, setHistory] = useState<Step[]>([]);
-  const [archivedSessionCount, setArchivedSessionCount] = useState(0); // cheap counter for the multi-session archive badge — loaded once on mount, updated only when the archive actually changes, never re-read from localStorage during ordinary render
   const [startingBankroll, setStartingBankroll] = useState(DEFAULT_STARTING_BANKROLL);
   const [baseUnit, setBaseUnit] = useState(DEFAULT_BASE_UNIT);
   const [tableLimit, setTableLimit] = useState(DEFAULT_TABLE_LIMIT);
@@ -4307,18 +4306,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   React.useEffect(() => {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (raw) setSavedSessions((JSON.parse(raw) as SavedSession[]).map((session) => ({ ...session, strategy: normalizeStrategyName(session.strategy) })));
-  }, []);
-
-  // Multi-session archive counter — reads only the small integer counter,
-  // never the full archived-rows array, and only once on mount. Previously
-  // this count was recomputed on every render by parsing the ENTIRE
-  // archived-rows JSON blob (multiple times, inline in JSX) — that's what
-  // caused the page to lock up. Now it's plain state, updated only when the
-  // archive actually changes (see archiveCurrentSession/clearSessionArchive).
-  React.useEffect(() => {
-    if (typeof window === "undefined") return;
-    const raw = window.localStorage.getItem("edgelab_session_counter_v1");
-    setArchivedSessionCount(raw ? parseInt(raw, 10) : 0);
   }, []);
 
   React.useEffect(() => {
@@ -4453,7 +4440,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     }, 0);
   };
   const reset = () => {
-    archiveCurrentSession();
     setHistory([]);
     setStartingBankroll(DEFAULT_STARTING_BANKROLL);
     setBaseUnit(DEFAULT_BASE_UNIT);
@@ -4653,71 +4639,30 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const downloadCSV = () => downloadRowsAsCSV(rowsForExport(), "edgelab_pulse_roulette_session.csv");
   const downloadPulseAuditCSV = () => downloadRowsAsCSV(rowsForPulseAuditExport(), "edgelab_pulse_audit_trail.csv");
 
-  // ─── MULTI-SESSION ARCHIVE (for "Export All Sessions") ──────────────────
-  // Every time reset() is called, the just-finished session's spin-audit
-  // rows are tagged with a Session ID and appended to a running archive in
-  // localStorage — so you can run N sessions back-to-back and export one
-  // combined CSV at the end instead of N separate files. Uses localStorage
-  // (not the in-memory-only Artifacts restriction — this is a real deployed
-  // Next.js app, browser storage is the right tool here).
-  const SESSION_ARCHIVE_KEY = "edgelab_session_archive_v1";
-  const SESSION_COUNTER_KEY = "edgelab_session_counter_v1";
-
-  const getArchivedRows = (): any[][] => {
-    if (typeof window === "undefined") return [];
-    try {
-      const raw = window.localStorage.getItem(SESSION_ARCHIVE_KEY);
-      return raw ? JSON.parse(raw) : [];
-    } catch {
-      return [];
-    }
+  // ─── MULTI-SESSION EXPORT (for "Export All Sessions") ───────────────────
+  // Originally built as a separate localStorage archive tied to the Reset
+  // button — but it turned out there's already a reliable, pre-existing
+  // mechanism for this: "Save Current Session" stores each session's full
+  // history in savedSessions, which is also what populates the Session
+  // History table and the Merge Sessions picker. Rebuilt to read from THAT
+  // instead, since it's already proven to have your real sessions in it,
+  // rather than requiring a second, parallel save workflow (see chat, July 24
+  // — the original archive showed "0 sessions" because Reset wasn't the
+  // button being used).
+  const buildTaggedRowsForSession = (sessionLabel: string, sourceHistory: Step[]): any[][] => {
+    const [, ...bodyRows] = rowsForSpinAuditExport(sourceHistory); // drop the header, keep just the data rows
+    return bodyRows.map((row) => [sessionLabel, ...row]);
   };
 
-  const getNextSessionId = (): number => {
-    if (typeof window === "undefined") return 1;
-    const raw = window.localStorage.getItem(SESSION_COUNTER_KEY);
-    return raw ? parseInt(raw, 10) + 1 : 1;
-  };
-
-  // Builds this session's rows in the same shape as the Spin Audit export,
-  // with a Session ID column prepended — reuses the exact same row logic so
-  // the combined file always matches the per-session exports column-for-column.
-  const buildTaggedRowsForCurrentSession = (sessionId: number): any[][] => {
-    const [, ...bodyRows] = rowsForSpinAuditExport(); // drop the header, keep just the data rows
-    return bodyRows.map((row) => [sessionId, ...row]);
-  };
-
-  const archiveCurrentSession = () => {
-    if (typeof window === "undefined" || history.length === 0) return;
-    const sessionId = getNextSessionId();
-    const taggedRows = buildTaggedRowsForCurrentSession(sessionId);
-    const existing = getArchivedRows();
-    const updated = [...existing, ...taggedRows];
-    try {
-      window.localStorage.setItem(SESSION_ARCHIVE_KEY, JSON.stringify(updated));
-      window.localStorage.setItem(SESSION_COUNTER_KEY, String(sessionId));
-      setArchivedSessionCount(sessionId);
-    } catch {
-      // storage full or unavailable — fail quietly, don't block reset
-    }
-  };
-
-  const clearSessionArchive = () => {
-    if (typeof window === "undefined") return;
-    window.localStorage.removeItem(SESSION_ARCHIVE_KEY);
-    window.localStorage.removeItem(SESSION_COUNTER_KEY);
-    setArchivedSessionCount(0);
-  };
-
-  // Combines every archived (already-reset) session with whatever is
-  // currently in progress, so you don't have to hit Reset first just to
-  // include the latest session in the export.
+  // Combines every saved session with whatever's currently in progress (if
+  // it hasn't been saved yet) — so you don't have to save the current run
+  // first just to include it in the export.
   const rowsForAllSessionsExport = (): any[][] => {
-    const header = ["Session ID", ...rowsForSpinAuditExport()[0]];
-    const archived = getArchivedRows();
-    const currentSessionId = getNextSessionId();
-    const currentRows = history.length > 0 ? buildTaggedRowsForCurrentSession(currentSessionId) : [];
-    return [header, ...archived, ...currentRows];
+    const header = ["Session", ...rowsForSpinAuditExport()[0]];
+    const savedRows = savedSessions.flatMap((s) => buildTaggedRowsForSession(s.name, s.history));
+    const isCurrentAlreadySaved = savedSessions.some((s) => s.history.length === history.length && s.history.every((h, i) => h.outcomeGroup === history[i]?.outcomeGroup));
+    const currentRows = history.length > 0 && !isCurrentAlreadySaved ? buildTaggedRowsForSession("(unsaved current)", history) : [];
+    return [header, ...savedRows, ...currentRows];
   };
 
   const downloadAllSessionsCSV = () => downloadRowsAsCSV(rowsForAllSessionsExport(), "edgelab_all_sessions_combined.csv");
@@ -5062,8 +5007,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const downloadPulseSwitchLogCSV = () => downloadRowsAsCSV(rowsForPulseSwitchLogExport(), "edgelab_pulse_switch_log.csv");
 
 
-  const getSpinAuditRows = () => {
-    return history.map((row, index) => {
+  const getSpinAuditRows = (sourceHistory: Step[] = history) => {
+    return sourceHistory.map((row, index) => {
       const structure = getStructureForHistoryRow(row);
       const forecastBasket = (row.forecastGroup ?? row.predictedGroup ?? null) as GroupKey | null;
       const exactProfile = getLearnedPulseExecutionProfile(structure);
@@ -5154,10 +5099,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   // Clean 14-column spin audit export — engine + per-axis gate state only,
   // no TI/structure/routing columns (those belonged to the removed
   // routing/transition-intelligence governance stack).
-  const rowsForSpinAuditExport = () => [
+  const rowsForSpinAuditExport = (sourceHistory: Step[] = history) => [
     ["Spin", "Forecast", "Outcome", "Execution Mode", "Engine", "Color Gate", "Range Gate", "Parity Gate", "Dimensions Correct", "Color", "Range", "Parity", "Result", "Winning Source",
      "Straight Predicted", "Straight Would Win", "Straight Diagnostic", "Inverted Predicted", "Inverted Would Win", "Inverted Diagnostic", "Markov Predicted", "Markov Would Win", "Markov Diagnostic", "Random Predicted", "Random Would Win", "Random Diagnostic"],
-    ...getSpinAuditRows().map((row) => {
+    ...getSpinAuditRows(sourceHistory).map((row) => {
       const fc = row.forecast ? groupToBits(row.forecast as GroupKey) : null;
       const oc = row.outcome ? groupToBits(row.outcome as GroupKey) : null;
       const colorHit  = fc && oc ? (fc[0]===oc[0]?"C":"I") : "—";
@@ -6879,11 +6824,10 @@ const StreakAnalyticsPanel = () => {
               </div>
               <div style={{ borderTop: `1px solid ${t.border}`, marginTop: 4, paddingTop: 10 }}>
                 <div style={{ fontSize: 11, color: t.subtext, fontWeight: 900, marginBottom: 6 }}>
-                  Multi-session archive: {archivedSessionCount} session{archivedSessionCount === 1 ? "" : "s"} saved (auto-saved on Reset) + current session in progress. Combines into one CSV with a Session ID column — run several sessions back-to-back, then export once instead of juggling files per session.
+                  Combines every session in "Save Current Session" (below) — currently {savedSessions.length} saved — plus the current in-progress session if it hasn't been saved yet, into one CSV with a Session column. Use "Save Current Session" after each run, then export once at the end instead of juggling files per session.
                 </div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
-                  <Button variant="secondary" onClick={downloadAllSessionsCSV} disabled={archivedSessionCount === 0 && !history.length}>Export All Sessions CSV</Button>
-                  <Button variant="danger" onClick={clearSessionArchive} disabled={archivedSessionCount === 0}>Clear Session Archive</Button>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(1, 1fr)", gap: 8 }}>
+                  <Button variant="secondary" onClick={downloadAllSessionsCSV} disabled={savedSessions.length === 0 && !history.length}>Export All Sessions CSV</Button>
                 </div>
               </div>
             </div>
