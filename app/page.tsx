@@ -104,7 +104,7 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
-    switchReason?: "highest-z" | null;
+    switchReason?: "highest-cumulative-advantage" | null;
     challengerZScores?: Record<string, number | null>;
     leanStreak?: number;
     zTrendDelta?: number | null;
@@ -2717,60 +2717,76 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const engineRates: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.rate]));
     const engineSamples: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.n]));
 
-    // ─── Z-SCORE vs a fixed baseline — the ONLY input to engine selection ───
-    // Per request (July 20): decisions are based purely on which engine has
-    // the highest one-sample z-score against a fixed baseline win rate, with
-    // no other gating — no hold, no pause, no decline check, no session
-    // floor, no tie-hold-on-current-engine. This is a deliberate return to
-    // something close to the original z-test system from before the
-    // "highest-score-wins" redesign, minus its hold-streak requirement, and
-    // scored against a fixed baseline instead of pairwise vs. a challenger.
-    // Known risk carried over from that earlier system (see Session
-    // Performance Findings): z-tests need real sample size to move, so this
-    // can sit on one engine for a long stretch while it waits for a gap to
-    // become statistically distinguishable from baseline — this is an
-    // intentional trade-off requested in chat, not an oversight. Treat this
-    // as a fresh starting point to validate against real sessions.
-    const PULSE_Z_BASELINE = 0.125; // fixed baseline win probability (~1/8 — chance odds of a 3-axis coincidence), same constant used as the shrinkage prior tested earlier
+    // ─── CUMULATIVE ADVANTAGE — the ONLY input to engine selection ──────────
+    // Per request (July 20): rank all four engines continuously by an
+    // unbounded running sum of (outcome − baseline) since the start of the
+    // session — NOT a ratio. This is the synthesis of everything tried
+    // today: raw rate, Bayesian-shrunk rate, and Z-score were all ratios on
+    // a rolling window — noisy, and with no memory of magnitude (an engine
+    // that just climbed out of a 30-loss hole looks identical to one that's
+    // been steady the whole time, the moment either is expressed as a
+    // percentage). Cumulative-since-start rate fixed the noise but not the
+    // memory problem — still a ratio, still floored at zero, still fooled by
+    // a short lucky streak. Lock-once + CUSUM fixed the memory problem but
+    // removed the ability to ever switch to a genuinely better engine.
+    //
+    // This keeps switching (whichever engine leads can change, no lock) while
+    // using a scoring function that actually has memory: a win adds
+    // (1 − baseline), a loss subtracts baseline, and nothing resets or
+    // floors at zero. An engine can only overtake another by accumulating
+    // real evidence over time — a couple of lucky spins can't vault a
+    // genuinely weak engine's SUM past a strong engine's SUM the way it can
+    // flip a bounded percentage. Verified against session 7 (July 20 chat):
+    // at the exact spin where rolling rate/Z said Straight looked
+    // "recovered" (20%, Z=+0.88), this metric correctly still showed it far
+    // behind (-3.38 vs. the leader's +0.62) — it wasn't fooled the way the
+    // ratio-based versions were.
+    const PULSE_BASELINE = 0.125; // fixed baseline win probability (~1/8 — chance odds of a 3-axis coincidence), same constant used throughout today's experiments
 
-    const zScoreVsBaseline = (s: { wins: number; n: number }): number | null => {
-      if (s.n < 1) return null; // undefined with zero evaluated spins — not a policy choice, just undefined math
-      const phat = s.wins / s.n;
-      const se = Math.sqrt(PULSE_Z_BASELINE * (1 - PULSE_Z_BASELINE) / s.n);
-      if (se === 0) return 0;
-      return (phat - PULSE_Z_BASELINE) / se;
+    const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random"] as const;
+    const engineDiagKey: Record<string, "straight" | "inverted" | "markov" | "random"> = {
+      Straight: "straight", Inverted: "inverted", Markov: "markov", Random: "random",
     };
 
-    const engineZScores: Record<string, number | null> = Object.fromEntries(
-      Object.entries(engineStats).map(([engine, s]) => [engine, zScoreVsBaseline(s)])
-    );
+    // Unbounded running sum per engine, replayed from the start of history
+    // every render (stateless, like everything else here) — no window, no
+    // floor, no ratio.
+    const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
+    const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
+    for (const step of history) {
+      const diag = (step as any).allEngineDiagnostics;
+      const actual = step.outcomeGroup;
+      if (!diag || !actual) continue;
+      for (const engine of ENGINE_ORDER) {
+        const predicted = diag[engineDiagKey[engine]]?.group ?? null;
+        if (!predicted) continue;
+        const outcome = predicted === actual ? 1 : 0;
+        cumulativeAdvantage[engine] += (outcome - PULSE_BASELINE);
+        evaluatedCount[engine] += 1;
+      }
+    }
 
-    // ─── LEADER SELECTION — highest Z-score, no other conditions ────────────
-    const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random"] as const;
-    const eligible = ENGINE_ORDER.filter((e) => engineZScores[e] !== null);
-
+    const eligible = ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
-    let leader = "Straight";
-    let leaderReason: "highest-z" | null = null;
+    let selectedEngine = "Straight";
+    let leaderReason: "highest-cumulative-advantage" | null = null;
     if (eligible.length === 0) {
-      leader = "Straight"; // nobody has an evaluated prediction yet — neutral default
+      selectedEngine = "Straight"; // nobody has an evaluated prediction yet — neutral default
     } else {
-      let bestZ = -Infinity;
+      let best = -Infinity;
       for (const engine of eligible) {
-        const z = engineZScores[engine]!;
-        if (z > bestZ) { bestZ = z; leader = engine; }
+        if (cumulativeAdvantage[engine] > best) { best = cumulativeAdvantage[engine]; selectedEngine = engine; }
       }
-      leaderReason = "highest-z";
+      leaderReason = "highest-cumulative-advantage";
     }
 
-    // No pause conditions of any kind — every spin with at least one
-    // eligible engine places a bet.
+    // No pause conditions — every spin with at least one eligible engine
+    // places a bet. The scoring function itself is what prevents chasing
+    // noise; there's no separate gate on top of it.
     const isPaused = false;
     const pauseReason: string | null = null;
-
-    const selectedEngine = leader;
 
     // Get prediction from selected engine
     let engineForecast: any;
@@ -2807,9 +2823,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       engineSamples,
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
-      switchZScore: engineZScores[selectedEngine] ?? null,
+      switchZScore: cumulativeAdvantage[selectedEngine] ?? null,
       switchReason: leaderReason,
-      challengerZScores: engineZScores, // now each engine's z vs. the fixed baseline, including the leader itself — not pairwise vs. leader
+      challengerZScores: cumulativeAdvantage, // repurposed field: each engine's cumulative advantage score (unbounded sum, not a ratio) — this is what drives selection now
       leanStreak: 0,
       zTrendDelta: null as number | null,
       isPaused,
@@ -2822,7 +2838,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       source: "PULSE" as const,
       mode,
       pulseEngineTracker: tracker,
-      reason: `Pulse · ${selectedEngine} selected (Z=${engineZScores[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_Z_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${Object.entries(engineStats).map(([e, s]) => `${e}:${s.rate}%(n=${s.n}, Z=${engineZScores[e]?.toFixed(2) ?? "—"})`).join(" · ")}`,
+      reason: `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
     };
   }
 
@@ -4918,9 +4934,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const tracker = row.pulseEngineTracker!;
         const rates = tracker.engineRates || {};
         const samples = tracker.engineSamples || {};
-        const czs = tracker.challengerZScores || {};
-        const engineZ = (engine: string) => (typeof czs[engine] === "number" ? czs[engine] as number : null);
-        const leaderTrend = typeof tracker.currentEngineTrend === "number" ? tracker.currentEngineTrend : null;
+        const adv = tracker.challengerZScores || {}; // repurposed field: cumulative advantage score per engine (unbounded sum, not a ratio)
+        const engineAdv = (engine: string) => (typeof adv[engine] === "number" ? adv[engine] as number : null);
         return {
           spin: row.spin,
           selectedEngine: tracker.selectedEngine ?? "—",
@@ -4934,13 +4949,12 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           invertedN: samples["Inverted"] ?? 0,
           markovN: samples["Markov"] ?? 0,
           randomN: samples["Random"] ?? 0,
-          straightZ: engineZ("Straight"),
-          invertedZ: engineZ("Inverted"),
-          markovZ: engineZ("Markov"),
-          randomZ: engineZ("Random"),
-          leader: tracker.selectedEngine ?? "—", // leader always equals selected engine now — no hold requirement means nothing to lag behind
+          straightAdv: engineAdv("Straight"),
+          invertedAdv: engineAdv("Inverted"),
+          markovAdv: engineAdv("Markov"),
+          randomAdv: engineAdv("Random"),
+          leader: tracker.selectedEngine ?? "—",
           switchReason: tracker.switchReason ?? null,
-          leaderTrend,
           isPaused: tracker.isPaused ?? false,
           pauseReason: tracker.pauseReason ?? null,
         };
@@ -4948,17 +4962,15 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   };
 
   const rowsForPulseSwitchLogExport = () => [
-    ["Spin", "Selected Engine (= Leader)", "Paused (No Bet)", "Switched", "Switch Reason", "Previous Engine",
-     "Straight %", "Straight n", "Straight Z (vs 12.5% baseline)", "Inverted %", "Inverted n", "Inverted Z (vs 12.5% baseline)",
-     "Markov %", "Markov n", "Markov Z (vs 12.5% baseline)", "Random %", "Random n", "Random Z (vs 12.5% baseline)",
-     "Leader Trend (Δpp/10 spins)", "Pause Reason"],
+    ["Spin", "Selected Engine (= Leader)", "Switched", "Switch Reason", "Previous Engine",
+     "Straight %", "Straight n", "Straight Cumulative Advantage", "Inverted %", "Inverted n", "Inverted Cumulative Advantage",
+     "Markov %", "Markov n", "Markov Cumulative Advantage", "Random %", "Random n", "Random Cumulative Advantage"],
     ...getPulseSwitchLogRows().map((row) => [
-      row.spin, row.selectedEngine, row.isPaused ? "YES" : "NO", row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
-      row.straightRate, row.straightN, row.straightZ === null ? "—" : row.straightZ.toFixed(2),
-      row.invertedRate, row.invertedN, row.invertedZ === null ? "—" : row.invertedZ.toFixed(2),
-      row.markovRate, row.markovN, row.markovZ === null ? "—" : row.markovZ.toFixed(2),
-      row.randomRate, row.randomN, row.randomZ === null ? "—" : row.randomZ.toFixed(2),
-      row.leaderTrend === null ? "—" : row.leaderTrend.toFixed(1), row.pauseReason ?? "—",
+      row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
+      row.straightRate, row.straightN, row.straightAdv === null ? "—" : row.straightAdv.toFixed(2),
+      row.invertedRate, row.invertedN, row.invertedAdv === null ? "—" : row.invertedAdv.toFixed(2),
+      row.markovRate, row.markovN, row.markovAdv === null ? "—" : row.markovAdv.toFixed(2),
+      row.randomRate, row.randomN, row.randomAdv === null ? "—" : row.randomAdv.toFixed(2),
     ]),
   ];
 
@@ -6553,7 +6565,7 @@ const StreakAnalyticsPanel = () => {
     const switches = rows.filter((row) => row.switched);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Each engine's win rate is scored as a one-sample z-score against a fixed 12.5% baseline. Whichever engine has the highest z-score is active immediately, every spin — no hold, no tie-break, no pause of any kind. This is a deliberate no-restrictions build (July 20) — validate against real sessions before trusting it.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Every spin, each engine's cumulative advantage — an unbounded running sum of (outcome − 12.5% baseline) since the start of the session, not a ratio — is compared, and whichever engine has the highest score leads. Switching is allowed, but an engine can only overtake another by accumulating real evidence over time; a short lucky streak can't vault a weak engine's sum past a strong one the way it can flip a bounded percentage. Synthesis build (July 20) — validate against real sessions.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
@@ -6571,10 +6583,10 @@ const StreakAnalyticsPanel = () => {
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
                 <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN}, Z={row.straightZ === null ? "—" : row.straightZ.toFixed(2)})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN}, Z={row.invertedZ === null ? "—" : row.invertedZ.toFixed(2)})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN}, Z={row.markovZ === null ? "—" : row.markovZ.toFixed(2)})</span></td>
-                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN}, Z={row.randomZ === null ? "—" : row.randomZ.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN}, adv={row.straightAdv === null ? "—" : row.straightAdv.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN}, adv={row.invertedAdv === null ? "—" : row.invertedAdv.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN}, adv={row.markovAdv === null ? "—" : row.markovAdv.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN}, adv={row.randomAdv === null ? "—" : row.randomAdv.toFixed(2)})</span></td>
               </tr>
             ))}
           </tbody>
