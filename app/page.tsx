@@ -2784,11 +2784,36 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       Random: (random as any).group ?? null,
     };
 
-    const axisSupplier: Record<string, string> = { Color: "Straight", Range: "Straight", Parity: "Straight" };
-    const axisLetter: Record<string, string> = { Color: "B", Range: "H", Parity: "E" }; // neutral fallback if literally nothing is eligible yet
+    // ─── 50% FLOOR — an engine must be at/above 50% on THIS axis to qualify ──
+    // Per request (July 24): restore the threshold-with-no-bet-fallback rule
+    // originally described, now applied per-axis instead of per-engine.
+    // Eligibility is a straight accuracy check (wins/n ≥ 0.5) on that axis
+    // alone; ranking among eligible engines still uses cumulative advantage
+    // (unbounded sum), same as before. If NO engine clears the floor on a
+    // given axis, that axis has nobody with even coin-flip-or-better
+    // evidence — and since a real bet needs all three axes to form a valid
+    // number set, the whole spin goes to no-bet rather than filling that one
+    // axis with a neutral guess. This is the same rule already backtested
+    // (July 20): landed at 13.2%, statistically identical to the 12.5%
+    // baseline, with ~30% of spins going unbet — rebuilding it live to
+    // validate that against real sessions rather than the backtest alone.
+    const AXIS_FLOOR = 0.5;
+
+    const axisSupplier: Record<string, string> = { Color: "—", Range: "—", Parity: "—" };
+    const axisLetter: Record<string, string> = { Color: "B", Range: "H", Parity: "E" }; // only used if isPaused ends up false despite a gap — see fallback note below
+    let anyAxisUnfilled = false;
     for (const { key, index } of AXES) {
-      const eligible = ENGINE_ORDER.filter((e) => currentEngineGroup[e] !== null && axisEvaluatedCount[key][e] >= 1);
-      if (eligible.length === 0) continue; // keep neutral fallback for this axis
+      const eligible = ENGINE_ORDER.filter((e) => {
+        if (currentEngineGroup[e] === null) return false;
+        const n = axisEvaluatedCount[key][e];
+        if (n < 1) return false;
+        const rate = (axisAdvantage[key][e] / n) + AXIS_BASELINE; // recover wins/n from the (correct − 0.5) running sum
+        return rate >= AXIS_FLOOR;
+      });
+      if (eligible.length === 0) {
+        anyAxisUnfilled = true;
+        continue;
+      }
       let best = -Infinity;
       let bestEngine: string = eligible[0];
       for (const engine of eligible) {
@@ -2801,23 +2826,25 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const compositeGroup = (axisLetter.Color + axisLetter.Range + axisLetter.Parity) as GroupKey;
     const previousComposite = (history[history.length - 1] as any)?.pulseSelectedEngine ?? null;
 
-    // No pause conditions — every spin with at least one eligible engine per
-    // axis places a bet (falling back to the neutral default axis-by-axis
-    // otherwise). The scoring function itself is what resists chasing noise;
-    // there's no separate gate on top of it, consistent with the
-    // whole-engine version this replaces.
-    const isPaused = false;
-    const pauseReason: string | null = null;
+    // Pause the WHOLE spin if any axis couldn't find an engine clearing the
+    // 50% floor — a partial bet (2 real axes + 1 neutral guess) isn't a
+    // meaningful wager, since all three have to hit for a real-money win.
+    const isPaused = anyAxisUnfilled;
+    const pauseReason: string | null = isPaused
+      ? `No engine at/above 50% on: ${AXES.filter(({ key }) => !ENGINE_ORDER.some((e) => currentEngineGroup[e] !== null && axisEvaluatedCount[key][e] >= 1 && (axisAdvantage[key][e] / Math.max(1, axisEvaluatedCount[key][e]) + AXIS_BASELINE) >= AXIS_FLOOR)).map(({ key }) => key).join(", ")}`
+      : null;
 
-    const engineForecast: any = {
-      group: compositeGroup,
-      numbers: GROUPS[compositeGroup] ?? [],
-      confidence: 60,
-      tier: "Active · Confirmed",
-      reason: `Composite — Color←${axisSupplier.Color}, Range←${axisSupplier.Range}, Parity←${axisSupplier.Parity}`,
-    };
+    const engineForecast: any = isPaused
+      ? { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: pauseReason }
+      : {
+          group: compositeGroup,
+          numbers: GROUPS[compositeGroup] ?? [],
+          confidence: 60,
+          tier: "Active · Confirmed",
+          reason: `Composite — Color←${axisSupplier.Color}, Range←${axisSupplier.Range}, Parity←${axisSupplier.Parity}`,
+        };
 
-    const selectedEngine = compositeGroup; // holds the composite 3-letter code now, not a single engine name — see axisSupplier for per-axis attribution
+    const selectedEngine = isPaused ? "Hold" : compositeGroup; // holds the composite 3-letter code (or "Hold" when paused) — not a single engine name — see axisSupplier for per-axis attribution
     const currentEngine = previousComposite;
 
     const tracker = {
