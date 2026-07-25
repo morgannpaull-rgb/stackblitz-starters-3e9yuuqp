@@ -2753,15 +2753,64 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       Straight: "straight", Inverted: "inverted", Markov: "markov", Random: "random",
     };
 
+    // ─── PUSH-AFTER-N-LOSSES — per request (July 24) ─────────────────────────
+    // Backtested first (34 sessions, 2720 spins): baseline win rate 13.1% vs.
+    // 13.8% with this rule — a 0.7pp difference with z=0.69, not statistically
+    // real. Expected, given losing streaks of this length are statistically
+    // normal at these win rates, not a signal something's wrong. Built anyway
+    // because the real value here isn't accuracy — it's that pausing cuts
+    // real betting volume (~26% of spins in the backtest) specifically during
+    // long losing stretches, which caps drawdown and prevents progressive
+    // staking strategies (Martingale, Step Recovery) from compounding into a
+    // runaway bet size during exactly the stretch where that's most dangerous.
+    // This is a risk control, not an edge-finding mechanism.
+    //
+    // Mechanics: track consecutive LOSSES of whichever engine is currently
+    // leading, regardless of whether that leader changes mid-streak. Once it
+    // hits PULSE_PUSH_LOSS_LIMIT, stop betting. While paused, keep evaluating
+    // the (possibly still-changing) leader's hypothetical result every spin
+    // via allEngineDiagnostics — release the instant that hypothetical would
+    // have been a win. Loss-streak state for staking strategies elsewhere
+    // (getLossStreak) already resets on any non-loss row including a push, so
+    // resuming after a release always starts staking fresh at base unit —
+    // no extra wiring needed for that part.
+    const PULSE_PUSH_LOSS_LIMIT = 9;
+
     // Unbounded running sum per engine, replayed from the start of history
     // every render (stateless, like everything else here) — no window, no
-    // floor, no ratio.
+    // floor, no ratio. Extended to also replay the push/release state in the
+    // same pass, using whoever was leading BEFORE each step (not after) to
+    // avoid lookahead.
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
+    let pushLossStreak = 0;
+    let isPushedFromReplay = false;
     for (const step of history) {
       const diag = (step as any).allEngineDiagnostics;
       const actual = step.outcomeGroup;
       if (!diag || !actual) continue;
+
+      // Who was leading BEFORE this step, using only prior steps' data —
+      // matches how the live decision would actually have been made.
+      const eligibleSoFar = ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
+      const leaderAtStep = eligibleSoFar.length
+        ? eligibleSoFar.reduce((best, e) => (cumulativeAdvantage[e] > cumulativeAdvantage[best] ? e : best), eligibleSoFar[0])
+        : "Straight";
+      const leaderPred = diag[engineDiagKey[leaderAtStep]]?.group ?? null;
+      const leaderCorrect: number | null = leaderPred ? (leaderPred === actual ? 1 : 0) : null;
+
+      if (isPushedFromReplay) {
+        if (leaderCorrect === 1) { isPushedFromReplay = false; pushLossStreak = 0; }
+        // else: still paused, still waiting for the next win
+      } else if (leaderCorrect !== null) {
+        if (leaderCorrect === 0) {
+          pushLossStreak += 1;
+          if (pushLossStreak >= PULSE_PUSH_LOSS_LIMIT) isPushedFromReplay = true;
+        } else {
+          pushLossStreak = 0;
+        }
+      }
+
       for (const engine of ENGINE_ORDER) {
         const predicted = diag[engineDiagKey[engine]]?.group ?? null;
         if (!predicted) continue;
@@ -2787,11 +2836,10 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       leaderReason = "highest-cumulative-advantage";
     }
 
-    // No pause conditions — every spin with at least one eligible engine
-    // places a bet. The scoring function itself is what prevents chasing
-    // noise; there's no separate gate on top of it.
-    const isPaused = false;
-    const pauseReason: string | null = null;
+    const isPaused = isPushedFromReplay;
+    const pauseReason: string | null = isPaused
+      ? `Paused after ${PULSE_PUSH_LOSS_LIMIT} consecutive losses — will resume the spin immediately after the next win (evaluated hypothetically while paused)`
+      : null;
 
     // Get prediction from selected engine
     let engineForecast: any;
@@ -4215,6 +4263,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const [sessionName, setSessionName] = useState("");
   const [selectedSession, setSelectedSession] = useState("");
   const [selectedMerge, setSelectedMerge] = useState<string[]>([]);
+  const [selectedDelete, setSelectedDelete] = useState<string[]>([]);
   const [savedSessions, setSavedSessions] = useState<SavedSession[]>([]);
   const [collapsedPanels, setCollapsedPanels] = useState<Record<string, boolean>>({});
   const [selectedStreakBand, setSelectedStreakBand] = useState<{ type: "win" | "loss"; startSpin: number; endSpin: number; length: number } | null>(null);
@@ -4297,8 +4346,27 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const saveLocal = (sessions: SavedSession[]) => {
     const normalized = sessions.map((session) => ({ ...session, strategy: normalizeStrategyName(session.strategy) }));
-    setSavedSessions(normalized);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+    try {
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(normalized));
+      setSavedSessions(normalized); // only commit to state once the write actually succeeds — avoids the UI showing a session as "saved" when it wasn't persisted
+    } catch (err) {
+      // Each saved session stores its full spin-by-spin history (every
+      // engine's diagnostics, per spin) — that adds up fast, and browsers
+      // cap localStorage around 5-10MB per site. This is very likely why
+      // saving stopped working around session 10: the write silently threw
+      // and nothing after that point ever actually persisted, even though
+      // clicking Save looked like it worked. Surfacing it explicitly here
+      // instead of failing silently, with a concrete next step using the
+      // two tools already in this panel: export what you have, then use
+      // "Delete Selected" to free up room before saving more.
+      alert(
+        "Couldn't save — your browser's storage limit for this site has been reached.\n\n" +
+        "Each saved session stores its full spin-by-spin data, so this fills up faster than it looks. To fix it:\n" +
+        "1. Click \"Export All Sessions CSV\" to back up everything you have.\n" +
+        "2. Use the \"Delete Selected\" list below to remove some older saved sessions.\n" +
+        "3. Then try saving again."
+      );
+    }
   };
 
   React.useEffect(() => {
@@ -4489,6 +4557,12 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     if (!selectedSession) return;
     saveLocal(savedSessions.filter((s) => s.name !== selectedSession));
     setSelectedSession("");
+  };
+  const deleteSelectedSessions = () => {
+    if (!selectedDelete.length) return;
+    saveLocal(savedSessions.filter((s) => !selectedDelete.includes(s.name)));
+    if (selectedDelete.includes(selectedSession)) setSelectedSession("");
+    setSelectedDelete([]);
   };
   const mergeSelected = () => {
     const sessions = savedSessions.filter((s) => selectedMerge.includes(s.name));
@@ -6815,6 +6889,19 @@ const StreakAnalyticsPanel = () => {
               <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}>
                 <Button onClick={deleteSession} variant="danger" disabled={!selectedSession}>Delete</Button>
                 <Button variant="secondary" onClick={() => window.print()} disabled={!history.length}>Print/PDF</Button>
+              </div>
+              <div style={{ borderTop: `1px solid ${t.border}`, marginTop: 4, paddingTop: 10 }}>
+                <div style={{ fontSize: 11, color: t.subtext, fontWeight: 900, marginBottom: 6 }}>
+                  Delete multiple sessions at once — select any number below (ctrl/cmd-click, or drag, to select more than one), then delete them all in one step instead of one at a time.
+                </div>
+                <select multiple value={selectedDelete} onChange={(e: any) => setSelectedDelete(Array.from(e.target.selectedOptions).map((o: any) => o.value))} style={{ width: "100%", minHeight: 100, padding: 10, borderRadius: 10, background: t.input, color: t.text, border: `1px solid ${t.borderStrong}`, marginBottom: 8 }}>
+                  {savedSessions.map((s) => <option key={s.name} value={s.name}>{s.name}</option>)}
+                </select>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
+                  <Button variant="secondary" onClick={() => setSelectedDelete(savedSessions.map((s) => s.name))} disabled={!savedSessions.length}>Select All</Button>
+                  <Button variant="secondary" onClick={() => setSelectedDelete([])} disabled={!selectedDelete.length}>Clear</Button>
+                  <Button variant="danger" onClick={deleteSelectedSessions} disabled={!selectedDelete.length}>Delete Selected ({selectedDelete.length})</Button>
+                </div>
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 8 }}>
                 <Button variant="secondary" onClick={downloadCSV} disabled={!history.length}>Session CSV</Button>
