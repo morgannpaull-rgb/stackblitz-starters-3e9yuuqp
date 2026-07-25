@@ -2666,7 +2666,6 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // per-axis recombination build — restores "bet the single best engine's
     // full 3-letter forecast" instead of stitching a composite from up to 3
     // different engines' individual axes.
-    const PULSE_BASELINE = 0.125; // fixed baseline win probability (~1/8 — chance odds of a 3-axis coincidence), same constant used throughout today's experiments
 
     const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random"] as const;
     const engineDiagKey: Record<string, "straight" | "inverted" | "markov" | "random"> = {
@@ -2694,7 +2693,40 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // (getLossStreak) already resets on any non-loss row including a push, so
     // resuming after a release always starts staking fresh at base unit —
     // no extra wiring needed for that part.
-    const PULSE_PUSH_LOSS_LIMIT = 9;
+    // ─── BASELINE — recalibrated to true money-breakeven, not pure chance ───
+    // Per request (July 25): 12.5% is the FAIR odds of landing in a basket
+    // this size (1/8 of the wheel), but it is NOT the break-even rate in
+    // real dollars — the 35:1 payout combined with the standard house edge
+    // means you need to beat fair odds by a bit just to tread water. Solving
+    // for the win rate where expected value per spin is zero, given a basket
+    // of size b: EV = p·(35 − (b−1)) − (1−p)·b = 0 → p = b/36 (not b/38).
+    // Groups here are always 4 or 5 numbers, giving a breakeven of 11.11% or
+    // 13.89% respectively — blended across all 8 groups that's ~13.2%, a
+    // meaningful ~0.7pp above the flat 12.5% previously used. Computed here
+    // per-spin from that spin's own predicted group size, rather than one
+    // fixed blended constant, since basket size varies spin to spin and this
+    // is more precise than an average. This means a score of exactly zero
+    // now means "breaking even in real money," not merely "beating a coin
+    // flip" — so PULSE_BASELINE_FLOOR (still 0) automatically means the
+    // right thing without needing a separately-tuned threshold.
+    const getBreakevenRate = (group: string | null): number => {
+      const basketSize = group ? (GROUPS[group as GroupKey]?.length ?? 5) : 5;
+      return basketSize / 36;
+    };
+
+    // ─── PUSH-AFTER-N-LOSSES — per request (July 24, adjusted July 25) ──────
+    // Backtested first (34 sessions, 2720 spins): baseline win rate 13.1% vs.
+    // 13.8% with this rule — a 0.7pp difference with z=0.69, not statistically
+    // real. Expected, given losing streaks of this length are statistically
+    // normal at these win rates, not a signal something's wrong. Built anyway
+    // because the real value here isn't accuracy — it's that pausing cuts
+    // real betting volume (~26% of spins in the backtest) specifically during
+    // long losing stretches, which caps drawdown and prevents progressive
+    // staking strategies (Martingale, Step Recovery) from compounding into a
+    // runaway bet size during exactly the stretch where that's most dangerous.
+    // This is a risk control, not an edge-finding mechanism. Moved from 9 to
+    // 10 losses per request.
+    const PULSE_PUSH_LOSS_LIMIT = 10;
 
     // Unbounded running sum per engine, replayed from the start of history
     // every render (stateless, like everything else here) — no window, no
@@ -2735,7 +2767,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         const predicted = diag[engineDiagKey[engine]]?.group ?? null;
         if (!predicted) continue;
         const outcome = predicted === actual ? 1 : 0;
-        cumulativeAdvantage[engine] += (outcome - PULSE_BASELINE);
+        cumulativeAdvantage[engine] += (outcome - getBreakevenRate(predicted));
         evaluatedCount[engine] += 1;
       }
     }
@@ -2760,7 +2792,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // Per request (July 24): only bet when the leading engine's cumulative
     // advantage score is at or above zero — i.e., performing at or above the
     // 12.5% baseline, not merely "the least bad of four bad options." Unlike
-    // the 9-loss push (which needs a hypothetical win to release), this is a
+    // the 10-loss push (which needs a hypothetical win to release), this is a
     // continuous, stateless check: re-evaluated fresh every spin from the
     // current scores, no separate release condition needed. If the leader's
     // score climbs back to zero or above on any later spin, betting simply
@@ -2769,11 +2801,16 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : -Infinity;
     const belowBaselineFloor = eligible.length > 0 && leaderScore < PULSE_BASELINE_FLOOR;
 
-    const isPaused = isPushedFromReplay || belowBaselineFloor;
-    const pauseReason: string | null = isPushedFromReplay
+    // Precedence: below-baseline is checked and reported FIRST (per request,
+    // July 25) — if a spin is both below the money-breakeven floor AND mid a
+    // 10-loss push, the reported reason is the baseline one. Both conditions
+    // still independently cause a pause either way; this only changes which
+    // explanation is shown when they happen to overlap.
+    const isPaused = belowBaselineFloor || isPushedFromReplay;
+    const pauseReason: string | null = belowBaselineFloor
+      ? `${selectedEngine} is the best available engine but still below money-breakeven (score ${leaderScore.toFixed(2)} vs. ~13.2% blended breakeven, not just the 12.5% chance rate) — no engine currently profitable`
+      : isPushedFromReplay
       ? `Paused after ${PULSE_PUSH_LOSS_LIMIT} consecutive losses — will resume the spin immediately after the next win (evaluated hypothetically while paused)`
-      : belowBaselineFloor
-      ? `${selectedEngine} is the best available engine but still below the 12.5% baseline (score ${leaderScore.toFixed(2)}) — no engine currently performing above chance`
       : null;
 
     // Get prediction from selected engine
@@ -2828,7 +2865,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pulseEngineTracker: tracker,
       reason: isPaused
         ? `Pulse · PAUSED — ${pauseReason}`
-        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
+        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
     };
   }
 
@@ -6592,7 +6629,7 @@ const StreakAnalyticsPanel = () => {
     const switches = rows.filter((row) => row.switched);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Every spin, each engine's cumulative advantage — an unbounded running sum of (outcome − 12.5% baseline) since the start of the session, not a ratio — is compared, and whichever engine has the highest score leads. Switching is allowed, but an engine can only overtake another by accumulating real evidence over time; a short lucky streak can't vault a weak engine's sum past a strong one the way it can flip a bounded percentage. Reverted back to this whole-engine version on July 24 from the per-axis recombination build.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Every spin, each engine's cumulative advantage — an unbounded running sum of (outcome − breakeven rate for that spin's predicted group) since the start of the session, not a ratio — is compared, and whichever engine has the highest score leads. Breakeven is basket-size-specific (11.11% for 4-number groups, 13.89% for 5-number groups — the true money-breakeven given the 35:1 payout, not just the 12.5% fair-odds rate), recalibrated July 25 so a score of zero means actually breaking even in dollars. Switching is allowed, but an engine can only overtake another by accumulating real evidence over time.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
