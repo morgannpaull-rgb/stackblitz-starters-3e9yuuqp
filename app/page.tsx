@@ -3901,6 +3901,15 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const f = normalizeObserveTierForSettings(rawDecision, tierExecution, history);
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
 
+  // Per request (July 25): this shouldn't require a separate manual
+  // dropdown pick — if Pulse is already automatically choosing the best
+  // engine, it should automatically apply the best-strategy switching and
+  // both stop conditions too. Whenever Pulse is on, sizing/stop decisions
+  // use "Auto (Best of 6)" regardless of whatever the Strategy dropdown is
+  // set to; the dropdown only governs sizing when Pulse is off (manual
+  // engine selection).
+  const effectiveStrategy: Strategy = pulseEnabled ? "Auto (Best of 6)" : strategy;
+
   // Auto (Best of 6) stop conditions: once triggered, stays triggered for
   // the rest of the session — checked BEFORE deciding whether to bet this
   // spin. Two independent triggers, either one ends the session:
@@ -3911,7 +3920,7 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const alreadyEnded = history.at(-1)?.sessionEnded ?? false;
   let autoStopTriggered = alreadyEnded;
   let autoStopReason: "loss-floor" | "giveback" | null = null;
-  if (strategy === "Auto (Best of 6)" && !alreadyEnded) {
+  if (effectiveStrategy === "Auto (Best of 6)" && !alreadyEnded) {
     const inferredStart = inferStartingBankroll(history, startingBankroll);
     const rois = computeShadowStrategyROIs(history, baseUnit, inferredStart, tableLimit, perNumberLimit);
     const allBelowFloor = AUTO_BASE_STRATEGIES.every((s) => rois[s] < AUTO_STOP_ROI_THRESHOLD);
@@ -3930,13 +3939,13 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const observePushHold = isObservePushTier(f.tier, tierExecution);
   const dimensionTDAAllowed = true; // TDA diagnostic only, not a hard gate.
   const pulseHasSelectedEngine = !pulseEnabled || bbStraightEnabled || bbInvertedEnabled || markovEnabled || randomEnabled;
-const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine && shouldBet(strategy, f.confidence, pulseEnabled, f.group, f) && executionAllowed ;
+const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine && shouldBet(effectiveStrategy, f.confidence, pulseEnabled, f.group, f) && executionAllowed ;
   const previewNumbers = active && f.group ? getExecutionNumbers(f.group, routedExecutionMode, f.source, f) : [];
   const streamNumbers = active && f.group ? getCoreExecutionNumbers(f.group, f.source, f, routedExecutionMode) : [];
   const wheelNeighbors = active && f.group ? getWheelNeighbors(f.group, f.source, routedExecutionMode, f) : [];
   const numbers = previewNumbers;
   const activeBasket = routedExecutionMode === "Stream Direct" ? streamNumbers : numbers;
-  const unit = active ? getUnitBet(strategy, baseUnit, f.confidence, history, activeBasket.length, bankroll, tableLimit, perNumberLimit, f) : 0;
+  const unit = active ? getUnitBet(effectiveStrategy, baseUnit, f.confidence, history, activeBasket.length, bankroll, tableLimit, perNumberLimit, f) : 0;
   const exposure = activeBasket.length * unit;
 
   // FINAL FORECAST / SETTLEMENT LOCK
@@ -4011,7 +4020,7 @@ const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && 
           ? "SESSION ENDED — ROI gave back 20 points from its peak (locking in the gain)"
           : "SESSION ENDED — all 6 base strategies fell below -25% ROI")
       : active
-      ? `${strategy === "Post-10 Win Recovery" ? `${getPost10WinRecoveryNote(history)} · ` : ""}${f.source} ${f.group} · ${f.source === "PULSE" && (f as any).dimensionTDA?.compressed ? "2D Compression · " : ""}${f.source === "PULSE" ? `${f.confidence}% · ` : ""}${routedExecutionMode}${pulseExecutionRouter.active ? " · Pulse Router" : ""}${overlayHit ? " · Wheel Overlay Hit" : ""}${hasStreamConflict(f.group, routedExecutionMode, f.source, f) ? " · Stream Conflict" : ""}`
+      ? `${effectiveStrategy === "Post-10 Win Recovery" ? `${getPost10WinRecoveryNote(history)} · ` : ""}${f.source} ${f.group} · ${f.source === "PULSE" && (f as any).dimensionTDA?.compressed ? "2D Compression · " : ""}${f.source === "PULSE" ? `${f.confidence}% · ` : ""}${routedExecutionMode}${pulseExecutionRouter.active ? " · Pulse Router" : ""}${overlayHit ? " · Wheel Overlay Hit" : ""}${hasStreamConflict(f.group, routedExecutionMode, f.source, f) ? " · Stream Conflict" : ""}`
       : observePushHold
       ? getTierExecutionNote(f.tier, f.group, f.group ? GROUPS[f.group] : [])
       : !dimensionTDAAllowed
