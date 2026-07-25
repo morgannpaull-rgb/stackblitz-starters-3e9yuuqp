@@ -2784,7 +2784,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       Random: (random as any).group ?? null,
     };
 
-    // ─── 50% FLOOR — an engine must be at/above 50% on THIS axis to qualify ──
+    // ─── AXIS FLOOR — an engine must clear AXIS_FLOOR on THIS axis to qualify ──
     // Per request (July 24): restore the threshold-with-no-bet-fallback rule
     // originally described, now applied per-axis instead of per-engine.
     // Eligibility is a straight accuracy check (wins/n ≥ 0.5) on that axis
@@ -2797,7 +2797,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // (July 20): landed at 13.2%, statistically identical to the 12.5%
     // baseline, with ~30% of spins going unbet — rebuilding it live to
     // validate that against real sessions rather than the backtest alone.
-    const AXIS_FLOOR = 0.5;
+    const AXIS_FLOOR = 0.49;
 
     const axisSupplier: Record<string, string> = { Color: "—", Range: "—", Parity: "—" };
     const axisLetter: Record<string, string> = { Color: "B", Range: "H", Parity: "E" }; // only used if isPaused ends up false despite a gap — see fallback note below
@@ -2827,11 +2827,11 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const previousComposite = (history[history.length - 1] as any)?.pulseSelectedEngine ?? null;
 
     // Pause the WHOLE spin if any axis couldn't find an engine clearing the
-    // 50% floor — a partial bet (2 real axes + 1 neutral guess) isn't a
+    // AXIS_FLOOR — a partial bet (2 real axes + 1 neutral guess) isn't a
     // meaningful wager, since all three have to hit for a real-money win.
     const isPaused = anyAxisUnfilled;
     const pauseReason: string | null = isPaused
-      ? `No engine at/above 50% on: ${AXES.filter(({ key }) => !ENGINE_ORDER.some((e) => currentEngineGroup[e] !== null && axisEvaluatedCount[key][e] >= 1 && (axisAdvantage[key][e] / Math.max(1, axisEvaluatedCount[key][e]) + AXIS_BASELINE) >= AXIS_FLOOR)).map(({ key }) => key).join(", ")}`
+      ? `No engine at/above ${(AXIS_FLOOR * 100).toFixed(0)}% on: ${AXES.filter(({ key }) => !ENGINE_ORDER.some((e) => currentEngineGroup[e] !== null && axisEvaluatedCount[key][e] >= 1 && (axisAdvantage[key][e] / Math.max(1, axisEvaluatedCount[key][e]) + AXIS_BASELINE) >= AXIS_FLOOR)).map(({ key }) => key).join(", ")}`
       : null;
 
     const engineForecast: any = isPaused
