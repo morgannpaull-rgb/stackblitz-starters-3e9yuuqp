@@ -104,15 +104,13 @@ type Step = {
     switched: boolean;
     previousEngine: string | null;
     switchZScore?: number | null;
-    switchReason?: "axis-composite" | null;
+    switchReason?: "highest-cumulative-advantage" | null;
     challengerZScores?: Record<string, number | null>;
     leanStreak?: number;
     zTrendDelta?: number | null;
     isPaused?: boolean;
     pauseReason?: string | null;
     currentEngineTrend?: number | null;
-    axisSupplier?: Record<string, string>;
-    axisAdvantage?: Record<string, Record<string, number>>;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -2719,46 +2717,47 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const engineRates: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.rate]));
     const engineSamples: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.n]));
 
-    // ─── PER-AXIS CUMULATIVE ADVANTAGE — combine the best axis per engine ───
-    // Per request (July 20): instead of picking one engine's whole 3-axis
-    // forecast, score each engine SEPARATELY on each axis (Color/Range/
-    // Parity) using the same unbounded cumulative-advantage mechanism used
-    // at the whole-engine level, then build the final 3-letter forecast by
-    // taking whichever engine currently leads on EACH axis independently —
-    // Color might come from Straight, Range from Markov, Parity from
-    // Random, all in the same spin.
+    // ─── CUMULATIVE ADVANTAGE — the ONLY input to engine selection ──────────
+    // Per request (July 20): rank all four engines continuously by an
+    // unbounded running sum of (outcome − baseline) since the start of the
+    // session — NOT a ratio. This is the synthesis of everything tried
+    // today: raw rate, Bayesian-shrunk rate, and Z-score were all ratios on
+    // a rolling window — noisy, and with no memory of magnitude (an engine
+    // that just climbed out of a 30-loss hole looks identical to one that's
+    // been steady the whole time, the moment either is expressed as a
+    // percentage). Cumulative-since-start rate fixed the noise but not the
+    // memory problem — still a ratio, still floored at zero, still fooled by
+    // a short lucky streak. Lock-once + CUSUM fixed the memory problem but
+    // removed the ability to ever switch to a genuinely better engine.
     //
-    // Known finding going in (see chat, July 20): a formal chi-square
-    // homogeneity test across all 4 engines × 3 axes, and a direct backtest
-    // of a related axis-swap rule, both showed no engine has a real,
-    // detectable edge on any specific axis — all 12 combinations were
-    // statistically indistinguishable from a fair coin (48-53%, all within
-    // noise), and the backtested rule landed at 13.2% — statistically
-    // identical to the 12.5% you'd get from three independent fair coins.
-    // Built anyway, per request, to test directly against new sessions
-    // rather than resting on the prior evidence alone.
-    const AXIS_BASELINE = 0.5; // fair-coin baseline for a single binary axis (not the 0.125 three-axis coincidence baseline used at the whole-engine level)
-    const AXES: { key: "Color" | "Range" | "Parity"; index: 0 | 1 | 2 }[] = [
-      { key: "Color", index: 0 }, { key: "Range", index: 1 }, { key: "Parity", index: 2 },
-    ];
+    // This keeps switching (whichever engine leads can change, no lock) while
+    // using a scoring function that actually has memory: a win adds
+    // (1 − baseline), a loss subtracts baseline, and nothing resets or
+    // floors at zero. An engine can only overtake another by accumulating
+    // real evidence over time — a couple of lucky spins can't vault a
+    // genuinely weak engine's SUM past a strong engine's SUM the way it can
+    // flip a bounded percentage. Verified against session 7 (July 20 chat):
+    // at the exact spin where rolling rate/Z said Straight looked
+    // "recovered" (20%, Z=+0.88), this metric correctly still showed it far
+    // behind (-3.38 vs. the leader's +0.62) — it wasn't fooled the way the
+    // ratio-based versions were.
+    //
+    // Reverted back to this whole-engine version on July 24 from the
+    // per-axis recombination build — restores "bet the single best engine's
+    // full 3-letter forecast" instead of stitching a composite from up to 3
+    // different engines' individual axes.
+    const PULSE_BASELINE = 0.125; // fixed baseline win probability (~1/8 — chance odds of a 3-axis coincidence), same constant used throughout today's experiments
+
     const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random"] as const;
     const engineDiagKey: Record<string, "straight" | "inverted" | "markov" | "random"> = {
       Straight: "straight", Inverted: "inverted", Markov: "markov", Random: "random",
     };
 
-    // Unbounded per-axis, per-engine running sum, replayed from the start of
-    // history every render — same mechanism as the whole-engine version,
-    // just scored one axis at a time instead of on the full 3-letter code.
-    const axisAdvantage: Record<string, Record<string, number>> = {
-      Color: { Straight: 0, Inverted: 0, Markov: 0, Random: 0 },
-      Range: { Straight: 0, Inverted: 0, Markov: 0, Random: 0 },
-      Parity: { Straight: 0, Inverted: 0, Markov: 0, Random: 0 },
-    };
-    const axisEvaluatedCount: Record<string, Record<string, number>> = {
-      Color: { Straight: 0, Inverted: 0, Markov: 0, Random: 0 },
-      Range: { Straight: 0, Inverted: 0, Markov: 0, Random: 0 },
-      Parity: { Straight: 0, Inverted: 0, Markov: 0, Random: 0 },
-    };
+    // Unbounded running sum per engine, replayed from the start of history
+    // every render (stateless, like everything else here) — no window, no
+    // floor, no ratio.
+    const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
+    const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     for (const step of history) {
       const diag = (step as any).allEngineDiagnostics;
       const actual = step.outcomeGroup;
@@ -2766,105 +2765,77 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       for (const engine of ENGINE_ORDER) {
         const predicted = diag[engineDiagKey[engine]]?.group ?? null;
         if (!predicted) continue;
-        for (const { key, index } of AXES) {
-          const correct = predicted[index] === actual[index] ? 1 : 0;
-          axisAdvantage[key][engine] += (correct - AXIS_BASELINE);
-          axisEvaluatedCount[key][engine] += 1;
-        }
+        const outcome = predicted === actual ? 1 : 0;
+        cumulativeAdvantage[engine] += (outcome - PULSE_BASELINE);
+        evaluatedCount[engine] += 1;
       }
     }
 
-    // Current spin's live per-engine letter for each axis — may be null if
-    // that engine can't currently produce a prediction (e.g. Markov still
-    // building history).
-    const currentEngineGroup: Record<string, string | null> = {
-      Straight: (straight as any).group ?? null,
-      Inverted: (inverted as any).group ?? null,
-      Markov: (markov as any).group ?? null,
-      Random: (random as any).group ?? null,
-    };
+    const eligible = ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
+    const lastStep = history[history.length - 1];
+    const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
-    // ─── AXIS FLOOR — an engine must clear AXIS_FLOOR on THIS axis to qualify ──
-    // Per request (July 24): restore the threshold-with-no-bet-fallback rule
-    // originally described, now applied per-axis instead of per-engine.
-    // Eligibility is a straight accuracy check (wins/n ≥ 0.5) on that axis
-    // alone; ranking among eligible engines still uses cumulative advantage
-    // (unbounded sum), same as before. If NO engine clears the floor on a
-    // given axis, that axis has nobody with even coin-flip-or-better
-    // evidence — and since a real bet needs all three axes to form a valid
-    // number set, the whole spin goes to no-bet rather than filling that one
-    // axis with a neutral guess. This is the same rule already backtested
-    // (July 20): landed at 13.2%, statistically identical to the 12.5%
-    // baseline, with ~30% of spins going unbet — rebuilding it live to
-    // validate that against real sessions rather than the backtest alone.
-    const AXIS_FLOOR = 0.49;
-
-    const axisSupplier: Record<string, string> = { Color: "—", Range: "—", Parity: "—" };
-    const axisLetter: Record<string, string> = { Color: "B", Range: "H", Parity: "E" }; // only used if isPaused ends up false despite a gap — see fallback note below
-    let anyAxisUnfilled = false;
-    for (const { key, index } of AXES) {
-      const eligible = ENGINE_ORDER.filter((e) => {
-        if (currentEngineGroup[e] === null) return false;
-        const n = axisEvaluatedCount[key][e];
-        if (n < 1) return false;
-        const rate = (axisAdvantage[key][e] / n) + AXIS_BASELINE; // recover wins/n from the (correct − 0.5) running sum
-        return rate >= AXIS_FLOOR;
-      });
-      if (eligible.length === 0) {
-        anyAxisUnfilled = true;
-        continue;
-      }
+    let selectedEngine = "Straight";
+    let leaderReason: "highest-cumulative-advantage" | null = null;
+    if (eligible.length === 0) {
+      selectedEngine = "Straight"; // nobody has an evaluated prediction yet — neutral default
+    } else {
       let best = -Infinity;
-      let bestEngine: string = eligible[0];
       for (const engine of eligible) {
-        if (axisAdvantage[key][engine] > best) { best = axisAdvantage[key][engine]; bestEngine = engine; }
+        if (cumulativeAdvantage[engine] > best) { best = cumulativeAdvantage[engine]; selectedEngine = engine; }
       }
-      axisSupplier[key] = bestEngine;
-      axisLetter[key] = currentEngineGroup[bestEngine]![index];
+      leaderReason = "highest-cumulative-advantage";
     }
 
-    const compositeGroup = (axisLetter.Color + axisLetter.Range + axisLetter.Parity) as GroupKey;
-    const previousComposite = (history[history.length - 1] as any)?.pulseSelectedEngine ?? null;
+    // No pause conditions — every spin with at least one eligible engine
+    // places a bet. The scoring function itself is what prevents chasing
+    // noise; there's no separate gate on top of it.
+    const isPaused = false;
+    const pauseReason: string | null = null;
 
-    // Pause the WHOLE spin if any axis couldn't find an engine clearing the
-    // AXIS_FLOOR — a partial bet (2 real axes + 1 neutral guess) isn't a
-    // meaningful wager, since all three have to hit for a real-money win.
-    const isPaused = anyAxisUnfilled;
-    const pauseReason: string | null = isPaused
-      ? `No engine at/above ${(AXIS_FLOOR * 100).toFixed(0)}% on: ${AXES.filter(({ key }) => !ENGINE_ORDER.some((e) => currentEngineGroup[e] !== null && axisEvaluatedCount[key][e] >= 1 && (axisAdvantage[key][e] / Math.max(1, axisEvaluatedCount[key][e]) + AXIS_BASELINE) >= AXIS_FLOOR)).map(({ key }) => key).join(", ")}`
-      : null;
-
-    const engineForecast: any = isPaused
-      ? { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: pauseReason }
-      : {
-          group: compositeGroup,
-          numbers: GROUPS[compositeGroup] ?? [],
-          confidence: 60,
+    // Get prediction from selected engine
+    let engineForecast: any;
+    if (isPaused) {
+      engineForecast = { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: pauseReason };
+    } else if (selectedEngine === "Straight") {
+      const divergence = getPulseBBStraightDivergence(history);
+      if (divergence.isWarming || divergence.holdCount === 3) {
+        engineForecast = { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: divergence.label };
+      } else {
+        engineForecast = {
+          ...straight,
+          group: divergence.group,
+          numbers: divergence.group ? GROUPS[divergence.group] : [],
+          confidence: 65,
           tier: "Active · Confirmed",
-          reason: `Composite — Color←${axisSupplier.Color}, Range←${axisSupplier.Range}, Parity←${axisSupplier.Parity}`,
+          reason: divergence.label,
+          pulseDivergence: divergence,
         };
-
-    const selectedEngine = isPaused ? "Hold" : compositeGroup; // holds the composite 3-letter code (or "Hold" when paused) — not a single engine name — see axisSupplier for per-axis attribution
-    const currentEngine = previousComposite;
+      }
+    } else if (selectedEngine === "Inverted") {
+      engineForecast = { ...inverted, tier: "Active · Confirmed" };
+    } else if (selectedEngine === "Markov") {
+      engineForecast = { ...markov, tier: "Active · Confirmed" };
+    } else {
+      engineForecast = { ...random, tier: "Active · Confirmed" };
+    }
 
     const tracker = {
-      selectedEngine, // composite 3-letter code, e.g. "BHE" — not a single engine name anymore
+      selectedEngine,
       isWarming: false,
       spinsRemaining: 0,
       engineRates,
       engineSamples,
       switched: currentEngine !== null && currentEngine !== selectedEngine,
       previousEngine: currentEngine,
-      switchZScore: null as number | null,
-      switchReason: "axis-composite" as const,
-      challengerZScores: {} as Record<string, number | null>, // unused in this build — see axisAdvantage below
+      switchZScore: cumulativeAdvantage[selectedEngine] ?? null,
+      switchReason: leaderReason,
+      challengerZScores: cumulativeAdvantage, // repurposed field: each engine's cumulative advantage score (unbounded sum, not a ratio) — this is what drives selection now
       leanStreak: 0,
       zTrendDelta: null as number | null,
       isPaused,
       pauseReason,
       currentEngineTrend: null as number | null,
-      axisSupplier,   // which engine currently supplies each axis: { Color, Range, Parity }
-      axisAdvantage,  // full per-axis, per-engine cumulative advantage breakdown
     };
 
     return {
@@ -2872,7 +2843,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       source: "PULSE" as const,
       mode,
       pulseEngineTracker: tracker,
-      reason: `Pulse · ${engineForecast.reason} | Color: ${ENGINE_ORDER.map((e) => `${e}:${axisAdvantage.Color[e].toFixed(2)}`).join(" ")} | Range: ${ENGINE_ORDER.map((e) => `${e}:${axisAdvantage.Range[e].toFixed(2)}`).join(" ")} | Parity: ${ENGINE_ORDER.map((e) => `${e}:${axisAdvantage.Parity[e].toFixed(2)}`).join(" ")}`,
+      reason: `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
     };
   }
 
@@ -4997,36 +4968,43 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const tracker = row.pulseEngineTracker!;
         const rates = tracker.engineRates || {};
         const samples = tracker.engineSamples || {};
-        const supplier = tracker.axisSupplier || { Color: "—", Range: "—", Parity: "—" };
-        const adv = tracker.axisAdvantage || { Color: {}, Range: {}, Parity: {} };
-        const engines = ["Straight", "Inverted", "Markov", "Random"];
+        const adv = tracker.challengerZScores || {}; // repurposed field: cumulative advantage score per engine (unbounded sum, not a ratio)
+        const engineAdv = (engine: string) => (typeof adv[engine] === "number" ? adv[engine] as number : null);
         return {
           spin: row.spin,
-          composite: tracker.selectedEngine ?? "—", // the 3-letter composite code
+          selectedEngine: tracker.selectedEngine ?? "—",
           switched: tracker.switched,
-          previousComposite: tracker.previousEngine ?? "—",
-          colorSupplier: supplier.Color ?? "—",
-          rangeSupplier: supplier.Range ?? "—",
-          paritySupplier: supplier.Parity ?? "—",
-          colorAdv: engines.map((e) => `${e}:${(adv.Color?.[e] ?? 0).toFixed(2)}`).join(" "),
-          rangeAdv: engines.map((e) => `${e}:${(adv.Range?.[e] ?? 0).toFixed(2)}`).join(" "),
-          parityAdv: engines.map((e) => `${e}:${(adv.Parity?.[e] ?? 0).toFixed(2)}`).join(" "),
+          previousEngine: tracker.previousEngine ?? "—",
           straightRate: rates["Straight"] ?? 0,
           invertedRate: rates["Inverted"] ?? 0,
           markovRate: rates["Markov"] ?? 0,
           randomRate: rates["Random"] ?? 0,
+          straightN: samples["Straight"] ?? 0,
+          invertedN: samples["Inverted"] ?? 0,
+          markovN: samples["Markov"] ?? 0,
+          randomN: samples["Random"] ?? 0,
+          straightAdv: engineAdv("Straight"),
+          invertedAdv: engineAdv("Inverted"),
+          markovAdv: engineAdv("Markov"),
+          randomAdv: engineAdv("Random"),
+          leader: tracker.selectedEngine ?? "—",
+          switchReason: tracker.switchReason ?? null,
+          isPaused: tracker.isPaused ?? false,
+          pauseReason: tracker.pauseReason ?? null,
         };
       });
   };
 
   const rowsForPulseSwitchLogExport = () => [
-    ["Spin", "Composite Forecast", "Changed", "Previous Composite",
-     "Color Supplier", "Range Supplier", "Parity Supplier",
-     "Color Advantage (all 4 engines)", "Range Advantage (all 4 engines)", "Parity Advantage (all 4 engines)"],
+    ["Spin", "Selected Engine (= Leader)", "Switched", "Switch Reason", "Previous Engine",
+     "Straight %", "Straight n", "Straight Cumulative Advantage", "Inverted %", "Inverted n", "Inverted Cumulative Advantage",
+     "Markov %", "Markov n", "Markov Cumulative Advantage", "Random %", "Random n", "Random Cumulative Advantage"],
     ...getPulseSwitchLogRows().map((row) => [
-      row.spin, row.composite, row.switched ? "YES" : "NO", row.previousComposite,
-      row.colorSupplier, row.rangeSupplier, row.paritySupplier,
-      row.colorAdv, row.rangeAdv, row.parityAdv,
+      row.spin, row.selectedEngine, row.switched ? "YES" : "NO", row.switchReason ?? "—", row.previousEngine,
+      row.straightRate, row.straightN, row.straightAdv === null ? "—" : row.straightAdv.toFixed(2),
+      row.invertedRate, row.invertedN, row.invertedAdv === null ? "—" : row.invertedAdv.toFixed(2),
+      row.markovRate, row.markovN, row.markovAdv === null ? "—" : row.markovAdv.toFixed(2),
+      row.randomRate, row.randomN, row.randomAdv === null ? "—" : row.randomAdv.toFixed(2),
     ]),
   ];
 
@@ -5512,37 +5490,32 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
             </div>
           ) : (
             <div>
-              {/* Axis composite — which engine currently supplies each axis */}
-              <div style={{ border: `1px solid ${t.border}`, borderRadius: 10, padding: "8px 12px", background: t.panel2, marginBottom: 8 }}>
-                <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8, marginBottom: 6 }}>Axis Composite (Color · Range · Parity)</div>
-                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 6 }}>
-                  {(["Color", "Range", "Parity"] as const).map((axis) => {
-                    const supplier = tracker.axisSupplier?.[axis] ?? "—";
-                    const col = engineColors[supplier] ?? COLORS.cyan;
-                    return (
-                      <div key={axis} style={{ border: `1px solid ${col}44`, borderRadius: 8, padding: "5px 6px", background: `${col}0a`, textAlign: "center" }}>
-                        <div style={{ fontSize: 8, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>{axis}</div>
-                        <div style={{ fontSize: 12, fontWeight: 950, color: col, marginTop: 2 }}>{supplier}</div>
-                      </div>
-                    );
-                  })}
+              {/* Active engine */}
+              <div style={{ border: `1px solid ${engineColors[tracker.selectedEngine] ?? COLORS.cyan}44`, borderRadius: 10, padding: "8px 12px", background: `${engineColors[tracker.selectedEngine] ?? COLORS.cyan}0a`, marginBottom: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <div>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>Active Engine</div>
+                  <div style={{ fontSize: 16, fontWeight: 950, color: engineColors[tracker.selectedEngine] ?? COLORS.cyan, marginTop: 2 }}>{tracker.selectedEngine}</div>
+                </div>
+                <div style={{ textAlign: "right" }}>
+                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase", letterSpacing: 0.8 }}>Win Rate (10)</div>
+                  <div style={{ fontSize: 16, fontWeight: 950, color: engineColors[tracker.selectedEngine] ?? COLORS.cyan, marginTop: 2 }}>{tracker.engineRates[tracker.selectedEngine]}%</div>
                 </div>
               </div>
               {/* All engine rates */}
               <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 4 }}>
                 {["Straight","Inverted","Markov","Random"].map(eng => {
                   const rate = tracker.engineRates[eng] ?? 0;
-                  const isSupplyingAnyAxis = tracker.axisSupplier && Object.values(tracker.axisSupplier).includes(eng);
+                  const isActive = eng === tracker.selectedEngine;
                   const col = engineColors[eng];
                   return (
-                    <div key={eng} style={{ border: `1px solid ${isSupplyingAnyAxis ? col+"66" : t.border}`, borderRadius: 8, padding: "5px 6px", background: isSupplyingAnyAxis ? `${col}10` : t.input, textAlign: "center" }}>
-                      <div style={{ fontSize: 8, color: isSupplyingAnyAxis ? col : t.subtext, fontWeight: 700, textTransform: "uppercase" }}>{eng.slice(0,3)}</div>
-                      <div style={{ fontSize: 13, fontWeight: 950, color: isSupplyingAnyAxis ? col : t.text, marginTop: 2 }}>{rate}%</div>
+                    <div key={eng} style={{ border: `1px solid ${isActive ? col+"66" : t.border}`, borderRadius: 8, padding: "5px 6px", background: isActive ? `${col}10` : t.input, textAlign: "center" }}>
+                      <div style={{ fontSize: 8, color: isActive ? col : t.subtext, fontWeight: 700, textTransform: "uppercase" }}>{eng.slice(0,3)}</div>
+                      <div style={{ fontSize: 13, fontWeight: 950, color: isActive ? col : t.text, marginTop: 2 }}>{rate}%</div>
                     </div>
                   );
                 })}
               </div>
-              {tracker.switched && <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 900, marginTop: 6, textAlign: "center" }}>↔ Composite changed from {tracker.previousEngine}</div>}
+              {tracker.switched && <div style={{ fontSize: 10, color: COLORS.amber, fontWeight: 900, marginTop: 6, textAlign: "center" }}>↔ Switched from {tracker.previousEngine}</div>}
             </div>
           )}
         </div>
@@ -6625,32 +6598,31 @@ const StreakAnalyticsPanel = () => {
   const PulseSwitchLogPanel = () => {
     const engineColors: Record<string, string> = { Straight: COLORS.blue, Inverted: COLORS.amber, Markov: COLORS.green, Random: COLORS.cyan };
     const rows = getPulseSwitchLogRows();
-    const changes = rows.filter((row) => row.switched);
+    const switches = rows.filter((row) => row.switched);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Each of the 3 axes (Color/Range/Parity) is scored independently: every engine's cumulative advantage on THAT axis alone (unbounded running sum vs. a 50% fair-coin baseline) is compared, and whichever engine leads supplies that axis's letter — Color, Range, and Parity can each come from a different engine in the same spin. Known finding going in: a formal test found no engine has a detectable edge on any specific axis (all 12 combinations were statistically indistinguishable from a coin flip). Built to test this directly (July 20) — treat as an open experiment, not a validated improvement.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Every spin, each engine's cumulative advantage — an unbounded running sum of (outcome − 12.5% baseline) since the start of the session, not a ratio — is compared, and whichever engine has the highest score leads. Switching is allowed, but an engine can only overtake another by accumulating real evidence over time; a short lucky streak can't vault a weak engine's sum past a strong one the way it can flip a bounded percentage. Reverted back to this whole-engine version on July 24 from the per-axis recombination build.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
         <MiniMetric label="Spins Tracked" value={rows.length} />
-        <MiniMetric label="Composite Changes" value={changes.length} />
-        <MiniMetric label="Current Composite" value={rows.at(-1)?.composite ?? "—"} />
+        <MiniMetric label="Switches" value={switches.length} />
+        <MiniMetric label="Current Leader" value={rows.at(-1)?.selectedEngine ?? "—"} />
       </div>
       <div style={{ maxHeight: 360, overflow: "auto", border: `1px solid ${t.border}`, borderRadius: 12 }}>
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, whiteSpace: "nowrap" }}>
-          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Composite", "Changed", "Color ← from", "Range ← from", "Parity ← from", "Color adv (S/I/M/R)", "Range adv (S/I/M/R)", "Parity adv (S/I/M/R)"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
+          <thead><tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}`, color: t.subtext }}>{["Spin", "Leader", "Switched", "From", "Straight", "Inverted", "Markov", "Random"].map((h) => <th key={h} style={{ padding: "8px 10px" }}>{h}</th>)}</tr></thead>
           <tbody>
-            {rows.length === 0 ? <tr><td colSpan={9} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
+            {rows.length === 0 ? <tr><td colSpan={8} style={{ padding: 12, color: t.subtext, fontWeight: 900 }}>No Pulse-tracked spins yet (Pulse must be ON).</td></tr> : rows.slice(-100).reverse().map((row) => (
               <tr key={row.spin} style={{ borderBottom: `1px solid ${t.border}` }}>
                 <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.spin}</td>
-                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.composite}</td>
+                <td style={{ padding: "8px 10px", fontWeight: 950 }}>{row.selectedEngine}</td>
                 <td style={{ padding: "8px 10px", color: row.switched ? COLORS.cyan : t.subtext, fontWeight: 950 }}>{row.switched ? "YES" : "—"}</td>
-                <td style={{ padding: "8px 10px", color: engineColors[row.colorSupplier] ?? t.text, fontWeight: 900 }}>{row.colorSupplier}</td>
-                <td style={{ padding: "8px 10px", color: engineColors[row.rangeSupplier] ?? t.text, fontWeight: 900 }}>{row.rangeSupplier}</td>
-                <td style={{ padding: "8px 10px", color: engineColors[row.paritySupplier] ?? t.text, fontWeight: 900 }}>{row.paritySupplier}</td>
-                <td style={{ padding: "8px 10px", color: t.subtext, fontSize: 11 }}>{row.colorAdv}</td>
-                <td style={{ padding: "8px 10px", color: t.subtext, fontSize: 11 }}>{row.rangeAdv}</td>
-                <td style={{ padding: "8px 10px", color: t.subtext, fontSize: 11 }}>{row.parityAdv}</td>
+                <td style={{ padding: "8px 10px", color: t.subtext }}>{row.switched ? row.previousEngine : "—"}</td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.straightRate}% <span style={{ color: t.subtext }}>(n={row.straightN}, adv={row.straightAdv === null ? "—" : row.straightAdv.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.invertedRate}% <span style={{ color: t.subtext }}>(n={row.invertedN}, adv={row.invertedAdv === null ? "—" : row.invertedAdv.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.markovRate}% <span style={{ color: t.subtext }}>(n={row.markovN}, adv={row.markovAdv === null ? "—" : row.markovAdv.toFixed(2)})</span></td>
+                <td style={{ padding: "8px 10px", textAlign: "center" }}>{row.randomRate}% <span style={{ color: t.subtext }}>(n={row.randomN}, adv={row.randomAdv === null ? "—" : row.randomAdv.toFixed(2)})</span></td>
               </tr>
             ))}
           </tbody>
