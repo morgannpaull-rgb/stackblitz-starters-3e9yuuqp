@@ -174,12 +174,6 @@ type SavedControlSettings = {
 // how each is constructed and consumed, not guessed.
 type PulseDivergenceState = "OFF_PATTERN" | "DIVERGING" | "ON_PATTERN";
 
-type PulseDivergenceCycle =
-  | "NONE" | "ALTERNATING"
-  | "CYCLE_3_001" | "CYCLE_3_011" | "CYCLE_3_110"
-  | "CYCLE_3_100" | "CYCLE_3_010" | "CYCLE_3_101"
-  | "STREAK_0" | "STREAK_1";
-
 type DimensionPerformanceState = "WARMING" | "HOLD" | "EXECUTE";
 
 type PulseDriftAxisKey = "color" | "range" | "parity";
@@ -193,17 +187,6 @@ type PulseAxisDivergence = {
   axisConfidence: number;
   spread: number;
   spreadActive: boolean;
-  cadenceActive: boolean;
-  cadencePattern: (0 | 1)[];
-  cadenceIndex: number;
-  cadenceBreakBit: (0 | 1) | null;
-  lossProtection: { active: boolean; severe: boolean; lossRun: number; penalty: number; observe: boolean; status: string };
-  entropy: { score: number; penalty: number; random: boolean; elevated: boolean; status: string };
-  persistence: { score: number; flipRate: number; unstable: boolean; breakingDown: boolean; penalty: number; status: string };
-  consensus: { agrees: number; recentWin: boolean; reEntryReady: boolean; lift: number; status: string };
-  dpiStructural: { forceObserve: boolean; penalty: number; status: string; velocity: number };
-  cadenceAssist: { penalty: number; observe: boolean; status: string };
-  neuralGovernance: { hold: boolean; reason: string };
   performanceState: DimensionPerformanceState;
   adjustedConfidence: number;
   isHold: boolean;
@@ -212,16 +195,12 @@ type PulseAxisDivergence = {
   conformanceScore: number;
   conformanceWindow: number;
   mismatchStreak: number;
-  detectedCycle: PulseDivergenceCycle;
-  cycleConfidence: number;
-  cyclePosition: number;
   rollingAccuracy: number;
   rollingWindow: number;
   consecutiveBelowThreshold: number;
   performanceFlipActive: boolean;
   selectedGate: string;
   gateFitScore: number;
-  allGateScores: Record<BooleanGate, number>;
   summary: string;
 };
 
@@ -1680,36 +1659,6 @@ function getDivergenceState(conformanceScore: number, mismatchStreak: number): P
   return "ON_PATTERN";
 }
 
-function detectAlternativeCycle(bits: (0 | 1)[]): { cycle: PulseDivergenceCycle; confidence: number; position: number; nextBit: 0 | 1 } {
-  if (bits.length < 4) return { cycle: "NONE", confidence: 0, position: 0, nextBit: 0 };
-  const recent = bits.slice(-15);
-  if (recent.length >= 6) {
-    const cw = recent.slice(-8);
-    const alts = cw.reduce((n: number, b, i) => n + (i > 0 && b !== cw[i-1] ? 1 : 0), 0 as number);
-    if (alts / (cw.length - 1) >= 0.75)
-      return { cycle: "ALTERNATING", confidence: Math.min(3, Math.floor(recent.length/2)), position: recent.length%2, nextBit: (recent[recent.length-1]===0?1:0) as 0|1 };
-  }
-  const THREE_CYCLES: Array<{pattern:[0|1,0|1,0|1];name:PulseDivergenceCycle}> = [
-    {pattern:[0,0,1],name:"CYCLE_3_001"},{pattern:[0,1,1],name:"CYCLE_3_011"},
-    {pattern:[1,1,0],name:"CYCLE_3_110"},{pattern:[1,0,0],name:"CYCLE_3_100"},
-    {pattern:[0,1,0],name:"CYCLE_3_010"},{pattern:[1,0,1],name:"CYCLE_3_101"},
-  ];
-  for (const {pattern, name} of THREE_CYCLES) {
-    for (let offset = 0; offset < 3; offset++) {
-      const check = recent.slice(-9);
-      if (check.length < 6) continue;
-      const matches = check.reduce((n: number, b, i) => n+(b===pattern[(i+offset)%3]?1:0), 0 as number);
-      if (matches/check.length >= 0.89) {
-        const pos = (recent.length+offset)%3;
-        return { cycle: name, confidence: Math.min(3,Math.floor(recent.length/3)), position: pos, nextBit: pattern[pos] as 0|1 };
-      }
-    }
-  }
-  const {bit: runBit, length: runLength} = getCurrentBitRun(recent);
-  if (runLength >= 4) return { cycle: runBit===0?"STREAK_0":"STREAK_1", confidence: Math.min(3,Math.floor(runLength/2)), position: runLength, nextBit: runBit };
-  return { cycle: "NONE", confidence: 0, position: 0, nextBit: bits[bits.length-1] ?? 0 };
-}
-
 // ── 3-Input Boolean Gate System ───────────────────────────────────────────────
 // Each axis now uses a 3-input Boolean truth table instead of a 2-input gate.
 // Inputs: A = outcome[n-3], B = outcome[n-2], C = outcome[n-1]
@@ -1901,22 +1850,11 @@ function analyseAxis(
   gatePredOtherB: 0|1,
 ): PulseAxisDivergence {
   const isWarming = bits.length < MIN_HISTORY_SPINS;
-  const emptyScores: Record<BooleanGate,number> = {AND:0,NAND:0,OR:0,NOR:0,XOR:0,XNOR:0};
   const andPrediction: 0|1 = getStraightNextBit(bits) as 0|1;
 
   // Diagnostics for UI display
   const { conformanceScore, mismatchStreak, windowUsed } = scoreDimensionConformance(bits, 10);
   const state = getDivergenceState(conformanceScore, mismatchStreak);
-  const { cycle, confidence: cycleConf, position: cyclePos } = detectAlternativeCycle(bits);
-
-  // Null-op components — kept for type compatibility, values are neutral
-  const nullProtection = { active:false, severe:false, lossRun:0, penalty:0, observe:false, status:"—" };
-  const nullEntropy    = { score:0, penalty:0, random:false, elevated:false, status:"—" };
-  const nullPersist    = { score:50, flipRate:0, unstable:false, breakingDown:false, penalty:0, status:"—" };
-  const nullConsensus  = { agrees:0, recentWin:false, reEntryReady:false, lift:0, status:"—" };
-  const nullDpiStr     = { forceObserve:false, penalty:0, status:"—", velocity:0 };
-  const nullCadenceA   = { penalty:0, observe:false, status:"—" };
-  const nullNeural     = { hold:false, reason:"—" };
 
   const makeResult = (
     overrideBit: 0|1,
@@ -1932,17 +1870,12 @@ function analyseAxis(
     overrideActive: overrideBit !== andPrediction && !isHold,
     overrideReason,
     axisDpi: 0, axisConfidence: Math.round(fitScore * 100), spread: 0, spreadActive: !isHold,
-    cadenceActive: false, cadencePattern: [], cadenceIndex: 0, cadenceBreakBit: null,
-    lossProtection: nullProtection, entropy: nullEntropy, persistence: nullPersist,
-    consensus: nullConsensus, dpiStructural: nullDpiStr, cadenceAssist: nullCadenceA,
-    neuralGovernance: nullNeural,
     performanceState: perfState, adjustedConfidence: Math.round(fitScore * 100),
     isHold, isWarming,
     state, conformanceScore, conformanceWindow: windowUsed, mismatchStreak,
-    detectedCycle: cycle, cycleConfidence: cycleConf, cyclePosition: cyclePos,
     rollingAccuracy: fitScore, rollingWindow: GATE_3_EVAL_WINDOW,
     consecutiveBelowThreshold: 0, performanceFlipActive: overrideBit !== andPrediction && !isHold,
-    selectedGate: gateName, gateFitScore: fitScore, allGateScores: emptyScores,
+    selectedGate: gateName, gateFitScore: fitScore,
     summary,
   });
 
@@ -1985,23 +1918,13 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
   const isWarming = history.length < MIN_HISTORY_SPINS;
   if (isWarming) {
     const wa = (name: string): PulseAxisDivergence => {
-      const emptyScores: Record<BooleanGate,number>={AND:0,NAND:0,OR:0,NOR:0,XOR:0,XNOR:0};
       return {
         andPrediction:0,overrideBit:0,overrideActive:false,overrideReason:"WARMING",
         axisDpi:0,axisConfidence:0,spread:0,spreadActive:false,
-        cadenceActive:false,cadencePattern:[],cadenceIndex:0,cadenceBreakBit:null,
-        lossProtection:{active:false,severe:false,lossRun:0,penalty:0,observe:false,status:"Warming"},
-        entropy:{score:0,penalty:0,random:false,elevated:false,status:"Warming"},
-        persistence:{score:50,flipRate:0,unstable:false,breakingDown:false,penalty:0,status:"Warming"},
-        consensus:{agrees:0,recentWin:false,reEntryReady:false,lift:0,status:"Warming"},
-        dpiStructural:{forceObserve:false,penalty:0,status:"Warming",velocity:0},
-        cadenceAssist:{penalty:0,observe:false,status:"Warming"},
-        neuralGovernance:{hold:false,reason:"Warming"},
         performanceState:"WARMING",adjustedConfidence:0,isHold:true,isWarming:true,
         state:"ON_PATTERN",conformanceScore:1,conformanceWindow:0,mismatchStreak:0,
-        detectedCycle:"NONE",cycleConfidence:0,cyclePosition:0,
         rollingAccuracy:1,rollingWindow:0,consecutiveBelowThreshold:0,
-        performanceFlipActive:false,selectedGate:"AND",gateFitScore:0,allGateScores:emptyScores,
+        performanceFlipActive:false,selectedGate:"AND",gateFitScore:0,
         summary:`${name} WARMING — need ${MIN_HISTORY_SPINS} spins (have ${history.length})`,
       };
     };
@@ -2034,15 +1957,12 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
 
   const holdCount     = [color,range,parity].filter(a=>a.isHold).length;
   const execCount     = [color,range,parity].filter(a=>a.performanceState==="EXECUTE").length;
-  const cadenceCount  = [color,range,parity].filter(a=>a.cadenceActive).length;
   const overrideCount = [color,range,parity].filter(a=>a.overrideActive).length;
 
   const label = holdCount===3
     ? "All Dimensions HOLD"
     : holdCount>0
-    ? `${holdCount}/3 HOLD · ${execCount} EXECUTE · ${cadenceCount} CADENCE`
-    : cadenceCount>0
-    ? `Cadence Active · ${cadenceCount}/3 dimensions`
+    ? `${holdCount}/3 HOLD · ${execCount} EXECUTE`
     : `Straight · All EXECUTE`;
 
   return { color,range,parity,colorBit,rangeBit,parityBit,group,overrideCount,holdCount,isWarming:false,label };
@@ -2836,9 +2756,24 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       leaderReason = "highest-cumulative-advantage";
     }
 
-    const isPaused = isPushedFromReplay;
-    const pauseReason: string | null = isPaused
+    // ─── BASELINE FLOOR — pause if even the leader is below zero ────────────
+    // Per request (July 24): only bet when the leading engine's cumulative
+    // advantage score is at or above zero — i.e., performing at or above the
+    // 12.5% baseline, not merely "the least bad of four bad options." Unlike
+    // the 9-loss push (which needs a hypothetical win to release), this is a
+    // continuous, stateless check: re-evaluated fresh every spin from the
+    // current scores, no separate release condition needed. If the leader's
+    // score climbs back to zero or above on any later spin, betting simply
+    // resumes that spin — nothing to track in between.
+    const PULSE_BASELINE_FLOOR = 0;
+    const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : -Infinity;
+    const belowBaselineFloor = eligible.length > 0 && leaderScore < PULSE_BASELINE_FLOOR;
+
+    const isPaused = isPushedFromReplay || belowBaselineFloor;
+    const pauseReason: string | null = isPushedFromReplay
       ? `Paused after ${PULSE_PUSH_LOSS_LIMIT} consecutive losses — will resume the spin immediately after the next win (evaluated hypothetically while paused)`
+      : belowBaselineFloor
+      ? `${selectedEngine} is the best available engine but still below the 12.5% baseline (score ${leaderScore.toFixed(2)}) — no engine currently performing above chance`
       : null;
 
     // Get prediction from selected engine
@@ -2891,7 +2826,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       source: "PULSE" as const,
       mode,
       pulseEngineTracker: tracker,
-      reason: `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
+      reason: isPaused
+        ? `Pulse · PAUSED — ${pauseReason}`
+        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ${(PULSE_BASELINE * 100).toFixed(1)}% baseline, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
     };
   }
 
@@ -5631,10 +5568,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const isPulseAndStraight = pulseEnabled && bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled;
     const divergence = isPulseAndStraight ? getPulseBBStraightDivergence(history) : null;
 
-    const stateColor = (state: PulseDivergenceState) =>
-      state === "ON_PATTERN" ? COLORS.green : state === "DIVERGING" ? COLORS.amber : COLORS.red;
-    const cycleLabel = (cycle: PulseDivergenceCycle) =>
-      cycle === "NONE" ? "—" : cycle.replace("CYCLE_3_","3-Cycle ").replace("STREAK_0","Streak B/H/E").replace("STREAK_1","Streak R/L/O").replace("ALTERNATING","Alternating");
     const perfColor = (ps: DimensionPerformanceState) =>
       ps === "EXECUTE" ? COLORS.green : ps === "HOLD" ? COLORS.red : ps === "WARMING" ? t.subtext : COLORS.amber;
 
@@ -5708,22 +5641,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
                 <span>0%</span>
                 <span style={{ color: `${COLORS.green}cc` }}>55% → Trust</span>
                 <span>100%</span>
-              </div>
-            </div>
-          )}
-
-          {/* Cycle detection */}
-          {axis.detectedCycle !== "NONE" && (
-            <div style={{ border: `1px solid ${stateColor(axis.state)}44`, borderRadius: 8, padding: "7px 10px", background: `${stateColor(axis.state)}08`, marginBottom: 8 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-                <div>
-                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>Detected Cycle</div>
-                  <div style={{ fontSize: 12, fontWeight: 950, color: stateColor(axis.state), marginTop: 2 }}>{cycleLabel(axis.detectedCycle)}</div>
-                </div>
-                <div style={{ textAlign: "right" }}>
-                  <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, textTransform: "uppercase" }}>Reps / Pos</div>
-                  <div style={{ fontSize: 12, fontWeight: 950, color: stateColor(axis.state), marginTop: 2 }}>{axis.cycleConfidence} · {axis.cyclePosition}</div>
-                </div>
               </div>
             </div>
           )}
