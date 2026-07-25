@@ -19,7 +19,9 @@ type Strategy =
   | "Progressive Gap"
   | "Confidence-65"
   | "Confidence-75"
-  | "Progressive Confidence";
+  | "Progressive Confidence"
+  | "Auto (Best of 6)"
+  | "ROI-Trend Adaptive";
 type Appearance = "dark" | "light";
 type ViewKey = "Dashboard" | "Analytics" | "Reports" | "Sessions";
 type BBMode = "BB Off" | "Straight" | "Inverted";
@@ -127,6 +129,10 @@ type Step = {
   _bbInvertedEnabled?: boolean;
   _markovEnabled?: boolean;
   _randomEnabled?: boolean;
+  // "Auto (Best of 6)" strategy only: true once all 6 base strategies have
+  // simultaneously dropped below -25% ROI. Once true, no further real bets
+  // are placed for the rest of the session and Run Auto stops early.
+  sessionEnded?: boolean;
 };
 
 type SavedSession = {
@@ -266,7 +272,21 @@ const STRATEGIES: Strategy[] = [
   "Martingale 7",
   "Post-10 Win Recovery",
   "Step Recovery",
+  "Auto (Best of 6)",
+  "ROI-Trend Adaptive",
 ];
+// The 6 base strategies "Auto (Best of 6)" chooses between — deliberately
+// excludes itself and "ROI-Trend Adaptive" to avoid circularity.
+const AUTO_BASE_STRATEGIES: Strategy[] = [
+  "Flat",
+  "Martingale 3",
+  "Martingale 5",
+  "Martingale 7",
+  "Post-10 Win Recovery",
+  "Step Recovery",
+];
+const AUTO_STOP_ROI_THRESHOLD = -0.25; // per request, July 25 — session ends if ALL 6 base strategies are simultaneously below this ROI
+const AUTO_GIVEBACK_THRESHOLD = 0.20; // per request, July 25 — session ends if the REAL account's ROI drops 20 flat percentage-points off its own peak, regardless of how high that peak was
 
 function normalizeStrategyName(value: any): Strategy {
   return STRATEGIES.includes(value) ? value : DEFAULT_STRATEGY;
@@ -3396,6 +3416,104 @@ function getPost10WinRecoveryNote(history: Step[] = []) {
   return "Post-10 Recovery Flat";
 }
 
+// ─── AUTO (BEST OF 6) + STOP-LOSS — per request, July 25 ──────────────────
+// Backtested first (57 pooled sessions): average ROI looked great (+25.5%)
+// but the MEDIAN was -27.0% — a classic sign of a skewed distribution where
+// a few big wins (from the escalating strategies) pull the average up while
+// the typical session is quite negative. The -25% stop also fired in 35/57
+// sessions, usually almost immediately (spin 11-20), because escalating
+// strategies can cross a 25%-of-bankroll loss within the first cold stretch
+// alone — a normal occurrence at these win rates, not a sign of anything
+// unusual. Built anyway, per explicit request, as a real option to test live
+// against "ROI-Trend Adaptive" and see which one performs better in practice.
+//
+// Mechanics: every spin, replay all 6 base strategies against the ACTUAL
+// recorded win/loss/basket-size sequence so far (not a fresh forecast — the
+// forecast and its result already happened; only bet SIZE would differ under
+// a different strategy). Whichever has the highest current ROI supplies the
+// sizing rule for the next real bet. If all 6 are simultaneously below
+// AUTO_STOP_ROI_THRESHOLD, the session ends — no further bets, for the rest
+// of the session, regardless of what happens afterward.
+type ShadowStrategyState = {
+  bankroll: number;
+  lossStreak: number;
+  p10Active: boolean; p10Losses: number; p10Normal: number; p10Armed: boolean; p10Pending: boolean;
+};
+
+function unitForBaseStrategy(strategy: Strategy, baseUnit: number, st: ShadowStrategyState): number {
+  if (strategy === "Martingale 3") return baseUnit * Math.pow(2, Math.floor(st.lossStreak / 3));
+  if (strategy === "Martingale 5") return baseUnit * Math.pow(2, Math.floor(st.lossStreak / 5));
+  if (strategy === "Martingale 7") return baseUnit * Math.pow(2, Math.floor(st.lossStreak / 7));
+  if (strategy === "Step Recovery") {
+    if (st.lossStreak <= 2) return baseUnit;
+    if (st.lossStreak <= 5) return baseUnit * 2;
+    if (st.lossStreak <= 8) return baseUnit * 3;
+    return baseUnit * 4;
+  }
+  if (strategy === "Post-10 Win Recovery") {
+    return st.p10Active ? baseUnit * Math.pow(2, Math.floor(st.p10Losses / 5)) : baseUnit;
+  }
+  return baseUnit; // Flat
+}
+
+// Reconstructs the ORIGINAL starting bankroll from the first recorded step
+// (step.bankroll = previousBankroll + step.net, so previousBankroll = the
+// starting bankroll when step is the first one) — avoids needing to thread
+// startingBankroll through getUnitBet's existing call sites.
+function inferStartingBankroll(history: Step[], fallback: number): number {
+  if (history.length === 0) return fallback;
+  return history[0].bankroll - history[0].net;
+}
+
+// Real-account peak-ROI tracker for the "lock in gains" trigger — walks the
+// ACTUAL bankroll history (not a shadow strategy) and returns the highest
+// ROI reached at any point up to and including right now, before this spin.
+function computeRealAccountPeakROI(history: Step[], startingBankroll: number, currentBankroll: number): number {
+  let peak = (currentBankroll - startingBankroll) / startingBankroll;
+  for (const step of history) {
+    const roi = (step.bankroll - startingBankroll) / startingBankroll;
+    if (roi > peak) peak = roi;
+  }
+  return peak;
+}
+
+function computeShadowStrategyROIs(history: Step[], baseUnit: number, startingBankroll: number, tableLimit: number, perNumberLimit: number): Record<string, number> {
+  const states: Record<string, ShadowStrategyState> = {};
+  for (const s of AUTO_BASE_STRATEGIES) states[s] = { bankroll: startingBankroll, lossStreak: 0, p10Active: false, p10Losses: 0, p10Normal: 0, p10Armed: false, p10Pending: false };
+
+  for (const step of history) {
+    if (step.result !== "win" && step.result !== "loss") continue; // push/no-bet spins: skip, matches getLossStreak's treatment elsewhere
+    const basketSize = step.unitBet > 0 ? Math.max(1, Math.round(step.exposure / step.unitBet)) : 5;
+    const won = step.result === "win";
+    for (const s of AUTO_BASE_STRATEGIES) {
+      const st = states[s];
+      if (st.p10Pending) { st.p10Pending = false; st.p10Active = true; st.p10Losses = 0; }
+      const rawUnit = unitForBaseStrategy(s, baseUnit, st);
+      const unit = capUnitByLimits(rawUnit, basketSize, tableLimit, perNumberLimit);
+      const exposure = Math.min(unit * basketSize, Math.max(0, st.bankroll));
+      const finalUnit = exposure > 0 ? Math.max(1, Math.floor(exposure / basketSize)) : 0;
+      const finalExposure = finalUnit * basketSize;
+      const net = won ? (35 * finalUnit - (basketSize - 1) * finalUnit) : -finalExposure;
+      st.bankroll += net;
+      st.lossStreak = won ? 0 : st.lossStreak + 1;
+      if (st.p10Active) {
+        if (won) { st.p10Active = false; st.p10Losses = 0; st.p10Normal = 0; st.p10Armed = false; st.p10Pending = false; }
+        else st.p10Losses += 1;
+      } else if (st.p10Armed) {
+        if (won) { st.p10Armed = false; st.p10Pending = true; st.p10Normal = 0; }
+        else st.p10Normal += 1;
+      } else {
+        if (!won) { st.p10Normal += 1; if (st.p10Normal >= 10) st.p10Armed = true; }
+        else st.p10Normal = 0;
+      }
+    }
+  }
+
+  const rois: Record<string, number> = {};
+  for (const s of AUTO_BASE_STRATEGIES) rois[s] = (states[s].bankroll - startingBankroll) / startingBankroll;
+  return rois;
+}
+
 function getUnitBet(
   strategy: Strategy,
   baseUnit: number,
@@ -3429,6 +3547,47 @@ function getUnitBet(
     rawUnit = Math.max(1, Math.floor(maxExposure / Math.max(1, executionBasketSize)));
   } else if (strategy === "Progressive Gap" || strategy === "Progressive Confidence") {
     rawUnit = baseUnit * getProgressiveGapMultiplier(decision);
+  } else if (strategy === "Auto (Best of 6)") {
+    const startingBankroll = inferStartingBankroll(history, bankroll);
+    const rois = computeShadowStrategyROIs(history, baseUnit, startingBankroll, tableLimit, perNumberLimit);
+    let bestName: Strategy = AUTO_BASE_STRATEGIES[0];
+    let bestRoi = -Infinity;
+    for (const s of AUTO_BASE_STRATEGIES) { if (rois[s] > bestRoi) { bestRoi = rois[s]; bestName = s; } }
+    // Replay the BEST strategy's own internal state (loss streak / Post-10
+    // state) to get its current sizing — reuses the same replay, just keyed
+    // to whichever name won this time.
+    const states: Record<string, ShadowStrategyState> = {};
+    for (const s of AUTO_BASE_STRATEGIES) states[s] = { bankroll: startingBankroll, lossStreak: 0, p10Active: false, p10Losses: 0, p10Normal: 0, p10Armed: false, p10Pending: false };
+    for (const step of history) {
+      if (step.result !== "win" && step.result !== "loss") continue;
+      const basketSize = step.unitBet > 0 ? Math.max(1, Math.round(step.exposure / step.unitBet)) : 5;
+      const won = step.result === "win";
+      const st = states[bestName];
+      if (st.p10Pending) { st.p10Pending = false; st.p10Active = true; st.p10Losses = 0; }
+      st.lossStreak = won ? 0 : st.lossStreak + 1;
+      if (st.p10Active) { if (won) { st.p10Active = false; st.p10Losses = 0; } else st.p10Losses += 1; }
+      else if (st.p10Armed) { if (won) { st.p10Armed = false; st.p10Pending = true; st.p10Normal = 0; } else st.p10Normal += 1; }
+      else { if (!won) { st.p10Normal += 1; if (st.p10Normal >= 10) st.p10Armed = true; } else st.p10Normal = 0; }
+    }
+    rawUnit = unitForBaseStrategy(bestName, baseUnit, states[bestName]);
+  } else if (strategy === "ROI-Trend Adaptive") {
+    // Per request (July 25): scale bet size by ROI trend rather than loss
+    // streak. Backtested against a plain Flat baseline (57 pooled sessions):
+    // this UNDERPERFORMED — worse median (-16.2% vs Flat's -11.5%) and fewer
+    // positive sessions (21/57 vs 27/57) — same average as Flat. Built
+    // anyway, per request, to test directly rather than rely on the backtest
+    // alone; the multiplier bounds (0.5x-2x) and lookback (10 spins) are
+    // starting values, not calibrated, and are the first things worth
+    // adjusting if this is kept.
+    const startingBankroll = inferStartingBankroll(history, bankroll);
+    const lookback = 10;
+    const kSensitivity = 2.0;
+    const curRoi = (bankroll - startingBankroll) / startingBankroll;
+    const pastStep = history.length >= lookback ? history[history.length - lookback] : history[0];
+    const pastRoi = pastStep ? (pastStep.bankroll - startingBankroll) / startingBankroll : 0;
+    const trend = curRoi - pastRoi;
+    const multiplier = Math.max(0.5, Math.min(2.0, 1 + kSensitivity * trend));
+    rawUnit = baseUnit * multiplier;
   }
 
   return capUnitByLimits(rawUnit, executionBasketSize, tableLimit, perNumberLimit);
@@ -3741,13 +3900,37 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const rawDecision = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
   const f = normalizeObserveTierForSettings(rawDecision, tierExecution, history);
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
+
+  // Auto (Best of 6) stop conditions: once triggered, stays triggered for
+  // the rest of the session — checked BEFORE deciding whether to bet this
+  // spin. Two independent triggers, either one ends the session:
+  //   1. All 6 base strategies simultaneously below -25% ROI (loss-side).
+  //   2. The REAL account's own ROI has given back 20 flat percentage-points
+  //      off its own peak, regardless of how high that peak was (gain-side —
+  //      "lock in gains" rather than let a real profit erode back to zero).
+  const alreadyEnded = history.at(-1)?.sessionEnded ?? false;
+  let autoStopTriggered = alreadyEnded;
+  let autoStopReason: "loss-floor" | "giveback" | null = null;
+  if (strategy === "Auto (Best of 6)" && !alreadyEnded) {
+    const inferredStart = inferStartingBankroll(history, startingBankroll);
+    const rois = computeShadowStrategyROIs(history, baseUnit, inferredStart, tableLimit, perNumberLimit);
+    const allBelowFloor = AUTO_BASE_STRATEGIES.every((s) => rois[s] < AUTO_STOP_ROI_THRESHOLD);
+
+    const peakRoi = computeRealAccountPeakROI(history, inferredStart, bankroll);
+    const curRoi = (bankroll - inferredStart) / inferredStart;
+    const gaveBackTooMuch = peakRoi > 0 && (peakRoi - curRoi) >= AUTO_GIVEBACK_THRESHOLD;
+
+    autoStopTriggered = allBelowFloor || gaveBackTooMuch;
+    autoStopReason = allBelowFloor ? "loss-floor" : gaveBackTooMuch ? "giveback" : null;
+  }
+
   const pulseExecutionRouter = getPulseExecutionRouterDecision(pulseEnabled, executionMode, f, history);
   const routedExecutionMode = pulseExecutionRouter.selectedMode;
   const executionAllowed = shouldExecuteTier(f.tier, f.source, tierExecution, (f as any).rv, (f as any).entropyExtreme);
   const observePushHold = isObservePushTier(f.tier, tierExecution);
   const dimensionTDAAllowed = true; // TDA diagnostic only, not a hard gate.
   const pulseHasSelectedEngine = !pulseEnabled || bbStraightEnabled || bbInvertedEnabled || markovEnabled || randomEnabled;
-const active = !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine && shouldBet(strategy, f.confidence, pulseEnabled, f.group, f) && executionAllowed ;
+const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine && shouldBet(strategy, f.confidence, pulseEnabled, f.group, f) && executionAllowed ;
   const previewNumbers = active && f.group ? getExecutionNumbers(f.group, routedExecutionMode, f.source, f) : [];
   const streamNumbers = active && f.group ? getCoreExecutionNumbers(f.group, f.source, f, routedExecutionMode) : [];
   const wheelNeighbors = active && f.group ? getWheelNeighbors(f.group, f.source, routedExecutionMode, f) : [];
@@ -3821,7 +4004,13 @@ const active = !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine
     exposure,
     net,
     bankroll: bankroll + net,
-    note: active
+    note: autoStopTriggered
+      ? (alreadyEnded
+          ? "Session ended — stop condition already triggered"
+          : autoStopReason === "giveback"
+          ? "SESSION ENDED — ROI gave back 20 points from its peak (locking in the gain)"
+          : "SESSION ENDED — all 6 base strategies fell below -25% ROI")
+      : active
       ? `${strategy === "Post-10 Win Recovery" ? `${getPost10WinRecoveryNote(history)} · ` : ""}${f.source} ${f.group} · ${f.source === "PULSE" && (f as any).dimensionTDA?.compressed ? "2D Compression · " : ""}${f.source === "PULSE" ? `${f.confidence}% · ` : ""}${routedExecutionMode}${pulseExecutionRouter.active ? " · Pulse Router" : ""}${overlayHit ? " · Wheel Overlay Hit" : ""}${hasStreamConflict(f.group, routedExecutionMode, f.source, f) ? " · Stream Conflict" : ""}`
       : observePushHold
       ? getTierExecutionNote(f.tier, f.group, f.group ? GROUPS[f.group] : [])
@@ -3830,6 +4019,7 @@ const active = !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine
       : f.source === "PULSE" && (f as any).entropyExtreme
       ? `Entropy Extreme · No Bet · entropy ${((f as any).entropyValue ?? 0)}%`
       : getTierExecutionNote(f.tier, f.group, f.group ? GROUPS[f.group] : []),
+    sessionEnded: autoStopTriggered,
     executionMode: routedExecutionMode,
     coreResult,
     overlayResult,
@@ -4489,6 +4679,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled);
         const autoRunAudit = buildAutoRunAuditEntry(priorRows, settled);
         rows.push({ ...settled, autoRun: true, autoRunAudit });
+        // "Auto (Best of 6)" stop-loss: end the session outright once all 6
+        // base strategies are simultaneously below -25% ROI, rather than
+        // running out the rest of autoSpins with no further betting.
+        if (settled.sessionEnded) break;
       }
       setHistory(rows);
       setAutoRunning(false);
