@@ -2575,30 +2575,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   //   - Straight uses 3-input gate selector (256 truth tables per axis)
   //   - Inverted, Markov, Random use their existing prediction engines
   if (pulseEnabled) {
-    const PULSE_WARMING     = 10;
+    const PULSE_WARMING     = 10; // no longer gates anything — kept only because engineRates/engineSamples below still use it as a display window
     const PULSE_WINDOW      = 15;   // rolling window for win rate
 
-    // Not enough history yet — use Straight as fallback so chart still draws
-    if (history.length < PULSE_WARMING) {
-      const warmForecast = bbStraightForecast(history);
-      return {
-        ...warmForecast,
-        group: null as GroupKey | null,
-        numbers: [] as SpinValue[],
-        confidence: 0,
-        tier: "Hold · No Bet" as const,
-        reason: `Pulse warming — need ${PULSE_WARMING} spins (have ${history.length})`,
-        source: "PULSE" as const,
-        mode,
-        pulseEngineTracker: {
-          selectedEngine: null as string | null,
-          isWarming: true,
-          spinsRemaining: PULSE_WARMING - history.length,
-          engineRates: {} as Record<string, number>,
-          engineSamples: {} as Record<string, number>,
-        },
-      };
-    }
+    // Per request (July 26): removed the "history.length < PULSE_WARMING (10)
+    // → forced Hold, no bet" early return that used to sit here. This was
+    // leftover from the original rolling-window engine-selection design
+    // (abandoned back on July 20 in favor of cumulative advantage) and was
+    // never actually deleted — it sat in front of all the cumulative-
+    // advantage and uniform-start logic below, silently overriding it for
+    // the first 10 spins of every single Pulse session regardless of any
+    // fix made further down. That's what caused Pulse to keep pushing for
+    // exactly 10 spins even after the uniform-start-at-spin-4 change was
+    // built — this function never got far enough to reach it.
 
     // Compute rolling win rate AND sample size for each engine over the last
     // PULSE_WINDOW spins. Uses allEngineDiagnostics, which snapshots every
