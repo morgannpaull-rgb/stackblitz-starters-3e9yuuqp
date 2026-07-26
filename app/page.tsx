@@ -2102,16 +2102,19 @@ function getBooleanAxisPatternConfidence(bits: (0 | 1)[], mode: "Straight" | "In
 }
 
 function markovForecast(history: Step[]) {
-  if (history.length < 6) {
-    return {
-      group: null as GroupKey | null,
-      numbers: [] as SpinValue[],
-      confidence: 0,
-      tier: "Observation Forecast",
-      reason: "Markov waiting for 6-spin memory.",
-    };
-  }
-
+  // Per request (July 25): the 6-spin wait here was an extra gate layered on
+  // top of getMarkovNextBit/getMarkovAxisConfidence, both of which already
+  // degrade gracefully for short histories on their own — an empty history
+  // returns a trivial default, anything shorter than depth+1 (4 bits) falls
+  // back to "repeat the last observed bit," and only once there's enough
+  // data does the real depth-3 pattern lookup kick in. None of that needed
+  // this extra wait to work correctly. Removing it lets Markov start
+  // competing for leadership from spin 1, same as Straight/Inverted/Random,
+  // instead of entering 6-7 spins late and having to close a head-start gap
+  // it never had a chance to compete for. Predictions early on are lower-
+  // quality (just "repeat the last bit") but real, and improve automatically
+  // as more history accumulates — same engine, same code, just no longer
+  // artificially silent about it.
   const bitRows = groupSeries(history).map(groupToBits);
   const colorBits = bitRows.map((b) => b[0]);
   const rangeBits = bitRows.map((b) => b[1]);
