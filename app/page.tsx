@@ -4386,7 +4386,20 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const recoveryState = lossStreak >= 7 ? "recovery" : lossStreak >= 4 ? "watch" : "off";
   const dpiValue = getDpiValue(history);
   const dpiZone = dpiValue <= -7 ? "Transition" : dpiValue <= -3 ? "Pressure" : "Neutral";
-  const recent = [...history].reverse().slice(0, 24);
+  // Per request (July 26): spin generation runs the full session regardless
+  // of Pulse's stop condition (so switching to a manual engine or a
+  // different Strategy afterward has complete data to replay) — but that
+  // means the LIVE CHART and SESSION LOG, when Pulse is the active view,
+  // were showing a long, meaningless tail of pushed spins past the point
+  // Pulse actually stopped betting. This trims what's DISPLAYED, not what
+  // exists: when Pulse is on and has hit its stop condition, the chart and
+  // log only show spins up through the one that triggered it. The full
+  // `history` array is untouched — rawOutcomes, the Strategy Comparison
+  // table, and switching to a manual engine all still see every spin.
+  const pulseStopIndex = pulseEnabled ? history.findIndex((h) => h.sessionEnded) : -1;
+  const displayHistory = pulseStopIndex === -1 ? history : history.slice(0, pulseStopIndex + 1);
+
+  const recent = [...displayHistory].reverse().slice(0, 24);
   const rawOutcomes = useMemo(() => history.map((h) => h.outcome), [history]);
   const isPulseOnlyMode = pulseEnabled && !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled;
   const streakStats = useMemo(() => getStreakStats(history), [history]);
@@ -4395,7 +4408,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const activeDrawdownPct = peakBankroll ? (activeDrawdown / peakBankroll) * 100 : 0;
   const lossStreakSeverity = getLossStreakSeverity(streakStats.currentLossStreak);
 
-  const chartData = [{ spin: 0, bankroll: startingBankroll }, ...history.map((h) => ({ spin: h.spin, bankroll: h.bankroll }))];
+  const chartData = [{ spin: 0, bankroll: startingBankroll }, ...displayHistory.map((h) => ({ spin: h.spin, bankroll: h.bankroll }))];
   const values = chartData.map((d) => d.bankroll);
   const axisMin = Math.floor((Math.min(...values, startingBankroll) - 50) / 25) * 25;
   const axisMax = Math.ceil((Math.max(...values, startingBankroll) + 50) / 25) * 25;
