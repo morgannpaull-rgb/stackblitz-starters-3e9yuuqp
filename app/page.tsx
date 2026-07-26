@@ -2716,34 +2716,34 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       return basketSize / 36;
     };
 
-    // ─── ENGINE SELECTION ─── bet on whichever engine currently leads, every ──
-    // spin, no per-spin pause. Per request (July 25): the baseline floor and
-    // fractal swing-low (both removed here) were per-spin pauses tied to
-    // which engine was leading — that turned out to be a real source of
-    // confusion once the session-level stop-loss/giveback was also added,
-    // since two independent mechanisms were both capable of withholding a
-    // bet, for different and sometimes overlapping reasons. Simplified so
-    // there is exactly ONE thing that can stop betting: the adjustable
-    // session-level stop-loss/giveback in settleSpin, which is purely about
-    // the REAL account's dollar ROI and has nothing to do with engine
-    // identity. This function now just picks the leader and returns its
-    // forecast — always, no gating.
+    // ─── ENGINE SELECTION — trend-state based (July 26) ──────────────────────
+    // Per request: move away from "always bet whoever has the highest score"
+    // toward something closer to an actual trend-following trading engine.
+    // Each of the 4 engines gets its OWN score path tracked independently
+    // (not just whichever currently leads), and its own confirmed peaks
+    // (fractal highs, same window=2 definition already tested and built for
+    // the swing-low mechanism). An engine only qualifies to be bet on once
+    // its current score has broken back above its own last confirmed peak —
+    // a genuine, structurally-confirmed uptrend, not just "highest number
+    // right now." If more than one engine qualifies, whichever has the
+    // highest cumulative-advantage score among them is selected. If NO
+    // engine currently qualifies, the whole spin pauses — per explicit
+    // request, this does NOT fall back to highest-score-regardless-of-trend.
     //
-    // UNIFORM START (July 26): Inverted, Markov, and Random are all capable
-    // of producing a real prediction from spin 1; Straight's real gate-test
-    // can't mathematically begin before spin 5 (needs 4 bits of axis
-    // history), even with its own fallback covering the gap. Rather than
-    // let three engines quietly accumulate a few spins of unopposed
-    // evaluated score before Straight can compete at all — the same kind of
-    // head-start problem identified earlier with Markov — nobody's
-    // prediction counts toward evaluatedCount/cumulativeAdvantage, and no
-    // real bet is placed, until history.length >= 3 (first real bet at
-    // spin 4). All four engines start competing from exactly the same line.
+    // Tested first (21 pooled sessions, 1,596 spins) before building: being
+    // in a confirmed uptrend showed 12.0% win rate vs. 12.2% neutral / 14.5%
+    // downtrend — no real edge, z well under 1 in every pairwise comparison.
+    // Built anyway, by explicit request, as a deliberate move toward
+    // trend-following STYLE and more decisive, less noise-chasing engine
+    // commitment — not because backtesting showed it wins more.
+    const TREND_FRACTAL_WINDOW = 2;
     const UNIFORM_START_SPINS = 3;
+
+    const enginePaths: Record<string, number[]> = { Straight: [], Inverted: [], Markov: [], Random: [] };
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     for (let i = 0; i < history.length; i++) {
-      if (i < UNIFORM_START_SPINS) continue; // don't evaluate anyone's predictions for the first 3 spins
+      if (i < UNIFORM_START_SPINS) continue; // don't evaluate anyone's predictions for the first 3 spins — all four start together
       const step = history[i];
       const diag = (step as any).allEngineDiagnostics;
       const actual = step.outcomeGroup;
@@ -2754,19 +2754,43 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         const outcome = predicted === actual ? 1 : 0;
         cumulativeAdvantage[engine] += (outcome - getBreakevenRate(predicted));
         evaluatedCount[engine] += 1;
+        enginePaths[engine].push(cumulativeAdvantage[engine]);
       }
     }
 
+    const isFractalHigh = (path: number[], i: number): boolean => {
+      const w = TREND_FRACTAL_WINDOW;
+      if (i - w < 0 || i + w >= path.length) return false;
+      for (let k = i - w; k <= i + w; k++) {
+        if (k === i) continue;
+        if (path[k] >= path[i]) return false;
+      }
+      return true;
+    };
+
+    const inConfirmedUptrend: Record<string, boolean> = { Straight: false, Inverted: false, Markov: false, Random: false };
+    for (const engine of ENGINE_ORDER) {
+      const path = enginePaths[engine];
+      if (!path.length) continue;
+      let confirmedPeak: number | null = null;
+      for (let i = 0; i < path.length; i++) {
+        const confirmIdx = i - TREND_FRACTAL_WINDOW;
+        if (confirmIdx >= 0 && isFractalHigh(path, confirmIdx)) {
+          confirmedPeak = path[confirmIdx];
+        }
+      }
+      const currentScore = path[path.length - 1];
+      inConfirmedUptrend[engine] = confirmedPeak !== null && currentScore > confirmedPeak;
+    }
+
     const stillWaitingForUniformStart = history.length < UNIFORM_START_SPINS;
-    const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
+    const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1 && inConfirmedUptrend[e]);
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
     let selectedEngine = "Straight";
     let leaderReason: "highest-cumulative-advantage" | null = null;
-    if (eligible.length === 0) {
-      selectedEngine = "Straight"; // nobody has an evaluated prediction yet — neutral default
-    } else {
+    if (eligible.length > 0) {
       let best = -Infinity;
       for (const engine of eligible) {
         if (cumulativeAdvantage[engine] > best) { best = cumulativeAdvantage[engine]; selectedEngine = engine; }
@@ -2775,9 +2799,11 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     }
 
     const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : 0;
-    const isPaused = stillWaitingForUniformStart;
+    const isPaused = stillWaitingForUniformStart || eligible.length === 0;
     const pauseReason: string | null = stillWaitingForUniformStart
       ? `Waiting for uniform start — all four engines begin competing together at spin ${UNIFORM_START_SPINS + 1} (have ${history.length})`
+      : eligible.length === 0
+      ? "No engine is currently in a confirmed uptrend (broken above its own last peak) — waiting for one to reverse"
       : null;
 
     // Get prediction from selected engine
@@ -2832,7 +2858,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pulseEngineTracker: tracker,
       reason: isPaused
         ? `Pulse · PAUSED — ${pauseReason}`
-        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
+        : `Pulse · ${selectedEngine} selected (confirmed uptrend, score=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"}) · trend state: ${ENGINE_ORDER.map((e) => `${e}:${inConfirmedUptrend[e] ? "up" : "not-up"}(${cumulativeAdvantage[e].toFixed(2)})`).join(" · ")}`,
     };
   }
 
