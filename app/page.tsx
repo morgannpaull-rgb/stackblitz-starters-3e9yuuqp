@@ -3779,7 +3779,18 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   //      small peak gets a tight, proportional leash instead of an
   //      oversized fixed one. The trigger level only ever moves UP as new
   //      peaks form; a temporary dip never pulls it back down.
-  const alreadyEnded = history.at(-1)?.sessionEnded ?? false;
+  //
+  // Per request (July 26): these stop conditions only ever apply to Pulse —
+  // manual engine selection (Pulse off) should always show a full session,
+  // even when viewing a session that was originally recorded with Pulse on
+  // and stopped early. Previously, sessionEnded was read unconditionally
+  // from the last recorded step, so it kept propagating forward regardless
+  // of the current pulseEnabled state — meaning switching to a manual
+  // engine after a Pulse session stopped would stay frozen too, even though
+  // manual mode was never subject to that stop in the first place. Gating
+  // the read on pulseEnabled fixes this: turn Pulse off, and the sessionEnded
+  // flag from the Pulse-driven portion of history is simply ignored.
+  const alreadyEnded = pulseEnabled && (history.at(-1)?.sessionEnded ?? false);
   let autoStopTriggered = alreadyEnded;
   let autoStopReason: "loss-floor" | "trail-stop" | null = null;
   if (pulseEnabled && !alreadyEnded) {
