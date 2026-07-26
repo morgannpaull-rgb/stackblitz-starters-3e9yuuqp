@@ -3901,14 +3901,17 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const f = normalizeObserveTierForSettings(rawDecision, tierExecution, history);
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
 
-  // Per request (July 25): this shouldn't require a separate manual
-  // dropdown pick — if Pulse is already automatically choosing the best
-  // engine, it should automatically apply the best-strategy switching and
-  // both stop conditions too. Whenever Pulse is on, sizing/stop decisions
-  // use "Auto (Best of 6)" regardless of whatever the Strategy dropdown is
-  // set to; the dropdown only governs sizing when Pulse is off (manual
-  // engine selection).
-  const effectiveStrategy: Strategy = pulseEnabled ? "Auto (Best of 6)" : strategy;
+  // NOTE: this function is shared by the real live bet AND every hypothetical
+  // comparison replay (runComparisonStrategyReplay, runComboShadowStrategy,
+  // runStrategy) — it must stay neutral and use `strategy` exactly as passed
+  // in. The "Auto (Best of 6) whenever Pulse is on" override belongs ONLY at
+  // the genuine live-betting call sites (addSpin, runAuto, mergeSelected),
+  // which compute it themselves before calling this function. Putting the
+  // override in here directly (an earlier version of this fix) silently
+  // hijacked every comparison-strategy row whenever Pulse was on, since those
+  // replays pass the live pulseEnabled value straight through — that's what
+  // caused all 7 Strategy Comparison rows to show identical numbers.
+  const effectiveStrategy: Strategy = strategy;
 
   // Auto (Best of 6) stop conditions: once triggered, stays triggered for
   // the rest of the session — checked BEFORE deciding whether to bet this
@@ -4587,7 +4590,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     }
   }, []);
 
-  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled)]);
+  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, pulseEnabled ? "Auto (Best of 6)" : strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled)]);
   const rebuild = (start = startingBankroll, unit = baseUnit, nextStrategy = strategy, nextPulse = pulseEnabled) => {
     setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled));
   };
@@ -4683,9 +4686,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     setAutoRunning(true);
     window.setTimeout(() => {
       const rows: Step[] = [];
+      const liveStrategy: Strategy = pulseEnabled ? "Auto (Best of 6)" : strategy;
       for (let i = 0; i < autoSpins; i += 1) {
         const priorRows = [...rows];
-        const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled);
+        const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, liveStrategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled);
         const autoRunAudit = buildAutoRunAuditEntry(priorRows, settled);
         rows.push({ ...settled, autoRun: true, autoRunAudit });
         // "Auto (Best of 6)" stop-loss: end the session outright once all 6
@@ -4759,7 +4763,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const mergeSelected = () => {
     const sessions = savedSessions.filter((s) => selectedMerge.includes(s.name));
     let rows: Step[] = [];
-    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled))));
+    const liveStrategy: Strategy = pulseEnabled ? "Auto (Best of 6)" : strategy;
+    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, liveStrategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled))));
     setHistory(rows);
   };
 
@@ -5799,11 +5804,21 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         </div>
       ) : null}
 
+      {/* Auto (Best of 6) stop condition — make this unmistakable rather than
+          a quiet "No Bet" tucked into the spin note, which is easy to miss
+          while the rest of the panel still looks like a normal active session. */}
+      {history.at(-1)?.sessionEnded && (
+        <div style={{ border: `2px solid ${COLORS.red}`, borderRadius: 12, background: "rgba(239,68,68,0.10)", padding: "10px 14px", margin: "10px 0", textAlign: "center" }}>
+          <div style={{ fontSize: 13, fontWeight: 950, color: COLORS.red, letterSpacing: 0.4 }}>SESSION ENDED</div>
+          <div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginTop: 3 }}>No further bets are being placed — see the session log for which condition (loss floor or gains giveback) triggered it.</div>
+        </div>
+      )}
+
       {/* Final prediction */}
       <div style={{ textAlign: "center", padding: "10px 0" }}>
         <div style={{ fontSize: 11, color: t.subtext, fontWeight: 950 }}>FINAL PREDICTION</div>
-        <div style={{ fontSize: 50, fontWeight: 950, color: f.group && !isObservationForecast ? COLORS.cyan : t.subtext, lineHeight: 1, marginTop: 8 }}>{displayPrediction}</div>
-        {numberDisplay}
+        <div style={{ fontSize: 50, fontWeight: 950, color: history.at(-1)?.sessionEnded ? t.subtext : (f.group && !isObservationForecast ? COLORS.cyan : t.subtext), lineHeight: 1, marginTop: 8 }}>{history.at(-1)?.sessionEnded ? "ENDED" : displayPrediction}</div>
+        {!history.at(-1)?.sessionEnded && numberDisplay}
       </div>
       <div style={{ border: `1px solid ${t.border}`, borderRadius: 12, background: t.panel2, padding: "9px 10px", marginTop: 8 }}>
         <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: 8, alignItems: "center", fontSize: 12, fontWeight: 900 }}>
