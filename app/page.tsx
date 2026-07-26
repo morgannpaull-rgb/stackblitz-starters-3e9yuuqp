@@ -20,7 +20,6 @@ type Strategy =
   | "Confidence-65"
   | "Confidence-75"
   | "Progressive Confidence"
-  | "Auto (Best of 6)"
   | "ROI-Trend Adaptive";
 type Appearance = "dark" | "light";
 type ViewKey = "Dashboard" | "Analytics" | "Reports" | "Sessions";
@@ -129,8 +128,8 @@ type Step = {
   _bbInvertedEnabled?: boolean;
   _markovEnabled?: boolean;
   _randomEnabled?: boolean;
-  // "Auto (Best of 6)" strategy only: true once all 6 base strategies have
-  // simultaneously dropped below -25% ROI. Once true, no further real bets
+  // Whenever Pulse is on: true once this account's own ROI drops below -25%,
+  // or has given back 30% of its own peak. Once true, no further real bets
   // are placed for the rest of the session and Run Auto stops early.
   sessionEnded?: boolean;
 };
@@ -272,21 +271,13 @@ const STRATEGIES: Strategy[] = [
   "Martingale 7",
   "Post-10 Win Recovery",
   "Step Recovery",
-  "Auto (Best of 6)",
   "ROI-Trend Adaptive",
 ];
-// The 6 base strategies "Auto (Best of 6)" chooses between — deliberately
-// excludes itself and "ROI-Trend Adaptive" to avoid circularity.
-const AUTO_BASE_STRATEGIES: Strategy[] = [
-  "Flat",
-  "Martingale 3",
-  "Martingale 5",
-  "Martingale 7",
-  "Post-10 Win Recovery",
-  "Step Recovery",
-];
-const AUTO_STOP_ROI_THRESHOLD = -0.25; // per request, July 25 — session ends if ALL 6 base strategies are simultaneously below this ROI
-const AUTO_GIVEBACK_THRESHOLD = 0.20; // per request, July 25 — session ends if the REAL account's ROI drops 20 flat percentage-points off its own peak, regardless of how high that peak was
+// Both thresholds now apply directly to whichever strategy is actually
+// running (no switching — see the stop-conditions block in settleSpin for
+// why the earlier switching design was removed the same day it was built).
+const DEFAULT_STOP_LOSS_THRESHOLD = -0.25; // per request, July 25 — session ends if THIS account's own ROI drops below this. Now user-adjustable in Settings.
+const DEFAULT_GIVEBACK_THRESHOLD = 0.30; // per request, July 25, corrected same day — session ends if THIS account's ROI has given back this fraction OF its own peak (percentage-of-peak, not flat points) — e.g. peak +11.5% at 30% → triggers once ROI drops to +8.05% (11.5% × 0.70), scaling down automatically for smaller peaks. Now user-adjustable in Settings.
 
 function normalizeStrategyName(value: any): Strategy {
   return STRATEGIES.includes(value) ? value : DEFAULT_STRATEGY;
@@ -3416,45 +3407,16 @@ function getPost10WinRecoveryNote(history: Step[] = []) {
   return "Post-10 Recovery Flat";
 }
 
-// ─── AUTO (BEST OF 6) + STOP-LOSS — per request, July 25 ──────────────────
-// Backtested first (57 pooled sessions): average ROI looked great (+25.5%)
-// but the MEDIAN was -27.0% — a classic sign of a skewed distribution where
-// a few big wins (from the escalating strategies) pull the average up while
-// the typical session is quite negative. The -25% stop also fired in 35/57
-// sessions, usually almost immediately (spin 11-20), because escalating
-// strategies can cross a 25%-of-bankroll loss within the first cold stretch
-// alone — a normal occurrence at these win rates, not a sign of anything
-// unusual. Built anyway, per explicit request, as a real option to test live
-// against "ROI-Trend Adaptive" and see which one performs better in practice.
-//
-// Mechanics: every spin, replay all 6 base strategies against the ACTUAL
-// recorded win/loss/basket-size sequence so far (not a fresh forecast — the
-// forecast and its result already happened; only bet SIZE would differ under
-// a different strategy). Whichever has the highest current ROI supplies the
-// sizing rule for the next real bet. If all 6 are simultaneously below
-// AUTO_STOP_ROI_THRESHOLD, the session ends — no further bets, for the rest
-// of the session, regardless of what happens afterward.
-type ShadowStrategyState = {
-  bankroll: number;
-  lossStreak: number;
-  p10Active: boolean; p10Losses: number; p10Normal: number; p10Armed: boolean; p10Pending: boolean;
-};
-
-function unitForBaseStrategy(strategy: Strategy, baseUnit: number, st: ShadowStrategyState): number {
-  if (strategy === "Martingale 3") return baseUnit * Math.pow(2, Math.floor(st.lossStreak / 3));
-  if (strategy === "Martingale 5") return baseUnit * Math.pow(2, Math.floor(st.lossStreak / 5));
-  if (strategy === "Martingale 7") return baseUnit * Math.pow(2, Math.floor(st.lossStreak / 7));
-  if (strategy === "Step Recovery") {
-    if (st.lossStreak <= 2) return baseUnit;
-    if (st.lossStreak <= 5) return baseUnit * 2;
-    if (st.lossStreak <= 8) return baseUnit * 3;
-    return baseUnit * 4;
-  }
-  if (strategy === "Post-10 Win Recovery") {
-    return st.p10Active ? baseUnit * Math.pow(2, Math.floor(st.p10Losses / 5)) : baseUnit;
-  }
-  return baseUnit; // Flat
-}
+// ─── STOP-LOSS / GAINS-LOCK support functions — per request, July 25 ───────
+// (The original design here also included a "switch real money between
+// whichever of 6 strategies currently looks best" mechanism. Removed the
+// same day after a real session hit -62.5% ROI despite none of its 6
+// components being worse than -14.5% — switching inherits whichever
+// strategy's bet size happens to be elevated right when it looks best,
+// typically right after an escalating strategy just won and hasn't reset,
+// so real money would switch in right before taking a real loss at that
+// elevated size. Both stop conditions now apply directly to whichever
+// strategy is actually selected — no switching, no inherited state.)
 
 // Reconstructs the ORIGINAL starting bankroll from the first recorded step
 // (step.bankroll = previousBankroll + step.net, so previousBankroll = the
@@ -3466,8 +3428,8 @@ function inferStartingBankroll(history: Step[], fallback: number): number {
 }
 
 // Real-account peak-ROI tracker for the "lock in gains" trigger — walks the
-// ACTUAL bankroll history (not a shadow strategy) and returns the highest
-// ROI reached at any point up to and including right now, before this spin.
+// ACTUAL bankroll history and returns the highest ROI reached at any point
+// up to and including right now, before this spin.
 function computeRealAccountPeakROI(history: Step[], startingBankroll: number, currentBankroll: number): number {
   let peak = (currentBankroll - startingBankroll) / startingBankroll;
   for (const step of history) {
@@ -3475,43 +3437,6 @@ function computeRealAccountPeakROI(history: Step[], startingBankroll: number, cu
     if (roi > peak) peak = roi;
   }
   return peak;
-}
-
-function computeShadowStrategyROIs(history: Step[], baseUnit: number, startingBankroll: number, tableLimit: number, perNumberLimit: number): Record<string, number> {
-  const states: Record<string, ShadowStrategyState> = {};
-  for (const s of AUTO_BASE_STRATEGIES) states[s] = { bankroll: startingBankroll, lossStreak: 0, p10Active: false, p10Losses: 0, p10Normal: 0, p10Armed: false, p10Pending: false };
-
-  for (const step of history) {
-    if (step.result !== "win" && step.result !== "loss") continue; // push/no-bet spins: skip, matches getLossStreak's treatment elsewhere
-    const basketSize = step.unitBet > 0 ? Math.max(1, Math.round(step.exposure / step.unitBet)) : 5;
-    const won = step.result === "win";
-    for (const s of AUTO_BASE_STRATEGIES) {
-      const st = states[s];
-      if (st.p10Pending) { st.p10Pending = false; st.p10Active = true; st.p10Losses = 0; }
-      const rawUnit = unitForBaseStrategy(s, baseUnit, st);
-      const unit = capUnitByLimits(rawUnit, basketSize, tableLimit, perNumberLimit);
-      const exposure = Math.min(unit * basketSize, Math.max(0, st.bankroll));
-      const finalUnit = exposure > 0 ? Math.max(1, Math.floor(exposure / basketSize)) : 0;
-      const finalExposure = finalUnit * basketSize;
-      const net = won ? (35 * finalUnit - (basketSize - 1) * finalUnit) : -finalExposure;
-      st.bankroll += net;
-      st.lossStreak = won ? 0 : st.lossStreak + 1;
-      if (st.p10Active) {
-        if (won) { st.p10Active = false; st.p10Losses = 0; st.p10Normal = 0; st.p10Armed = false; st.p10Pending = false; }
-        else st.p10Losses += 1;
-      } else if (st.p10Armed) {
-        if (won) { st.p10Armed = false; st.p10Pending = true; st.p10Normal = 0; }
-        else st.p10Normal += 1;
-      } else {
-        if (!won) { st.p10Normal += 1; if (st.p10Normal >= 10) st.p10Armed = true; }
-        else st.p10Normal = 0;
-      }
-    }
-  }
-
-  const rois: Record<string, number> = {};
-  for (const s of AUTO_BASE_STRATEGIES) rois[s] = (states[s].bankroll - startingBankroll) / startingBankroll;
-  return rois;
 }
 
 function getUnitBet(
@@ -3547,29 +3472,6 @@ function getUnitBet(
     rawUnit = Math.max(1, Math.floor(maxExposure / Math.max(1, executionBasketSize)));
   } else if (strategy === "Progressive Gap" || strategy === "Progressive Confidence") {
     rawUnit = baseUnit * getProgressiveGapMultiplier(decision);
-  } else if (strategy === "Auto (Best of 6)") {
-    const startingBankroll = inferStartingBankroll(history, bankroll);
-    const rois = computeShadowStrategyROIs(history, baseUnit, startingBankroll, tableLimit, perNumberLimit);
-    let bestName: Strategy = AUTO_BASE_STRATEGIES[0];
-    let bestRoi = -Infinity;
-    for (const s of AUTO_BASE_STRATEGIES) { if (rois[s] > bestRoi) { bestRoi = rois[s]; bestName = s; } }
-    // Replay the BEST strategy's own internal state (loss streak / Post-10
-    // state) to get its current sizing — reuses the same replay, just keyed
-    // to whichever name won this time.
-    const states: Record<string, ShadowStrategyState> = {};
-    for (const s of AUTO_BASE_STRATEGIES) states[s] = { bankroll: startingBankroll, lossStreak: 0, p10Active: false, p10Losses: 0, p10Normal: 0, p10Armed: false, p10Pending: false };
-    for (const step of history) {
-      if (step.result !== "win" && step.result !== "loss") continue;
-      const basketSize = step.unitBet > 0 ? Math.max(1, Math.round(step.exposure / step.unitBet)) : 5;
-      const won = step.result === "win";
-      const st = states[bestName];
-      if (st.p10Pending) { st.p10Pending = false; st.p10Active = true; st.p10Losses = 0; }
-      st.lossStreak = won ? 0 : st.lossStreak + 1;
-      if (st.p10Active) { if (won) { st.p10Active = false; st.p10Losses = 0; } else st.p10Losses += 1; }
-      else if (st.p10Armed) { if (won) { st.p10Armed = false; st.p10Pending = true; st.p10Normal = 0; } else st.p10Normal += 1; }
-      else { if (!won) { st.p10Normal += 1; if (st.p10Normal >= 10) st.p10Armed = true; } else st.p10Normal = 0; }
-    }
-    rawUnit = unitForBaseStrategy(bestName, baseUnit, states[bestName]);
   } else if (strategy === "ROI-Trend Adaptive") {
     // Per request (July 25): scale bet size by ROI trend rather than loss
     // streak. Backtested against a plain Flat baseline (57 pooled sessions):
@@ -3896,7 +3798,7 @@ function shouldBet(strategy: Strategy, confidence: number, pulseEnabled: boolean
   }
 }
 
-function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false): Step {
+function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD): Step {
   const rawDecision = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
   const f = normalizeObserveTierForSettings(rawDecision, tierExecution, history);
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
@@ -3904,36 +3806,44 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   // NOTE: this function is shared by the real live bet AND every hypothetical
   // comparison replay (runComparisonStrategyReplay, runComboShadowStrategy,
   // runStrategy) — it must stay neutral and use `strategy` exactly as passed
-  // in. The "Auto (Best of 6) whenever Pulse is on" override belongs ONLY at
-  // the genuine live-betting call sites (addSpin, runAuto, mergeSelected),
-  // which compute it themselves before calling this function. Putting the
-  // override in here directly (an earlier version of this fix) silently
-  // hijacked every comparison-strategy row whenever Pulse was on, since those
-  // replays pass the live pulseEnabled value straight through — that's what
-  // caused all 7 Strategy Comparison rows to show identical numbers.
+  // in, with no override here. See the two stop conditions below for why.
   const effectiveStrategy: Strategy = strategy;
 
-  // Auto (Best of 6) stop conditions: once triggered, stays triggered for
-  // the rest of the session — checked BEFORE deciding whether to bet this
-  // spin. Two independent triggers, either one ends the session:
-  //   1. All 6 base strategies simultaneously below -25% ROI (loss-side).
-  //   2. The REAL account's own ROI has given back 20 flat percentage-points
-  //      off its own peak, regardless of how high that peak was (gain-side —
-  //      "lock in gains" rather than let a real profit erode back to zero).
+  // ─── STOP CONDITIONS — applied directly to THIS account, no switching ────
+  // Per request (July 25, revised same day): the original "Auto (Best of 6)"
+  // design switched real money between whichever of 6 strategies currently
+  // looked best. That backfired badly in testing — a real session hit -62.5%
+  // ROI even though none of its 6 individual components were worse than
+  // -14.5%. The cause: switching inherits whichever strategy's bet size
+  // happens to be elevated right when it looks best — which is typically
+  // right after an escalating strategy (Martingale) just won and hasn't
+  // reset yet. Real money would switch in at that exact moment, then take a
+  // real loss at the escalated size on the very next spin — repeatedly,
+  // compounding into losses worse than any single fixed strategy would ever
+  // produce on its own.
+  //
+  // Fixed by removing the switching entirely: whichever strategy is actually
+  // selected (Flat, Martingale N, etc. — no override, no inheritance) just
+  // runs normally, exactly as it always has. Both stop conditions now watch
+  // THAT SAME real account directly, and apply automatically whenever Pulse
+  // is on, regardless of which strategy is running:
+  //   1. This account's own ROI is below -25% (loss-side).
+  //   2. This account's ROI has given back 30% OF its own peak (gain-side —
+  //      "lock in gains"), scaling down with the peak automatically so even
+  //      a modest gain gets proportionally protected.
   const alreadyEnded = history.at(-1)?.sessionEnded ?? false;
   let autoStopTriggered = alreadyEnded;
   let autoStopReason: "loss-floor" | "giveback" | null = null;
-  if (effectiveStrategy === "Auto (Best of 6)" && !alreadyEnded) {
+  if (pulseEnabled && !alreadyEnded) {
     const inferredStart = inferStartingBankroll(history, startingBankroll);
-    const rois = computeShadowStrategyROIs(history, baseUnit, inferredStart, tableLimit, perNumberLimit);
-    const allBelowFloor = AUTO_BASE_STRATEGIES.every((s) => rois[s] < AUTO_STOP_ROI_THRESHOLD);
+    const curRoi = (bankroll - inferredStart) / inferredStart;
+    const belowLossFloor = curRoi < stopLossThreshold;
 
     const peakRoi = computeRealAccountPeakROI(history, inferredStart, bankroll);
-    const curRoi = (bankroll - inferredStart) / inferredStart;
-    const gaveBackTooMuch = peakRoi > 0 && (peakRoi - curRoi) >= AUTO_GIVEBACK_THRESHOLD;
+    const gaveBackTooMuch = peakRoi > 0 && curRoi <= peakRoi * (1 - givebackThreshold);
 
-    autoStopTriggered = allBelowFloor || gaveBackTooMuch;
-    autoStopReason = allBelowFloor ? "loss-floor" : gaveBackTooMuch ? "giveback" : null;
+    autoStopTriggered = belowLossFloor || gaveBackTooMuch;
+    autoStopReason = belowLossFloor ? "loss-floor" : gaveBackTooMuch ? "giveback" : null;
   }
 
   const pulseExecutionRouter = getPulseExecutionRouterDecision(pulseEnabled, executionMode, f, history);
@@ -4020,7 +3930,7 @@ const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && 
       ? (alreadyEnded
           ? "Session ended — stop condition already triggered"
           : autoStopReason === "giveback"
-          ? "SESSION ENDED — ROI gave back 20 points from its peak (locking in the gain)"
+          ? "SESSION ENDED — ROI gave back 30% of its peak (locking in the gain)"
           : "SESSION ENDED — all 6 base strategies fell below -25% ROI")
       : active
       ? `${effectiveStrategy === "Post-10 Win Recovery" ? `${getPost10WinRecoveryNote(history)} · ` : ""}${f.source} ${f.group} · ${f.source === "PULSE" && (f as any).dimensionTDA?.compressed ? "2D Compression · " : ""}${f.source === "PULSE" ? `${f.confidence}% · ` : ""}${routedExecutionMode}${pulseExecutionRouter.active ? " · Pulse Router" : ""}${overlayHit ? " · Wheel Overlay Hit" : ""}${hasStreamConflict(f.group, routedExecutionMode, f.source, f) ? " · Stream Conflict" : ""}`
@@ -4345,9 +4255,9 @@ function runShadowStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: 
   return rows;
 }
 
-function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false) {
+function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD) {
   const rows: Step[] = [];
-  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled)));
+  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)));
   return rows;
 }
 
@@ -4361,7 +4271,9 @@ function runComboShadowStrategy(
   executionMode: ExecutionMode = "Stream Direct",
   tableLimit = DEFAULT_TABLE_LIMIT,
   perNumberLimit = DEFAULT_PER_NUMBER_LIMIT,
-  tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION
+  tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION,
+  stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD,
+  givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD
 ) {
   const rows: Step[] = [];
   outcomes.forEach((outcome) => {
@@ -4380,14 +4292,16 @@ function runComboShadowStrategy(
         perNumberLimit,
         tierExecution,
         combo === "PULSE_MARKOV",
-        combo === "PULSE_RANDOM"
+        combo === "PULSE_RANDOM",
+        stopLossThreshold,
+        givebackThreshold
       )
     );
   });
   return rows;
 }
 
-function runComparisonStrategyReplay(outcomes: SpinValue[], comparisonStrategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false) {
+function runComparisonStrategyReplay(outcomes: SpinValue[], comparisonStrategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD) {
   // LOCKED COMPARISON STABILITY
   // This intentionally creates a fresh Step[] for every strategy row.
   // Only the raw spin outcomes are shared. Bankroll, loss streak, unit size,
@@ -4410,7 +4324,9 @@ function runComparisonStrategyReplay(outcomes: SpinValue[], comparisonStrategy: 
         perNumberLimit,
         tierExecution,
         markovEnabled,
-        randomEnabled
+        randomEnabled,
+        stopLossThreshold,
+        givebackThreshold
       )
     );
   });
@@ -4429,6 +4345,8 @@ export default function Page() {
   const [perNumberLimit, setPerNumberLimit] = useState(DEFAULT_PER_NUMBER_LIMIT);
   const [autoSpins, setAutoSpins] = useState(DEFAULT_AUTO_SPINS);
   const [strategy, setStrategy] = useState<Strategy>(DEFAULT_STRATEGY);
+  const [stopLossThreshold, setStopLossThreshold] = useState<number>(DEFAULT_STOP_LOSS_THRESHOLD);
+  const [givebackThreshold, setGivebackThreshold] = useState<number>(DEFAULT_GIVEBACK_THRESHOLD);
   const [pulseEnabled, setPulseEnabled] = useState(false);
   const [bbMode, setBbMode] = useState<BBMode>("Straight");
   const [bbStraightEnabled, setBbStraightEnabled] = useState(false);
@@ -4590,9 +4508,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     }
   }, []);
 
-  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, pulseEnabled ? "Auto (Best of 6)" : strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled)]);
+  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)]);
   const rebuild = (start = startingBankroll, unit = baseUnit, nextStrategy = strategy, nextPulse = pulseEnabled) => {
-    setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled));
+    setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold));
   };
 
   const applyPulseMode = () => {
@@ -4615,7 +4533,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           perNumberLimit,
           tierExecution,
           markovEnabled,
-          randomEnabled
+          randomEnabled,
+          stopLossThreshold,
+          givebackThreshold
         )
       );
     }
@@ -4630,7 +4550,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, nextStraight, nextInverted, executionMode, tableLimit, perNumberLimit, tierExecution, false, false));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, nextStraight, nextInverted, executionMode, tableLimit, perNumberLimit, tierExecution, false, false, stopLossThreshold, givebackThreshold));
     }
   };
 
@@ -4642,7 +4562,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, true, false));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, true, false, stopLossThreshold, givebackThreshold));
     }
   };
 
@@ -4654,7 +4574,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, true));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, true, stopLossThreshold, givebackThreshold));
     }
   };
   const applyExecutionMode = (nextMode: ExecutionMode) => {
@@ -4676,7 +4596,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           perNumberLimit,
           tierExecution,
           markovEnabled,
-          randomEnabled
+          randomEnabled,
+          stopLossThreshold,
+          givebackThreshold
         )
       );
     }
@@ -4686,15 +4608,14 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     setAutoRunning(true);
     window.setTimeout(() => {
       const rows: Step[] = [];
-      const liveStrategy: Strategy = pulseEnabled ? "Auto (Best of 6)" : strategy;
       for (let i = 0; i < autoSpins; i += 1) {
         const priorRows = [...rows];
-        const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, liveStrategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled);
+        const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold);
         const autoRunAudit = buildAutoRunAuditEntry(priorRows, settled);
         rows.push({ ...settled, autoRun: true, autoRunAudit });
-        // "Auto (Best of 6)" stop-loss: end the session outright once all 6
-        // base strategies are simultaneously below -25% ROI, rather than
-        // running out the rest of autoSpins with no further betting.
+        // Stop conditions (loss floor / gains giveback) end the session
+        // outright once triggered, rather than running out the rest of
+        // autoSpins with no further betting.
         if (settled.sessionEnded) break;
       }
       setHistory(rows);
@@ -4763,8 +4684,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const mergeSelected = () => {
     const sessions = savedSessions.filter((s) => selectedMerge.includes(s.name));
     let rows: Step[] = [];
-    const liveStrategy: Strategy = pulseEnabled ? "Auto (Best of 6)" : strategy;
-    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, liveStrategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled))));
+    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold))));
     setHistory(rows);
   };
 
@@ -5586,7 +5506,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         perNumberLimit,
         tierExecution,
         markovEnabled,
-        randomEnabled
+        randomEnabled,
+        stopLossThreshold,
+        givebackThreshold
       );
       const end = rows.at(-1)?.bankroll ?? startingBankroll;
       const w = rows.filter((r) => r.result === "win").length;
@@ -5603,6 +5525,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       const grossLosses = Math.abs(rows.filter((r) => r.net < 0).reduce((sum, r) => sum + r.net, 0));
       const profitFactor = grossLosses > 0 ? (grossWins / grossLosses).toFixed(2) : grossWins > 0 ? "∞" : "0.00";
       const largest = rows.reduce((m, r) => Math.max(m, r.unitBet), 0);
+      const stopped = rows.at(-1)?.sessionEnded ?? false;
       return {
         strategy: comparisonStrategy,
         end,
@@ -5612,9 +5535,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         largest,
         maxDrawdown,
         profitFactor,
+        stopped,
       };
     });
-  }, [rawOutcomes, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled]);
+  }, [rawOutcomes, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold]);
 
 
   const pulseShadowRows = useMemo(
@@ -6275,10 +6199,11 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 12, color: t.text, tableLayout: "fixed" }}>
           <thead>
             <tr style={{ textAlign: "left", borderBottom: `1px solid ${t.border}` }}>
-              <th style={{ paddingBottom: 7, width: "42%" }}>Strategy</th>
-              <th style={{ paddingBottom: 7, textAlign: "center", width: "22%" }}>End</th>
-              <th style={{ paddingBottom: 7, textAlign: "center", width: "18%" }}>ROI</th>
-              <th style={{ paddingBottom: 7, textAlign: "center", width: "18%" }}>PF</th>
+              <th style={{ paddingBottom: 7, width: "36%" }}>Strategy</th>
+              <th style={{ paddingBottom: 7, textAlign: "center", width: "18%" }}>End</th>
+              <th style={{ paddingBottom: 7, textAlign: "center", width: "16%" }}>ROI</th>
+              <th style={{ paddingBottom: 7, textAlign: "center", width: "14%" }}>PF</th>
+              <th style={{ paddingBottom: 7, textAlign: "center", width: "16%" }}>Stopped</th>
             </tr>
           </thead>
           <tbody>
@@ -6287,6 +6212,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
               <td style={{ textAlign: "center", fontWeight: 850 }}>{row.end.toLocaleString()}</td>
               <td style={{ textAlign: "center", fontWeight: 950, color: roiColor(row.roi) }}>{row.roi}%</td>
               <td style={{ textAlign: "center", fontWeight: 950, color: row.profitFactor === "0.00" ? t.subtext : COLORS.cyan }}>{row.profitFactor}</td>
+              <td style={{ textAlign: "center", fontWeight: 900, color: row.stopped ? COLORS.red : t.subtext }}>{row.stopped ? "Yes" : "—"}</td>
             </tr>)}
           </tbody>
         </table>
@@ -6308,6 +6234,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
             <th style={{ textAlign: "center" }}>Largest</th>
             <th style={{ textAlign: "center" }}>Max DD</th>
             <th style={{ textAlign: "center" }}>PF</th>
+            <th style={{ textAlign: "center" }}>Stopped</th>
           </tr>
         </thead>
         <tbody>
@@ -6320,6 +6247,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
             <td style={{ textAlign: "center" }}>{row.largest}</td>
             <td style={{ textAlign: "center" }}>{row.maxDrawdown.toLocaleString()}</td>
             <td style={{ textAlign: "center", color: row.profitFactor === "0.00" ? t.subtext : COLORS.cyan, fontWeight: 900 }}>{row.profitFactor}</td>
+            <td style={{ textAlign: "center", fontWeight: 900, color: row.stopped ? COLORS.red : t.subtext }}>{row.stopped ? "Yes" : "—"}</td>
           </tr>)}
         </tbody>
       </table>
@@ -7126,7 +7054,7 @@ const StreakAnalyticsPanel = () => {
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Arial, sans-serif", display: "grid", gridTemplateColumns: "82px 1fr" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
-    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, randomEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe Hold OFF.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
+    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default -25 — enter as a negative number.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Gains Giveback (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 30 — e.g. a +10% peak triggers at +7%.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe Hold OFF.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
     {showGlossary ? <div
       style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.72)", zIndex: 9998, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={() => setShowGlossary(false)}
