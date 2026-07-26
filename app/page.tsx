@@ -113,6 +113,7 @@ type Step = {
     pauseReason?: string | null;
     currentEngineTrend?: number | null;
     inConfirmedUptrend?: Record<string, boolean>;
+    usingFallback?: boolean;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -2770,6 +2771,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     };
 
     const inConfirmedUptrend: Record<string, boolean> = { Straight: false, Inverted: false, Markov: false, Random: false };
+    const hasEverConfirmedUptrend: Record<string, boolean> = { Straight: false, Inverted: false, Markov: false, Random: false };
     for (const engine of ENGINE_ORDER) {
       const path = enginePaths[engine];
       if (!path.length) continue;
@@ -2779,13 +2781,39 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         if (confirmIdx >= 0 && isFractalHigh(path, confirmIdx)) {
           confirmedPeak = path[confirmIdx];
         }
+        if (confirmedPeak !== null && path[i] > confirmedPeak) {
+          hasEverConfirmedUptrend[engine] = true;
+        }
       }
       const currentScore = path[path.length - 1];
       inConfirmedUptrend[engine] = confirmedPeak !== null && currentScore > confirmedPeak;
     }
 
+    // ─── HYBRID FALLBACK (per request, July 26) ──────────────────────────────
+    // The trend-confirmation requirement (peak forms, then score breaks back
+    // above it) genuinely takes real time — backtested first (47 pooled
+    // sessions): loosening the fractal window from 2 points to 1 only saved
+    // ~2.7 spins on average (17.5 → 14.8), so the wait isn't primarily about
+    // how strict the peak-confirmation window is; it's that a genuine
+    // reversal-and-new-high just takes real spins to happen, however it's
+    // measured. Rather than loosen what counts as a real trend (which would
+    // make the signal noisier without fixing much), this keeps the trend
+    // logic exactly as rigorous as before, but only requires it ONCE some
+    // engine has actually confirmed a real uptrend for the first time this
+    // session. Before that point — since nobody has a track record for the
+    // gate to apply to yet — Pulse falls back to the original highest-score
+    // selection, so the early spins are productive instead of empty. Once
+    // any engine confirms its first real uptrend, the strict "pause until
+    // someone's confirmed" rule (explicitly chosen earlier) takes over for
+    // the rest of the session, permanently — this fallback only ever
+    // applies once, at the very start.
+    const anyEngineEverConfirmed = ENGINE_ORDER.some((e) => hasEverConfirmedUptrend[e]);
+
     const stillWaitingForUniformStart = history.length < UNIFORM_START_SPINS;
-    const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1 && inConfirmedUptrend[e]);
+    const trendEligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1 && inConfirmedUptrend[e]);
+    const fallbackEligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
+    const usingFallback = !anyEngineEverConfirmed && trendEligible.length === 0;
+    const eligible = usingFallback ? fallbackEligible : trendEligible;
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
@@ -2804,7 +2832,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const pauseReason: string | null = stillWaitingForUniformStart
       ? `Waiting for uniform start — all four engines begin competing together at spin ${UNIFORM_START_SPINS + 1} (have ${history.length})`
       : eligible.length === 0
-      ? "No engine is currently in a confirmed uptrend (broken above its own last peak) — waiting for one to reverse"
+      ? "No engine is currently in a confirmed uptrend, and at least one already has confirmed one earlier this session — waiting for one to reverse again"
       : null;
 
     // Get prediction from selected engine
@@ -2851,6 +2879,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pauseReason,
       currentEngineTrend: null as number | null, // swing-low mechanism removed July 25; field kept for type compatibility
       inConfirmedUptrend, // per-engine trend state (July 26 redesign) — which engines are currently eligible (broke above their own last confirmed peak)
+      usingFallback, // true only during the one-time early window before any engine has ever confirmed an uptrend this session
     };
 
     return {
@@ -2860,7 +2889,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pulseEngineTracker: tracker,
       reason: isPaused
         ? `Pulse · PAUSED — ${pauseReason}`
-        : `Pulse · ${selectedEngine} selected (confirmed uptrend, score=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"}) · trend state: ${ENGINE_ORDER.map((e) => `${e}:${inConfirmedUptrend[e] ? "up" : "not-up"}(${cumulativeAdvantage[e].toFixed(2)})`).join(" · ")}`,
+        : `Pulse · ${selectedEngine} selected (${usingFallback ? "highest-score fallback — no engine has confirmed an uptrend yet this session" : "confirmed uptrend"}, score=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"}) · trend state: ${ENGINE_ORDER.map((e) => `${e}:${inConfirmedUptrend[e] ? "up" : "not-up"}(${cumulativeAdvantage[e].toFixed(2)})`).join(" · ")}`,
     };
   }
 
@@ -3185,7 +3214,14 @@ function shouldExecuteTier(tier: string, source: string, settings: TierExecution
     tier === "No Prediction";
 
   if (isObserveTier) return settings.executeObservation === true ? false : true;
-  if (tier === "Active · Caution") return settings.executeWeak;
+  // Per request (July 26): the "Weak" toggle that used to gate this was
+  // removed from Settings, but shouldExecuteTier was still checking
+  // settings.executeWeak — meaning anyone whose saved settings had it
+  // toggled off (or would ever load as false) would have "Active · Caution"
+  // forecasts silently blocked forever, with no UI left to fix it. Since
+  // Weak is gone and its default was always ON, Active · Caution now always
+  // executes, same as Strong/Controlled.
+  if (tier === "Active · Caution") return true;
 
   return true;
 }
@@ -5509,7 +5545,10 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const downloadAxisFailureCSV = () => downloadRowsAsCSV(rowsForAxisFailureExport(), "edgelab_axis_failure_analysis.csv");
 
   const comparison = useMemo(() => {
-    return STRATEGIES.map((comparisonStrategy) => {
+    // Per request (July 26): ROI-Trend Adaptive removed from the Comparison
+    // panel display specifically — it's still a selectable live Strategy in
+    // the dropdown, just no longer shown as a row here.
+    return STRATEGIES.filter((s) => s !== "ROI-Trend Adaptive").map((comparisonStrategy) => {
       const rows = runComparisonStrategyReplay(
         rawOutcomes,
         comparisonStrategy,
@@ -6962,7 +7001,7 @@ const StreakAnalyticsPanel = () => {
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Arial, sans-serif", display: "grid", gridTemplateColumns: "82px 1fr" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
-    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default -25 — enter as a negative number.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Trail-Stop (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 30 — e.g. a +40% peak triggers at +28%; the gap grows as the peak grows. Only ratchets up on new peaks, never down.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe Hold OFF.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
+    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default -25 — enter as a negative number.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Trail-Stop (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 30 — e.g. a +40% peak triggers at +28%; the gap grows as the peak grows. Only ratchets up on new peaks, never down.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Observe Hold OFF. (Weak removed — confirmed dead for Pulse, since Pulse force-overrides tier to Active Confirmed for whichever engine it selects; only applied to manual mode anyway.)</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
     {showGlossary ? <div
       style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.72)", zIndex: 9998, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={() => setShowGlossary(false)}
