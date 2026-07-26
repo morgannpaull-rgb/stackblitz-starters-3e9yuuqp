@@ -95,6 +95,9 @@ type Step = {
   pulseAudit?: PulseAudit;
   pulseDivergence?: PulseDivergenceResult;
   pulseSelectedEngine?: string | null;
+  // Whether this spin's selected engine hit severe (halt-level) divergence
+  // from its own established win rate.
+  pulseDivergenceHalt?: boolean;
   // Full Pulse engine-tracker snapshot (all 4 rolling win rates + switch info),
   // not just the selected engine name — needed for the Pulse switch log.
   pulseEngineTracker?: {
@@ -117,6 +120,13 @@ type Step = {
     // They remain eligible again automatically once no longer this far
     // below their own peak — no separate "resume" state is stored.
     deceleratingEngines?: string[];
+    // Engine-divergence watch (z-score of last-10-spins win rate vs. each
+    // engine's own established baseline rate). Per engine, null until enough
+    // history exists to compute it (10 baseline + 10-spin window).
+    divergenceZ?: Record<string, number | null>;
+    // Whether the currently-selected engine's forecast group was flipped to
+    // its complement this spin because it hit moderate divergence.
+    axisFlipped?: boolean;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -544,6 +554,16 @@ const GROUPS: Record<GroupKey, SpinValue[]> = {
   RHO: [19, 21, 23, 25, 27],
   RLE: [12, 14, 16, 18],
   RLO: [1, 3, 5, 7, 9],
+};
+
+// Opposite group across all three axes (color, range, parity flipped) — used
+// by the engine-divergence "flip axis direction" response below. BHE (Black/
+// High/Even) <-> RLO (Red/Low/Odd), etc.
+const GROUP_COMPLEMENT: Record<GroupKey, GroupKey> = {
+  BHE: "RLO", RLO: "BHE",
+  BHO: "RLE", RLE: "BHO",
+  BLE: "RHO", RHO: "BLE",
+  BLO: "RHE", RHE: "BLO",
 };
 
 const WHEEL_NEIGHBORS: Partial<Record<GroupKey, SpinValue[]>> = {
@@ -2746,9 +2766,34 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // Trail-Stop guards on peakRoi > 0: percent-of-peak is meaningless (and
     // can misfire backwards) once the peak itself is at or below zero.
     const ENGINE_DECELERATION_PAUSE_PCT = 0.20;
+    // Per request (July 26): watch each engine's actual outcomes for a sharp
+    // deviation from ITS OWN established win rate — not the theoretical
+    // breakeven, and not another engine's rate. Method chosen after
+    // comparing two candidates on real session data: a fixed rolling-window
+    // gap (too noisy/twitchy) and this one — a proper z-score of the last
+    // DIVERGENCE_WINDOW spins against a baseline win rate built from
+    // everything before that window, which accounts for sample size instead
+    // of just eyeballing a gap. Two severity tiers, matching the "flip vs.
+    // halt depending on severity" design:
+    //   - moderate (z <= MODERATE): flip that engine's forecast to its axis
+    //     complement for this spin only — it can flip back the moment the
+    //     z-score recovers above the moderate line (recomputed fresh from
+    //     history every spin, no separate "resume" state to track).
+    //   - severe (z <= SEVERE): treat as a session-ending halt, same
+    //     permanence as the account-level Stop-Loss/Trail-Stop — see
+    //     settleSpin, which folds this into autoStopTriggered.
+    // NOTE: only the engine Pulse would actually bet through this spin is
+    // checked/acted on — the other three engines' divergence is tracked for
+    // display only (see divergenceZ in the tracker) since they aren't riding
+    // real money this spin regardless of their own state.
+    const DIVERGENCE_WINDOW = 10;
+    const DIVERGENCE_MIN_BASELINE = 10;
+    const DIVERGENCE_MODERATE_Z = -2.0;
+    const DIVERGENCE_SEVERE_Z = -3.0;
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const enginePeakScore: Record<string, number> = { Straight: -Infinity, Inverted: -Infinity, Markov: -Infinity, Random: -Infinity };
+    const engineOutcomeSequence: Record<string, number[]> = { Straight: [], Inverted: [], Markov: [], Random: [] };
     for (let i = 0; i < history.length; i++) {
       if (i < UNIFORM_START_SPINS) continue; // don't evaluate anyone's predictions for the first 3 spins — all four start together
       const step = history[i];
@@ -2762,8 +2807,32 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         cumulativeAdvantage[engine] += (outcome - getBreakevenRate(predicted));
         evaluatedCount[engine] += 1;
         if (cumulativeAdvantage[engine] > enginePeakScore[engine]) enginePeakScore[engine] = cumulativeAdvantage[engine];
+        engineOutcomeSequence[engine].push(outcome);
       }
     }
+
+    // z-score of the most recent DIVERGENCE_WINDOW spins vs. the win rate
+    // established over everything before that window. Null (not enough
+    // data) until baseline has DIVERGENCE_MIN_BASELINE spins AND the recent
+    // window is full — a partial window would understate real variance.
+    const computeDivergenceZ = (seq: number[]): number | null => {
+      const recentStart = seq.length - DIVERGENCE_WINDOW;
+      if (recentStart < DIVERGENCE_MIN_BASELINE) return null;
+      const baseline = seq.slice(0, recentStart);
+      const pEst = baseline.reduce((a, b) => a + b, 0) / baseline.length;
+      const recent = seq.slice(recentStart);
+      const k = recent.reduce((a, b) => a + b, 0);
+      const nr = recent.length;
+      const variance = nr * pEst * (1 - pEst);
+      if (!(variance > 0)) return null;
+      return (k - nr * pEst) / Math.sqrt(variance);
+    };
+    const divergenceZ: Record<string, number | null> = {
+      Straight: computeDivergenceZ(engineOutcomeSequence.Straight),
+      Inverted: computeDivergenceZ(engineOutcomeSequence.Inverted),
+      Markov: computeDivergenceZ(engineOutcomeSequence.Markov),
+      Random: computeDivergenceZ(engineOutcomeSequence.Random),
+    };
 
     const stillWaitingForUniformStart = history.length < UNIFORM_START_SPINS;
     const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
@@ -2831,6 +2900,26 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       engineForecast = { ...random, tier: "Active · Confirmed" };
     }
 
+    // Only the engine actually driving this spin's bet gets acted on — the
+    // other three engines' divergenceZ is diagnostic-only (see tracker).
+    const selectedZ = isPaused ? null : divergenceZ[selectedEngine];
+    const divergenceSeverity: "none" | "moderate" | "severe" =
+      selectedZ === null ? "none" : selectedZ <= DIVERGENCE_SEVERE_Z ? "severe" : selectedZ <= DIVERGENCE_MODERATE_Z ? "moderate" : "none";
+    const axisFlipped = divergenceSeverity === "moderate" && !!engineForecast.group;
+    if (axisFlipped) {
+      const flippedGroup = GROUP_COMPLEMENT[engineForecast.group as GroupKey];
+      engineForecast = {
+        ...engineForecast,
+        group: flippedGroup,
+        numbers: GROUPS[flippedGroup],
+        reason: `${engineForecast.reason ?? ""} · Axis flipped (${selectedEngine} diverging, z=${selectedZ?.toFixed(2)})`,
+      };
+    }
+    const divergenceHalt = divergenceSeverity === "severe";
+    const divergenceHaltReason = divergenceHalt
+      ? `${selectedEngine}'s actual outcomes diverged sharply from its own established win rate (z=${selectedZ?.toFixed(2)}, threshold ${DIVERGENCE_SEVERE_Z})`
+      : null;
+
     const tracker = {
       selectedEngine,
       isWarming: false,
@@ -2848,6 +2937,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pauseReason,
       currentEngineTrend: null as number | null, // swing-low mechanism removed July 25; field kept for type compatibility
       deceleratingEngines,
+      divergenceZ,
+      axisFlipped,
     };
 
     return {
@@ -2855,9 +2946,11 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       source: "PULSE" as const,
       mode,
       pulseEngineTracker: tracker,
+      divergenceHalt,
+      divergenceHaltReason,
       reason: isPaused
         ? `Pulse · PAUSED — ${pauseReason}`
-        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}${deceleratingEngines.length ? ` · cooling down: ${deceleratingEngines.join(", ")}` : ""}`,
+        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}${deceleratingEngines.length ? ` · cooling down: ${deceleratingEngines.join(", ")}` : ""}${axisFlipped ? ` · AXIS FLIPPED (${selectedEngine} z=${selectedZ?.toFixed(2)})` : ""}${divergenceHalt ? ` · DIVERGENCE HALT (${selectedEngine} z=${selectedZ?.toFixed(2)})` : ""}`,
     };
   }
 
@@ -3824,7 +3917,7 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   // flag from the Pulse-driven portion of history is simply ignored.
   const alreadyEnded = pulseEnabled && (history.at(-1)?.sessionEnded ?? false);
   let autoStopTriggered = alreadyEnded;
-  let autoStopReason: "loss-floor" | "trail-stop" | null = null;
+  let autoStopReason: "loss-floor" | "trail-stop" | "engine-divergence" | null = null;
   if (pulseEnabled && !alreadyEnded) {
     const inferredStart = inferStartingBankroll(history, startingBankroll);
     const curRoi = (bankroll - inferredStart) / inferredStart;
@@ -3845,8 +3938,18 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
     // do, so it's special-cased here instead of left to the literal math.
     const trailStopHit = givebackThreshold > 0 && peakRoi > 0 && curRoi <= peakRoi * (1 - givebackThreshold);
 
-    autoStopTriggered = belowLossFloor || trailStopHit;
-    autoStopReason = belowLossFloor ? "loss-floor" : trailStopHit ? "trail-stop" : null;
+    // Engine-divergence halt (per request July 26): if the engine actually
+    // driving this spin's bet has diverged severely from its own established
+    // win rate (see getActiveDecisionCore/divergenceHalt), treat it as
+    // permanent for the rest of the session — same semantics as the other
+    // two stop conditions. NOTE: since this reuses the same shared
+    // settleSpin function as the six comparison-table replays, it applies
+    // independently inside each of those replays too whenever Pulse is on —
+    // same caveat that already applies to stopLossThreshold/givebackThreshold.
+    const engineDivergenceHalt = (f as any).divergenceHalt === true;
+
+    autoStopTriggered = belowLossFloor || trailStopHit || engineDivergenceHalt;
+    autoStopReason = belowLossFloor ? "loss-floor" : trailStopHit ? "trail-stop" : engineDivergenceHalt ? "engine-divergence" : null;
   }
 
   const pulseExecutionRouter = getPulseExecutionRouterDecision(pulseEnabled, executionMode, f, history);
@@ -3934,6 +4037,8 @@ const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && 
           ? "Session ended — stop condition already triggered"
           : autoStopReason === "trail-stop"
           ? `SESSION ENDED — Trail-Stop hit (ROI gave back ${Math.round(givebackThreshold * 100)}% of its peak, locking in the gain)`
+          : autoStopReason === "engine-divergence"
+          ? `SESSION ENDED — ${(f as any).divergenceHaltReason ?? "engine diverged sharply from its own established win rate"}`
           : `SESSION ENDED — ROI fell below the ${Math.round(stopLossThreshold * 100)}% stop-loss`)
       : active
       ? `${effectiveStrategy === "Post-10 Win Recovery" ? `${getPost10WinRecoveryNote(history)} · ` : ""}${f.source} ${f.group} · ${f.source === "PULSE" && (f as any).dimensionTDA?.compressed ? "2D Compression · " : ""}${f.source === "PULSE" ? `${f.confidence}% · ` : ""}${routedExecutionMode}${pulseExecutionRouter.active ? " · Pulse Router" : ""}${overlayHit ? " · Wheel Overlay Hit" : ""}${hasStreamConflict(f.group, routedExecutionMode, f.source, f) ? " · Stream Conflict" : ""}`
@@ -3956,6 +4061,7 @@ const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && 
     pulseAudit: buildPulseAuditRecord(f, lockedOutcomeGroup, lockedForecastGroup, result, active),
     pulseDivergence: (f as any).pulseDivergence ?? null,
     pulseSelectedEngine: (f as any).pulseEngineTracker?.selectedEngine ?? null,
+    pulseDivergenceHalt: (f as any).divergenceHalt === true,
     pulseEngineTracker: (f as any).pulseEngineTracker ?? null,
     allEngineDiagnostics: (f as any).allEngineDiagnostics ?? null,
     // Snapshot of engine config at time of spin
@@ -5847,6 +5953,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const scores: Record<string, number> = tracker?.challengerZScores ?? {};
     const selectedEngineName: string | null = tracker?.selectedEngine ?? null;
     const deceleratingEngines: string[] = tracker?.deceleratingEngines ?? [];
+    const divergenceZByEngine: Record<string, number | null> = tracker?.divergenceZ ?? {};
+    const axisFlipped: boolean = tracker?.axisFlipped ?? false;
 
     return (
       <CollapsiblePanel id="engineDirection" title="Engine Direction">
@@ -5859,13 +5967,17 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
             const score = scores[engineKey];
             const isSelected = selectedEngineName === engineKey;
             const isCoolingDown = deceleratingEngines.includes(engineKey);
+            const z = divergenceZByEngine[engineKey];
+            const isDiverging = typeof z === "number" && z <= -2.0;
             return (
               <div key={eng.key} style={{ border: `1px solid ${isSelected ? COLORS.cyan + "55" : t.border}`, borderRadius: 14, padding: 16, background: isSelected ? `${COLORS.cyan}08` : t.panel2 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10, flexWrap: "wrap" }}>
                     <div style={{ fontSize: 16, fontWeight: 950, color: isSelected ? COLORS.cyan : t.text }}>{eng.label}</div>
                     {isSelected && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.cyan, background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px" }}>ACTIVE</div>}
                     {isCoolingDown && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.amber, background: `${COLORS.amber}18`, border: `1px solid ${COLORS.amber}44`, borderRadius: 6, padding: "2px 8px" }}>COOLING DOWN</div>}
+                    {isDiverging && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.red, background: `${COLORS.red}18`, border: `1px solid ${COLORS.red}44`, borderRadius: 6, padding: "2px 8px" }}>DIVERGING z={z!.toFixed(2)}</div>}
+                    {isSelected && axisFlipped && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.red, background: `${COLORS.red}18`, border: `1px solid ${COLORS.red}44`, borderRadius: 6, padding: "2px 8px" }}>AXIS FLIPPED</div>}
                   </div>
                   <div style={{ fontSize: 13, fontWeight: 900, color: t.subtext }}>score {typeof score === "number" ? score.toFixed(2) : "—"}</div>
                 </div>
