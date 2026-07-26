@@ -4583,16 +4583,16 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold);
         const autoRunAudit = buildAutoRunAuditEntry(priorRows, settled);
         rows.push({ ...settled, autoRun: true, autoRunAudit });
-        // Per request (July 26, reverted same day): Pulse is a single
-        // unified engine — one account, one stop-loss/giveback check, not
-        // four independently-tracked engine+strategy combinations. Given
-        // that, there's no value in generating 70+ more spins that only
-        // ever push once the account's threshold is hit — that was only
-        // useful for switching Strategy in the dropdown afterward to see a
-        // different strategy's independent performance, which came at the
-        // cost of a long, empty tail of pushes cluttering every session
-        // that stops early. Reverted back to stopping outright.
-        if (settled.sessionEnded) break;
+        // Per request (July 26, reverted back again same day): spin
+        // generation and Pulse's own betting are two different things.
+        // settleSpin already correctly freezes Pulse's REAL bets the
+        // instant its stop condition fires (sessionEnded), and that part
+        // is untouched — Pulse's own bankroll still stops exactly where it
+        // did before. What changed is that the WHEEL keeps generating
+        // outcomes for the rest of autoSpins regardless, so switching to a
+        // manual engine (or a different Strategy) afterward has the full
+        // spin sequence to work with, instead of being capped at however
+        // many spins existed when Pulse's threshold happened to hit.
       }
       setHistory(rows);
       setAutoRunning(false);
