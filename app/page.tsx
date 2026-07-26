@@ -123,6 +123,7 @@ type Step = {
     inverted: { axisDpi: { color: number; range: number; parity: number } | null; axisModes: { color: string; range: string; parity: string } | null; group: GroupKey | null };
     markov: { axisConfidence: { color: number; range: number; parity: number } | null; group: GroupKey | null };
     random: { axisDpi: { color: number; range: number; parity: number } | null; confidence: number | null; group: GroupKey | null };
+    cadence: { axisDpi: { color: number; range: number; parity: number } | null; axisModes: { color: string; range: string; parity: string } | null; group: GroupKey | null };
   } | null;
   // Engine config snapshot — captured at settle time so exports are accurate
   // even when viewed after the config has changed (e.g. post-autorun analysis).
@@ -131,6 +132,7 @@ type Step = {
   _bbInvertedEnabled?: boolean;
   _markovEnabled?: boolean;
   _randomEnabled?: boolean;
+  _cadenceEnabled?: boolean;
   // Whenever Pulse is on: true once this account's own ROI drops below -25%,
   // or has given back 30% of its own peak. Once true, no further real bets
   // are placed for the rest of the session and Run Auto stops early.
@@ -153,6 +155,7 @@ type SavedSession = {
   executeWeak?: boolean;
   executeObservation?: boolean;
   randomEnabled?: boolean;
+  cadenceEnabled?: boolean;
   history: Step[];
   executionMode?: ExecutionMode;
 };
@@ -169,6 +172,7 @@ type SavedControlSettings = {
   bbInvertedEnabled: boolean;
   markovEnabled: boolean;
   randomEnabled: boolean;
+  cadenceEnabled: boolean;
   executionMode: ExecutionMode;
   executeWeak: boolean;
   executeObservation: boolean;
@@ -2037,6 +2041,38 @@ function bbInvertedForecast(history: Step[]) {
   };
 }
 
+// =====================================================
+// CADENCE — new 5th engine (per request July 26)
+// Ported from a sibling project's "Pulse + Straight" logic. Each axis
+// (Color/Range/Parity) runs its OWN independent locked run-length Boolean
+// table (getStraightNextBit) against its own bit stream — no cross-axis
+// combination, no 256-gate truth-table search/fitting like the existing
+// "Straight" engine uses. This is the same machinery already powering
+// bbInvertedForecast above (getLockedBbAxisGroup/getAxisBbDpiValues), just
+// called with invertedModeOn = false, so every axis always stays on its own
+// Straight table rather than being eligible to flip to the mirrored table.
+// Kept fully separate from the existing Straight/Inverted engines per
+// request — this does not modify either of them.
+// =====================================================
+function cadenceForecast(history: Step[]) {
+  if (!history.length) {
+    return { group: "BHE" as GroupKey, numbers: GROUPS.BHE, confidence: 0, tier: "Active · Confirmed", reason: "Cadence initial base recommendation (locked per-axis Straight table)." };
+  }
+
+  const locked = getLockedBbAxisGroup(history, false);
+  const group = locked.group;
+
+  return {
+    group,
+    numbers: group ? GROUPS[group] : [],
+    confidence: 0,
+    tier: "Active · Confirmed",
+    axisDpi: locked.axisDpi,
+    axisModes: locked.axisModes,
+    reason: `Cadence — independent per-axis run-length table · Color ${locked.axisDpi.color} · Range ${locked.axisDpi.range} · Parity ${locked.axisDpi.parity} (no cross-axis combination, no gate search).`
+  };
+}
+
 
 // =====================================================
 // INDEPENDENT MARKOV PLAY MODE
@@ -2537,18 +2573,19 @@ function getSpreadPulseAxisSideMetrics(history: Step[]) {
   };
 }
 
-function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, randomEnabled = false) {
-  const bbMode = randomEnabled ? "Random" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted" : bbStraightEnabled ? "Straight" : "BB Off";
+function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, randomEnabled = false, cadenceEnabled = false) {
+  const bbMode = cadenceEnabled ? "Cadence" : randomEnabled ? "Random" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted" : bbStraightEnabled ? "Straight" : "BB Off";
   if (pulseEnabled && bbMode !== "BB Off") return `PULSE + ${bbMode}`;
   if (pulseEnabled) return "PULSE Governance";
   return bbMode === "BB Off" ? "Disabled" : bbMode;
 }
 
-function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, randomEnabled = false) {
+function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, randomEnabled = false, cadenceEnabled = false) {
   const straight = bbStraightForecast(history);
   const inverted = bbInvertedForecast(history);
   const markov = markovForecast(history);
   const random = randomForecast(history);
+  const cadence = cadenceForecast(history);
 
   // Snapshot every engine's per-axis diagnostic every spin, regardless of
   // which engine ends up selected below. This is what lets us audit any
@@ -2559,14 +2596,15 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
     inverted: { axisDpi: (inverted as any).axisDpi ?? null, axisModes: (inverted as any).axisModes ?? null, group: (inverted as any).group ?? null },
     markov: { axisConfidence: (markov as any).markovAxisConfidence ?? null, group: (markov as any).group ?? null },
     random: { axisDpi: (random as any).axisDpi ?? null, confidence: (random as any).confidence ?? null, group: (random as any).group ?? null },
+    cadence: { axisDpi: (cadence as any).axisDpi ?? null, axisModes: (cadence as any).axisModes ?? null, group: (cadence as any).group ?? null },
   };
 
-  const decision = getActiveDecisionCore(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, straight, inverted, markov, random);
+  const decision = getActiveDecisionCore(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, cadenceEnabled, straight, inverted, markov, random, cadence);
   return { ...decision, allEngineDiagnostics };
 }
 
-function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled: boolean, randomEnabled: boolean, straight: any, inverted: any, markov: any, random: any) {
-  const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
+function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled: boolean, randomEnabled: boolean, cadenceEnabled: boolean, straight: any, inverted: any, markov: any, random: any, cadence: any) {
+  const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, cadenceEnabled);
 
   // ── PULSE: Engine Performance Tracker ────────────────────────────────────
   // When Pulse is ON, it runs all 4 engines silently every spin, tracks each
@@ -2615,6 +2653,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         else if (engineName === "Inverted") predicted = diag.inverted?.group ?? null;
         else if (engineName === "Markov") predicted = diag.markov?.group ?? null;
         else if (engineName === "Random") predicted = diag.random?.group ?? null;
+        else if (engineName === "Cadence") predicted = diag.cadence?.group ?? null;
       } else if (engineName === "Straight" || engineName === "Inverted") {
         // Fallback for older history rows recorded before allEngineDiagnostics
         // existed — use the legacy pulseDivergence-based proxy.
@@ -2655,6 +2694,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       Inverted: computeEngineStats("Inverted"),
       Markov:   computeEngineStats("Markov"),
       Random:   computeEngineStats("Random"),
+      Cadence:  computeEngineStats("Cadence"),
     };
     const engineRates: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.rate]));
     const engineSamples: Record<string, number> = Object.fromEntries(Object.entries(engineStats).map(([k, v]) => [k, v.n]));
@@ -2697,6 +2737,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       Inverted: computeAxisStatsFor("Inverted"),
       Markov:   computeAxisStatsFor("Markov"),
       Random:   computeAxisStatsFor("Random"),
+      Cadence:  computeAxisStatsFor("Cadence"),
     };
 
     // ─── CUMULATIVE ADVANTAGE — the ONLY input to engine selection ──────────
@@ -2729,9 +2770,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // full 3-letter forecast" instead of stitching a composite from up to 3
     // different engines' individual axes.
 
-    const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random"] as const;
-    const engineDiagKey: Record<string, "straight" | "inverted" | "markov" | "random"> = {
-      Straight: "straight", Inverted: "inverted", Markov: "markov", Random: "random",
+    const ENGINE_ORDER = ["Straight", "Inverted", "Markov", "Random", "Cadence"] as const;
+    const engineDiagKey: Record<string, "straight" | "inverted" | "markov" | "random" | "cadence"> = {
+      Straight: "straight", Inverted: "inverted", Markov: "markov", Random: "random", Cadence: "cadence",
     };
 
     // ─── PUSH-AFTER-N-LOSSES — per request (July 24) ─────────────────────────
@@ -2780,8 +2821,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // gating just cut the number of betting opportunities without adding
     // real signal to compensate — reverted on that basis.
     const UNIFORM_START_SPINS = 3;
-    const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
-    const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
+    const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0, Cadence: 0 };
+    const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0, Cadence: 0 };
     for (let i = 0; i < history.length; i++) {
       if (i < UNIFORM_START_SPINS) continue; // don't evaluate anyone's predictions for the first 3 spins — all four start together
       const step = history[i];
@@ -2817,7 +2858,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : 0;
     const isPaused = stillWaitingForUniformStart;
     const pauseReason: string | null = stillWaitingForUniformStart
-      ? `Waiting for uniform start — all four engines begin competing together at spin ${UNIFORM_START_SPINS + 1} (have ${history.length})`
+      ? `Waiting for uniform start — all five engines begin competing together at spin ${UNIFORM_START_SPINS + 1} (have ${history.length})`
       : null;
 
     // Get prediction from selected engine
@@ -2843,8 +2884,10 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       engineForecast = { ...inverted, tier: "Active · Confirmed" };
     } else if (selectedEngine === "Markov") {
       engineForecast = { ...markov, tier: "Active · Confirmed" };
-    } else {
+    } else if (selectedEngine === "Random") {
       engineForecast = { ...random, tier: "Active · Confirmed" };
+    } else {
+      engineForecast = { ...cadence, tier: "Active · Confirmed" };
     }
 
     const tracker = {
@@ -2878,6 +2921,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
   }
 
   // ── Manual engine selection (Pulse OFF) ───────────────────────────────────
+  if (cadenceEnabled && cadence.group) {
+    return { ...cadence, source: "CADENCE" as const, mode };
+  }
   if (randomEnabled && random.group) {
     return { ...random, source: "RANDOM" as const, mode };
   }
@@ -2896,7 +2942,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     numbers: [] as SpinValue[],
     confidence: 0,
     tier: "No Engine",
-    reason: "No active engine. Turn on PULSE, BB Straight, BB Inverted, Markov, or Random.",
+    reason: "No active engine. Turn on PULSE, BB Straight, BB Inverted, Markov, Random, or Cadence.",
     source: "NONE" as const,
     mode,
   };
@@ -3787,8 +3833,8 @@ function shouldBet(strategy: Strategy, confidence: number, pulseEnabled: boolean
   }
 }
 
-function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD): Step {
-  const rawDecision = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled);
+function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, cadenceEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD): Step {
+  const rawDecision = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, cadenceEnabled);
   const f = normalizeObserveTierForSettings(rawDecision, tierExecution, history);
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
 
@@ -3870,7 +3916,7 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const executionAllowed = shouldExecuteTier(f.tier, f.source, tierExecution, (f as any).rv, (f as any).entropyExtreme);
   const observePushHold = isObservePushTier(f.tier, tierExecution);
   const dimensionTDAAllowed = true; // TDA diagnostic only, not a hard gate.
-  const pulseHasSelectedEngine = !pulseEnabled || bbStraightEnabled || bbInvertedEnabled || markovEnabled || randomEnabled;
+  const pulseHasSelectedEngine = !pulseEnabled || bbStraightEnabled || bbInvertedEnabled || markovEnabled || randomEnabled || cadenceEnabled;
 const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && pulseHasSelectedEngine && shouldBet(effectiveStrategy, f.confidence, pulseEnabled, f.group, f) && executionAllowed ;
   const previewNumbers = active && f.group ? getExecutionNumbers(f.group, routedExecutionMode, f.source, f) : [];
   const streamNumbers = active && f.group ? getCoreExecutionNumbers(f.group, f.source, f, routedExecutionMode) : [];
@@ -3980,6 +4026,7 @@ const active = !autoStopTriggered && !observePushHold && f.source !== "NONE" && 
     _bbInvertedEnabled: bbInvertedEnabled,
     _markovEnabled: markovEnabled,
     _randomEnabled: randomEnabled,
+    _cadenceEnabled: cadenceEnabled,
   };
 }
 
@@ -4274,9 +4321,9 @@ function runShadowStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: 
   return rows;
 }
 
-function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD) {
+function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, cadenceEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD) {
   const rows: Step[] = [];
-  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)));
+  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold)));
   return rows;
 }
 
@@ -4312,6 +4359,7 @@ function runComboShadowStrategy(
         tierExecution,
         combo === "PULSE_MARKOV",
         combo === "PULSE_RANDOM",
+        false, // cadenceEnabled — combo shadow strategies don't include Cadence yet
         stopLossThreshold,
         givebackThreshold
       )
@@ -4320,7 +4368,7 @@ function runComboShadowStrategy(
   return rows;
 }
 
-function runComparisonStrategyReplay(outcomes: SpinValue[], comparisonStrategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD) {
+function runComparisonStrategyReplay(outcomes: SpinValue[], comparisonStrategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, randomEnabled = false, cadenceEnabled = false, stopLossThreshold = DEFAULT_STOP_LOSS_THRESHOLD, givebackThreshold = DEFAULT_GIVEBACK_THRESHOLD) {
   // LOCKED COMPARISON STABILITY
   // This intentionally creates a fresh Step[] for every strategy row.
   // Only the raw spin outcomes are shared. Bankroll, loss streak, unit size,
@@ -4344,6 +4392,7 @@ function runComparisonStrategyReplay(outcomes: SpinValue[], comparisonStrategy: 
         tierExecution,
         markovEnabled,
         randomEnabled,
+        cadenceEnabled,
         stopLossThreshold,
         givebackThreshold
       )
@@ -4372,6 +4421,7 @@ export default function Page() {
   const [bbInvertedEnabled, setBbInvertedEnabled] = useState(false);
   const [markovEnabled, setMarkovEnabled] = useState(false);
   const [randomEnabled, setRandomEnabled] = useState(false);
+  const [cadenceEnabled, setCadenceEnabled] = useState(false);
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("Stream Direct");
 const visibleExecutionModes: ExecutionMode[] = EXECUTION_MODES;
 
@@ -4411,11 +4461,11 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const f = useMemo(
     () =>
       normalizeObserveTierForSettings(
-        getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled),
+        getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, cadenceEnabled),
         tierExecution,
         history
       ),
-    [history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, tierExecution]
+    [history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, randomEnabled, cadenceEnabled, tierExecution]
   );
   const pulseExecutionRouter = useMemo(() => getPulseExecutionRouterDecision(pulseEnabled, executionMode, f, history), [pulseEnabled, executionMode, f, history]);
   const effectiveExecutionMode: ExecutionMode = pulseExecutionRouter.selectedMode;
@@ -4461,7 +4511,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
   const recent = [...displayHistory].reverse().slice(0, 24);
   const rawOutcomes = useMemo(() => history.map((h) => h.outcome), [history]);
-  const isPulseOnlyMode = pulseEnabled && !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled;
+  const isPulseOnlyMode = pulseEnabled && !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled;
   const streakStats = useMemo(() => getStreakStats(history), [history]);
   const peakBankroll = history.reduce((peak, row) => Math.max(peak, row.bankroll), startingBankroll);
   const activeDrawdown = Math.max(0, peakBankroll - bankroll);
@@ -4531,6 +4581,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       if (typeof saved.bbInvertedEnabled === "boolean") setBbInvertedEnabled(saved.bbInvertedEnabled);
       if (typeof saved.markovEnabled === "boolean") setMarkovEnabled(saved.markovEnabled);
       if (typeof saved.randomEnabled === "boolean") setRandomEnabled(saved.randomEnabled);
+      if (typeof saved.cadenceEnabled === "boolean") setCadenceEnabled(saved.cadenceEnabled);
       if (saved.executionMode && EXECUTION_MODES.includes(saved.executionMode)) setExecutionMode(saved.executionMode);
       if (typeof saved.executeWeak === "boolean") setExecuteWeak(saved.executeWeak);
       if (typeof saved.executeObservation === "boolean") setExecuteObservation(saved.executeObservation);
@@ -4542,9 +4593,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     }
   }, []);
 
-  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)]);
+  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold)]);
   const rebuild = (start = startingBankroll, unit = baseUnit, nextStrategy = strategy, nextPulse = pulseEnabled) => {
-    setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold));
+    setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold));
   };
 
   const applyPulseMode = () => {
@@ -4568,6 +4619,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           tierExecution,
           markovEnabled,
           randomEnabled,
+          cadenceEnabled,
           stopLossThreshold,
           givebackThreshold
         )
@@ -4590,10 +4642,11 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     setBbInvertedEnabled(nextInverted);
     setMarkovEnabled(false);
     setRandomEnabled(false);
+    setCadenceEnabled(false);
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, nextStraight, nextInverted, executionMode, tableLimit, perNumberLimit, tierExecution, false, false, stopLossThreshold, givebackThreshold));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, nextStraight, nextInverted, executionMode, tableLimit, perNumberLimit, tierExecution, false, false, false, stopLossThreshold, givebackThreshold));
     }
   };
 
@@ -4603,10 +4656,11 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     setBbInvertedEnabled(false);
     setMarkovEnabled(true);
     setRandomEnabled(false);
+    setCadenceEnabled(false);
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, true, false, stopLossThreshold, givebackThreshold));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, true, false, false, stopLossThreshold, givebackThreshold));
     }
   };
 
@@ -4616,10 +4670,25 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     setBbInvertedEnabled(false);
     setMarkovEnabled(false);
     setRandomEnabled(true);
+    setCadenceEnabled(false);
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, true, stopLossThreshold, givebackThreshold));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, true, false, stopLossThreshold, givebackThreshold));
+    }
+  };
+
+  const applyCadenceMode = () => {
+    setPulseEnabled(false);
+    setBbStraightEnabled(false);
+    setBbInvertedEnabled(false);
+    setMarkovEnabled(false);
+    setRandomEnabled(false);
+    setCadenceEnabled(true);
+
+    const outcomes = history.map((h) => h.outcome);
+    if (outcomes.length) {
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, false, true, stopLossThreshold, givebackThreshold));
     }
   };
   const applyExecutionMode = (nextMode: ExecutionMode) => {
@@ -4642,6 +4711,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
           tierExecution,
           markovEnabled,
           randomEnabled,
+          cadenceEnabled,
           stopLossThreshold,
           givebackThreshold
         )
@@ -4655,7 +4725,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       const rows: Step[] = [];
       for (let i = 0; i < autoSpins; i += 1) {
         const priorRows = [...rows];
-        const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold);
+        const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold);
         const autoRunAudit = buildAutoRunAuditEntry(priorRows, settled);
         rows.push({ ...settled, autoRun: true, autoRunAudit });
         // Per request (July 26, reverted back again same day): spin
@@ -4695,7 +4765,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const saveSession = () => {
     const name = sessionName.trim();
     if (!name) return;
-    const next: SavedSession = { name, createdAt: new Date().toISOString(), startingBankroll, baseUnit, tableLimit, perNumberLimit, autoSpins, strategy, pulseEnabled, bbMode, bbStraightEnabled, bbInvertedEnabled, randomEnabled, executeWeak, executeObservation, executionMode, history };
+    const next: SavedSession = { name, createdAt: new Date().toISOString(), startingBankroll, baseUnit, tableLimit, perNumberLimit, autoSpins, strategy, pulseEnabled, bbMode, bbStraightEnabled, bbInvertedEnabled, randomEnabled, cadenceEnabled, executeWeak, executeObservation, executionMode, history };
     saveLocal([...savedSessions.filter((s) => s.name !== name), next]);
     setSelectedSession(name);
     setSessionName("");
@@ -4714,6 +4784,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     setBbStraightEnabled(s.bbStraightEnabled ?? false);
     setBbInvertedEnabled(s.bbInvertedEnabled ?? false);
     setRandomEnabled(s.randomEnabled ?? false);
+    setCadenceEnabled(s.cadenceEnabled ?? false);
     setExecuteWeak(s.executeWeak ?? DEFAULT_EXECUTE_WEAK);
     setExecuteObservation(s.executeObservation ?? DEFAULT_EXECUTE_OBSERVATION);
     setBbMode(s.bbMode);
@@ -4735,7 +4806,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   const mergeSelected = () => {
     const sessions = savedSessions.filter((s) => selectedMerge.includes(s.name));
     let rows: Step[] = [];
-    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold))));
+    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold))));
     setHistory(rows);
   };
 
@@ -4752,6 +4823,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       bbInvertedEnabled,
       markovEnabled,
       randomEnabled,
+      cadenceEnabled,
       executionMode,
       executeWeak,
       executeObservation,
@@ -4832,7 +4904,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       const rowBBInv = (h as any)._bbInvertedEnabled;
       const rowMarkov = (h as any)._markovEnabled;
       const rowRandom = (h as any)._randomEnabled;
-      const engineLabel = rowRandom ? "Random" : rowMarkov ? "Markov"
+      const rowCadence = (h as any)._cadenceEnabled;
+      const engineLabel = rowCadence ? "Cadence" : rowRandom ? "Random" : rowMarkov ? "Markov"
         : rowBBStr && rowBBInv ? "Inverted" : rowBBStr ? "Straight"
         : rowPulse ? "Pulse Only" : "Off";
       const fc = forecastBasket ? groupToBits(forecastBasket as GroupKey) : null;
@@ -5126,6 +5199,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     if ((row as any)._bbInvertedEnabled) return "Inverted";
     if ((row as any)._markovEnabled) return "Markov";
     if ((row as any)._randomEnabled) return "Random";
+    if ((row as any)._cadenceEnabled) return "Cadence";
     return "—";
   };
 
@@ -5563,6 +5637,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         tierExecution,
         markovEnabled,
         randomEnabled,
+        cadenceEnabled,
         stopLossThreshold,
         givebackThreshold
       );
@@ -5594,7 +5669,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         stopped,
       };
     });
-  }, [rawOutcomes, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold]);
+  }, [rawOutcomes, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold]);
 
 
   const pulseShadowRows = useMemo(
@@ -5774,12 +5849,13 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         // Manual engine selection (Pulse OFF)
         <div>
           <div style={{ fontSize: 10, color: t.subtext, fontWeight: 950, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Play Mode</div>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
-            <button onClick={() => applyBBMode(false, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.red : t.borderStrong}`, background: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(239,68,68,0.10)" : t.input, color: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 12 }}>OFF</button>
-            <button onClick={() => applyBBMode(true, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.blue : t.borderStrong}`, background: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(37,99,235,0.14)" : t.input, color: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.blue : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>STRAIGHT</button>
-            <button onClick={() => applyBBMode(true, true)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.amber : t.borderStrong}`, background: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? "rgba(245,158,11,0.12)" : t.input, color: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled ? COLORS.amber : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>INVERTED</button>
-            <button onClick={applyMarkovMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${markovEnabled && !randomEnabled ? COLORS.green : t.borderStrong}`, background: markovEnabled && !randomEnabled ? "rgba(34,197,94,0.13)" : t.input, color: markovEnabled && !randomEnabled ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>MARKOV</button>
-            <button onClick={applyRandomMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${randomEnabled ? COLORS.cyan : t.borderStrong}`, background: randomEnabled ? "rgba(34,199,243,0.13)" : t.input, color: randomEnabled ? COLORS.cyan : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>RANDOM</button>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(6, 1fr)", gap: 8, marginBottom: 10 }}>
+            <button onClick={() => applyBBMode(false, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.red : t.borderStrong}`, background: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? "rgba(239,68,68,0.10)" : t.input, color: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 12 }}>OFF</button>
+            <button onClick={() => applyBBMode(true, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.blue : t.borderStrong}`, background: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? "rgba(37,99,235,0.14)" : t.input, color: bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.blue : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>STRAIGHT</button>
+            <button onClick={() => applyBBMode(true, true)} style={{ height: 34, borderRadius: 10, border: `1px solid ${bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.amber : t.borderStrong}`, background: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? "rgba(245,158,11,0.12)" : t.input, color: bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.amber : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>INVERTED</button>
+            <button onClick={applyMarkovMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.green : t.borderStrong}`, background: markovEnabled && !randomEnabled && !cadenceEnabled ? "rgba(34,197,94,0.13)" : t.input, color: markovEnabled && !randomEnabled && !cadenceEnabled ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>MARKOV</button>
+            <button onClick={applyRandomMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${randomEnabled && !cadenceEnabled ? COLORS.cyan : t.borderStrong}`, background: randomEnabled && !cadenceEnabled ? "rgba(34,199,243,0.13)" : t.input, color: randomEnabled && !cadenceEnabled ? COLORS.cyan : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>RANDOM</button>
+            <button onClick={applyCadenceMode} style={{ height: 34, borderRadius: 10, border: `1px solid ${cadenceEnabled ? "#a855f7" : t.borderStrong}`, background: cadenceEnabled ? "rgba(168,85,247,0.13)" : t.input, color: cadenceEnabled ? "#a855f7" : t.subtext, fontWeight: 950, cursor: "pointer", fontSize: 11 }}>CADENCE</button>
           </div>
         </div>
       ) : null}
@@ -5823,15 +5899,16 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       { key: "range", name: "Range", labels: ["High", "Low"] },
       { key: "parity", name: "Parity", labels: ["Even", "Odd"] },
     ];
-    const ENGINES: { key: "straight" | "inverted" | "markov" | "random"; label: string }[] = [
+    const ENGINES: { key: "straight" | "inverted" | "markov" | "random" | "cadence"; label: string }[] = [
       { key: "straight", label: "Straight" },
       { key: "inverted", label: "Inverted" },
       { key: "markov", label: "Markov" },
       { key: "random", label: "Random" },
+      { key: "cadence", label: "Cadence" },
     ];
 
     type Cell = { label: string; pct: number; value: string; tier: "strong" | "moderate" | "weak" | "none" };
-    const cellFor = (engine: "straight" | "inverted" | "markov" | "random", axisKey: "color" | "range" | "parity", labels: [string, string]): Cell => {
+    const cellFor = (engine: "straight" | "inverted" | "markov" | "random" | "cadence", axisKey: "color" | "range" | "parity", labels: [string, string]): Cell => {
       if (engine === "straight") {
         const gate = diag.straight?.gate;
         const axis = gate ? (gate as any)[axisKey] as PulseAxisDivergence : null;
@@ -5848,9 +5925,9 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const pct = Math.round(conf);
         return { label: labels[bits[bitIdx]], pct, value: `${pct}%`, tier: pct >= 70 ? "strong" : pct >= 60 ? "moderate" : "weak" };
       }
-      // inverted / random — DPI-based directional pressure
-      const dpi = engine === "inverted" ? diag.inverted?.axisDpi?.[axisKey] : diag.random?.axisDpi?.[axisKey];
-      const group = engine === "inverted" ? diag.inverted?.group : diag.random?.group;
+      // inverted / random / cadence — DPI-based directional pressure
+      const dpi = engine === "inverted" ? diag.inverted?.axisDpi?.[axisKey] : engine === "random" ? diag.random?.axisDpi?.[axisKey] : diag.cadence?.axisDpi?.[axisKey];
+      const group = engine === "inverted" ? diag.inverted?.group : engine === "random" ? diag.random?.group : diag.cadence?.group;
       if (typeof dpi !== "number" || !group) return { label: "—", pct: 0, value: "—", tier: "none" };
       const bits = groupToBits(group as GroupKey);
       const bitIdx = axisKey === "color" ? 0 : axisKey === "range" ? 1 : 2;
@@ -7000,7 +7077,7 @@ const StreakAnalyticsPanel = () => {
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Arial, sans-serif", display: "grid", gridTemplateColumns: "82px 1fr" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
-    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default 0 (disabled) — enter a negative number to turn it on.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Trail-Stop (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 0 (disabled) — set a value above 0 to turn it on. Once enabled, e.g. 30% means a +40% peak triggers at +28%; the gap grows as the peak grows and only ratchets up, never down.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Observe Hold OFF. (Weak removed — confirmed dead for Pulse, since Pulse force-overrides tier to Active Confirmed for whichever engine it selects; only applied to manual mode anyway.)</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Saves your current Stop-Loss, Trail-Stop, and other control settings so they persist next time you open the app, instead of resetting to defaults.</div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
+    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default 0 (disabled) — enter a negative number to turn it on.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Trail-Stop (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 0 (disabled) — set a value above 0 to turn it on. Once enabled, e.g. 30% means a +40% peak triggers at +28%; the gap grows as the peak grows and only ratchets up, never down.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, cadenceEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Observe Hold OFF. (Weak removed — confirmed dead for Pulse, since Pulse force-overrides tier to Active Confirmed for whichever engine it selects; only applied to manual mode anyway.)</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Saves your current Stop-Loss, Trail-Stop, and other control settings so they persist next time you open the app, instead of resetting to defaults.</div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
     {showGlossary ? <div
       style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.72)", zIndex: 9998, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={() => setShowGlossary(false)}
