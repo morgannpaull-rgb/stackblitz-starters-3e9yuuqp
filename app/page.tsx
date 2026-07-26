@@ -112,8 +112,6 @@ type Step = {
     isPaused?: boolean;
     pauseReason?: string | null;
     currentEngineTrend?: number | null;
-    inConfirmedUptrend?: Record<string, boolean>;
-    usingFallback?: boolean;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -172,6 +170,8 @@ type SavedControlSettings = {
   executeWeak: boolean;
   executeObservation: boolean;
   appearance: Appearance;
+  stopLossThreshold: number;
+  givebackThreshold: number;
 };
 
 // ─── Types reverse-engineered from actual usage (previously undeclared) ────
@@ -278,8 +278,8 @@ const STRATEGIES: Strategy[] = [
 // Both thresholds now apply directly to whichever strategy is actually
 // running (no switching — see the stop-conditions block in settleSpin for
 // why the earlier switching design was removed the same day it was built).
-const DEFAULT_STOP_LOSS_THRESHOLD = -0.25; // per request, July 25 — session ends if THIS account's own ROI drops below this. Now user-adjustable in Settings.
-const DEFAULT_GIVEBACK_THRESHOLD = 0.30; // per request, July 26 (reverted same day from a brief fixed-points version) — Trail-Stop: session ends if THIS account's ROI has given back this fraction OF its own peak — e.g. peak +40% at 30% → triggers once ROI drops to +28% (40% × 0.70), gap genuinely growing as the peak grows. The trigger level only ever moves up as new peaks form. Now user-adjustable in Settings.
+const DEFAULT_STOP_LOSS_THRESHOLD = -1.0; // per request, July 26 — default is now -100% (effectively unreachable/off at engine start) so the user sets their own real threshold in Settings rather than inheriting one.
+const DEFAULT_GIVEBACK_THRESHOLD = 0; // per request, July 26 — default is 0, treated as DISABLED (see the trailStopHit check below) so Trail-Stop doesn't constrain anything until the user explicitly sets a real value in Settings.
 
 function normalizeStrategyName(value: any): Strategy {
   return STRATEGIES.includes(value) ? value : DEFAULT_STRATEGY;
@@ -2718,30 +2718,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       return basketSize / 36;
     };
 
-    // ─── ENGINE SELECTION — trend-state based (July 26) ──────────────────────
-    // Per request: move away from "always bet whoever has the highest score"
-    // toward something closer to an actual trend-following trading engine.
-    // Each of the 4 engines gets its OWN score path tracked independently
-    // (not just whichever currently leads), and its own confirmed peaks
-    // (fractal highs, same window=2 definition already tested and built for
-    // the swing-low mechanism). An engine only qualifies to be bet on once
-    // its current score has broken back above its own last confirmed peak —
-    // a genuine, structurally-confirmed uptrend, not just "highest number
-    // right now." If more than one engine qualifies, whichever has the
-    // highest cumulative-advantage score among them is selected. If NO
-    // engine currently qualifies, the whole spin pauses — per explicit
-    // request, this does NOT fall back to highest-score-regardless-of-trend.
-    //
-    // Tested first (21 pooled sessions, 1,596 spins) before building: being
-    // in a confirmed uptrend showed 12.0% win rate vs. 12.2% neutral / 14.5%
-    // downtrend — no real edge, z well under 1 in every pairwise comparison.
-    // Built anyway, by explicit request, as a deliberate move toward
-    // trend-following STYLE and more decisive, less noise-chasing engine
-    // commitment — not because backtesting showed it wins more.
-    const TREND_FRACTAL_WINDOW = 2;
+    // ─── ENGINE SELECTION ─── bet on whichever engine currently leads, every ──
+    // spin, no per-spin pause. Per request (July 26): reverted back to this
+    // from the peak/trough trend-state design tried earlier the same day.
+    // Tested head-to-head on a real session with no stop-loss/Trail-Stop
+    // cutting things short: highest-score selection produced 76 real bets,
+    // 13.2% win rate, -6.5% ROI; the trend-state design produced only 40
+    // real bets (roughly half the volume, since it required a confirmed
+    // uptrend most of the session), 10.0% win rate, -26.0% ROI. Consistent
+    // with the earlier pooled backtest (being in a confirmed uptrend showed
+    // no real accuracy edge over neutral), the trend-state design's stricter
+    // gating just cut the number of betting opportunities without adding
+    // real signal to compensate — reverted on that basis.
     const UNIFORM_START_SPINS = 3;
-
-    const enginePaths: Record<string, number[]> = { Straight: [], Inverted: [], Markov: [], Random: [] };
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     for (let i = 0; i < history.length; i++) {
@@ -2756,70 +2745,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         const outcome = predicted === actual ? 1 : 0;
         cumulativeAdvantage[engine] += (outcome - getBreakevenRate(predicted));
         evaluatedCount[engine] += 1;
-        enginePaths[engine].push(cumulativeAdvantage[engine]);
       }
     }
-
-    const isFractalHigh = (path: number[], i: number): boolean => {
-      const w = TREND_FRACTAL_WINDOW;
-      if (i - w < 0 || i + w >= path.length) return false;
-      for (let k = i - w; k <= i + w; k++) {
-        if (k === i) continue;
-        if (path[k] >= path[i]) return false;
-      }
-      return true;
-    };
-
-    const inConfirmedUptrend: Record<string, boolean> = { Straight: false, Inverted: false, Markov: false, Random: false };
-    const hasEverConfirmedUptrend: Record<string, boolean> = { Straight: false, Inverted: false, Markov: false, Random: false };
-    for (const engine of ENGINE_ORDER) {
-      const path = enginePaths[engine];
-      if (!path.length) continue;
-      let confirmedPeak: number | null = null;
-      for (let i = 0; i < path.length; i++) {
-        const confirmIdx = i - TREND_FRACTAL_WINDOW;
-        if (confirmIdx >= 0 && isFractalHigh(path, confirmIdx)) {
-          confirmedPeak = path[confirmIdx];
-        }
-        if (confirmedPeak !== null && path[i] > confirmedPeak) {
-          hasEverConfirmedUptrend[engine] = true;
-        }
-      }
-      const currentScore = path[path.length - 1];
-      inConfirmedUptrend[engine] = confirmedPeak !== null && currentScore > confirmedPeak;
-    }
-
-    // ─── HYBRID FALLBACK (per request, July 26) ──────────────────────────────
-    // The trend-confirmation requirement (peak forms, then score breaks back
-    // above it) genuinely takes real time — backtested first (47 pooled
-    // sessions): loosening the fractal window from 2 points to 1 only saved
-    // ~2.7 spins on average (17.5 → 14.8), so the wait isn't primarily about
-    // how strict the peak-confirmation window is; it's that a genuine
-    // reversal-and-new-high just takes real spins to happen, however it's
-    // measured. Rather than loosen what counts as a real trend (which would
-    // make the signal noisier without fixing much), this keeps the trend
-    // logic exactly as rigorous as before, but only requires it ONCE some
-    // engine has actually confirmed a real uptrend for the first time this
-    // session. Before that point — since nobody has a track record for the
-    // gate to apply to yet — Pulse falls back to the original highest-score
-    // selection, so the early spins are productive instead of empty. Once
-    // any engine confirms its first real uptrend, the strict "pause until
-    // someone's confirmed" rule (explicitly chosen earlier) takes over for
-    // the rest of the session, permanently — this fallback only ever
-    // applies once, at the very start.
-    const anyEngineEverConfirmed = ENGINE_ORDER.some((e) => hasEverConfirmedUptrend[e]);
 
     const stillWaitingForUniformStart = history.length < UNIFORM_START_SPINS;
-    const trendEligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1 && inConfirmedUptrend[e]);
-    const fallbackEligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
-    const usingFallback = !anyEngineEverConfirmed && trendEligible.length === 0;
-    const eligible = usingFallback ? fallbackEligible : trendEligible;
+    const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
     let selectedEngine = "Straight";
     let leaderReason: "highest-cumulative-advantage" | null = null;
-    if (eligible.length > 0) {
+    if (eligible.length === 0) {
+      selectedEngine = "Straight"; // nobody has an evaluated prediction yet — neutral default
+    } else {
       let best = -Infinity;
       for (const engine of eligible) {
         if (cumulativeAdvantage[engine] > best) { best = cumulativeAdvantage[engine]; selectedEngine = engine; }
@@ -2828,11 +2766,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     }
 
     const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : 0;
-    const isPaused = stillWaitingForUniformStart || eligible.length === 0;
+    const isPaused = stillWaitingForUniformStart;
     const pauseReason: string | null = stillWaitingForUniformStart
       ? `Waiting for uniform start — all four engines begin competing together at spin ${UNIFORM_START_SPINS + 1} (have ${history.length})`
-      : eligible.length === 0
-      ? "No engine is currently in a confirmed uptrend, and at least one already has confirmed one earlier this session — waiting for one to reverse again"
       : null;
 
     // Get prediction from selected engine
@@ -2878,8 +2814,6 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       isPaused,
       pauseReason,
       currentEngineTrend: null as number | null, // swing-low mechanism removed July 25; field kept for type compatibility
-      inConfirmedUptrend, // per-engine trend state (July 26 redesign) — which engines are currently eligible (broke above their own last confirmed peak)
-      usingFallback, // true only during the one-time early window before any engine has ever confirmed an uptrend this session
     };
 
     return {
@@ -2889,7 +2823,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pulseEngineTracker: tracker,
       reason: isPaused
         ? `Pulse · PAUSED — ${pauseReason}`
-        : `Pulse · ${selectedEngine} selected (${usingFallback ? "highest-score fallback — no engine has confirmed an uptrend yet this session" : "confirmed uptrend"}, score=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"}) · trend state: ${ENGINE_ORDER.map((e) => `${e}:${inConfirmedUptrend[e] ? "up" : "not-up"}(${cumulativeAdvantage[e].toFixed(2)})`).join(" · ")}`,
+        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
     };
   }
 
@@ -3863,7 +3797,14 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
     const belowLossFloor = curRoi < stopLossThreshold;
 
     const peakRoi = computeRealAccountPeakROI(history, inferredStart, bankroll);
-    const trailStopHit = peakRoi > 0 && curRoi <= peakRoi * (1 - givebackThreshold);
+    // Trail-Stop of 0 (the new default) is treated as DISABLED, not "trigger
+    // immediately." With the percentage-of-peak formula, a literal 0%
+    // threshold would mean curRoi <= peakRoi * 1 = peakRoi — which is always
+    // true the instant there's ever been a peak, since peak can never be
+    // below the current value by definition. That's the most aggressive
+    // possible setting, the opposite of what a neutral/off default should
+    // do, so it's special-cased here instead of left to the literal math.
+    const trailStopHit = givebackThreshold > 0 && peakRoi > 0 && curRoi <= peakRoi * (1 - givebackThreshold);
 
     autoStopTriggered = belowLossFloor || trailStopHit;
     autoStopReason = belowLossFloor ? "loss-floor" : trailStopHit ? "trail-stop" : null;
@@ -4539,6 +4480,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       if (typeof saved.executeWeak === "boolean") setExecuteWeak(saved.executeWeak);
       if (typeof saved.executeObservation === "boolean") setExecuteObservation(saved.executeObservation);
       if (saved.appearance === "light" || saved.appearance === "dark") setAppearance(saved.appearance);
+      if (typeof saved.stopLossThreshold === "number" && !Number.isNaN(saved.stopLossThreshold)) setStopLossThreshold(saved.stopLossThreshold);
+      if (typeof saved.givebackThreshold === "number" && !Number.isNaN(saved.givebackThreshold)) setGivebackThreshold(saved.givebackThreshold);
     } catch {
       localStorage.removeItem(CONTROL_SETTINGS_KEY);
     }
@@ -4758,6 +4701,8 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
       executeWeak,
       executeObservation,
       appearance,
+      stopLossThreshold,
+      givebackThreshold,
     };
     localStorage.setItem(CONTROL_SETTINGS_KEY, JSON.stringify(saved));
     setSettingsSavedNotice("Control settings saved for next login.");
@@ -5861,19 +5806,17 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const tracker = (f as any).pulseEngineTracker;
     const scores: Record<string, number> = tracker?.challengerZScores ?? {};
-    const uptrend: Record<string, boolean> = tracker?.inConfirmedUptrend ?? {};
     const selectedEngineName: string | null = tracker?.selectedEngine ?? null;
 
     return (
       <CollapsiblePanel id="engineDirection" title="Engine Direction">
         <div style={{ color: t.subtext, fontSize: 12, fontWeight: 800, marginBottom: 16 }}>
-          Every engine's own score, trend state, and current lean per axis — this is the same data Pulse uses to decide who to bet on. Only an engine showing UPTREND has broken back above its own last confirmed peak and is eligible to be selected.
+          Every engine's own score and current lean per axis — this is the same data Pulse uses to decide who to bet on. The engine with the highest cumulative-advantage score is selected every spin.
         </div>
         <div style={{ display: "grid", gap: 16 }}>
           {ENGINES.map((eng) => {
             const engineKey = eng.label; // "Straight" | "Inverted" | "Markov" | "Random"
             const score = scores[engineKey];
-            const isUp = uptrend[engineKey] === true;
             const isSelected = selectedEngineName === engineKey;
             return (
               <div key={eng.key} style={{ border: `1px solid ${isSelected ? COLORS.cyan + "55" : t.border}`, borderRadius: 14, padding: 16, background: isSelected ? `${COLORS.cyan}08` : t.panel2 }}>
@@ -5882,12 +5825,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
                     <div style={{ fontSize: 16, fontWeight: 950, color: isSelected ? COLORS.cyan : t.text }}>{eng.label}</div>
                     {isSelected && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.cyan, background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px" }}>ACTIVE</div>}
                   </div>
-                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
-                    <div style={{ fontSize: 13, fontWeight: 900, color: t.subtext }}>score {typeof score === "number" ? score.toFixed(2) : "—"}</div>
-                    <div style={{ fontSize: 11, fontWeight: 950, color: isUp ? COLORS.green : t.subtext, background: isUp ? `${COLORS.green}18` : t.input, border: `1px solid ${isUp ? COLORS.green + "55" : t.border}`, borderRadius: 6, padding: "3px 10px" }}>
-                      {isUp ? "UPTREND" : "NOT UP"}
-                    </div>
-                  </div>
+                  <div style={{ fontSize: 13, fontWeight: 900, color: t.subtext }}>score {typeof score === "number" ? score.toFixed(2) : "—"}</div>
                 </div>
                 <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
                   {AXES.map((a) => {
@@ -7001,7 +6939,7 @@ const StreakAnalyticsPanel = () => {
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Arial, sans-serif", display: "grid", gridTemplateColumns: "82px 1fr" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
-    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default -25 — enter as a negative number.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Trail-Stop (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 30 — e.g. a +40% peak triggers at +28%; the gap grows as the peak grows. Only ratchets up on new peaks, never down.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Observe Hold OFF. (Weak removed — confirmed dead for Pulse, since Pulse force-overrides tier to Active Confirmed for whichever engine it selects; only applied to manual mode anyway.)</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
+    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><Input type="number" value={tableLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_TABLE_LIMIT; setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Number Limit</div><Input type="number" value={perNumberLimit} onChange={(e: any) => { const n = Number(e.target.value) || DEFAULT_PER_NUMBER_LIMIT; setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Limits are enforced on every strategy replay. Unit bet is capped by both the straight-up per-number limit and the total table limit across the active execution basket.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Pulse Stop Conditions</div><div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.4 }}>Whenever Pulse is on, the session automatically ends if either threshold is crossed — applied directly to whatever strategy is running, no switching between strategies involved.</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Stop-Loss (% ROI)</div><Input type="number" value={Math.round(stopLossThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct)) { setStopLossThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, pct / 100, givebackThreshold)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session if ROI drops below this. Default -100 (effectively off) — enter as a negative number and set your own real threshold.</div></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Trail-Stop (% of peak)</div><Input type="number" value={Math.round(givebackThreshold * 100)} onChange={(e: any) => { const pct = Number(e.target.value); if (!Number.isNaN(pct) && pct >= 0) { setGivebackThreshold(pct / 100); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, pct / 100)); } }} /><div style={{ fontSize: 10, color: t.subtext, marginTop: 4 }}>Ends the session once ROI falls back to this % of its own peak. Default 0 (disabled) — set a value above 0 to turn it on. Once enabled, e.g. 30% means a +40% peak triggers at +28%; the gap grows as the peak grows and only ratchets up, never down.</div></div></div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "1fr", gap: 8 }}><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeObservation ? COLORS.red : t.borderStrong}`, background: executeObservation ? "rgba(239,68,68,0.11)" : t.input, color: executeObservation ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe Hold {executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Observe Hold OFF. (Weak removed — confirmed dead for Pulse, since Pulse force-overrides tier to Active Confirmed for whichever engine it selects; only applied to manual mode anyway.)</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Saves your current Stop-Loss, Trail-Stop, and other control settings so they persist next time you open the app, instead of resetting to defaults.</div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
     {showGlossary ? <div
       style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.72)", zIndex: 9998, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={() => setShowGlossary(false)}
