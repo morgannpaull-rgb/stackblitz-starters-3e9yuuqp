@@ -1845,10 +1845,13 @@ function computeAxisConfidence(bits: (0|1)[], gateId: number, window=AXIS_CONF_W
 }
 
 // ── Main per-axis analyser — LEAN VERSION ──────────────────────────────────────
-// Two states only:
-//   WARMING  — fewer than MIN_HISTORY_SPINS → no prediction
+// One real state, decided by data rather than a spin count:
 //   EXECUTE  — gate selected and trusted → use gate prediction directly
 //   HOLD     — no gate beats the noise floor (55%) → suppress this axis
+//              (this naturally covers "not enough data yet" too, since
+//              score3InputGates reports a neutral 0.5 for every gate when
+//              there's under 4 bits of history — no separate WARMING state
+//              needed as of July 26; see analyseAxis below.)
 //
 // All governance components (DPI, spread, entropy, loss protection, cadence,
 // neural governance) have been removed. The data showed they added +0.0pp to
@@ -1860,8 +1863,19 @@ function analyseAxis(
   gatePredOtherA: 0|1,
   gatePredOtherB: 0|1,
 ): PulseAxisDivergence {
-  const isWarming = bits.length < MIN_HISTORY_SPINS;
+  // Per request (July 26): removed the "wait for MIN_HISTORY_SPINS (13)"
+  // early return that used to sit here — same issue as Markov's redundant
+  // 6-spin gate, fixed the same way. selectBest3InputGate already handles
+  // short histories correctly on its own: score3InputGates returns a neutral
+  // 0.5 score for every gate when bits.length < 4 (correctly triggering HOLD
+  // via the normal no-gate-beats-threshold path below, not a special case),
+  // and produces real, if noisy, scored predictions as soon as 4+ bits exist
+  // — far sooner than 13 spins. This lets Straight start competing for
+  // leadership immediately instead of being forced to HOLD for 13 spins
+  // even when it's the leader, which is what caused it to still push at the
+  // start of a session after the cross-engine pause mechanisms were removed.
   const andPrediction: 0|1 = getStraightNextBit(bits) as 0|1;
+  const isWarming = false; // kept for type compatibility on PulseAxisDivergence; no longer gates anything
 
   // Diagnostics for UI display
   const { conformanceScore, mismatchStreak, windowUsed } = scoreDimensionConformance(bits, 10);
@@ -1889,14 +1903,6 @@ function analyseAxis(
     selectedGate: gateName, gateFitScore: fitScore,
     summary,
   });
-
-  // WARMING — not enough history
-  if (isWarming) {
-    return makeResult(
-      andPrediction, "WARMING", "WARMING", true, 128, "AND3", 0,
-      `${axisName} WARMING — need ${MIN_HISTORY_SPINS} spins (have ${bits.length})`,
-    );
-  }
 
   // GATE SELECTION — score all 256 3-input truth tables
   const gateResult = selectBest3InputGate(bits);
@@ -1926,27 +1932,11 @@ function analyseAxis(
 
 // ── Main entry point ───────────────────────────────────────────────────────────
 function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
-  const isWarming = history.length < MIN_HISTORY_SPINS;
-  if (isWarming) {
-    const wa = (name: string): PulseAxisDivergence => {
-      return {
-        andPrediction:0,overrideBit:0,overrideActive:false,overrideReason:"WARMING",
-        axisDpi:0,axisConfidence:0,spread:0,spreadActive:false,
-        performanceState:"WARMING",adjustedConfidence:0,isHold:true,isWarming:true,
-        state:"ON_PATTERN",conformanceScore:1,conformanceWindow:0,mismatchStreak:0,
-        rollingAccuracy:1,rollingWindow:0,consecutiveBelowThreshold:0,
-        performanceFlipActive:false,selectedGate:"AND",gateFitScore:0,
-        summary:`${name} WARMING — need ${MIN_HISTORY_SPINS} spins (have ${history.length})`,
-      };
-    };
-    return {
-      color:wa("Color"),range:wa("Range"),parity:wa("Parity"),
-      colorBit:0,rangeBit:0,parityBit:0,group:"BHE",
-      overrideCount:0,holdCount:3,isWarming:true,
-      label:`Warming · ${history.length}/${MIN_HISTORY_SPINS} spins · Holding`,
-    };
-  }
-
+  // Per request (July 26): removed the top-level "wait for MIN_HISTORY_SPINS
+  // (13)" block that used to short-circuit this whole function — same reason
+  // as the analyseAxis fix just above. Every axis now goes through the real
+  // gate-search path from spin 1, which correctly reports HOLD on its own
+  // for genuinely insufficient data instead of needing a separate wait.
   const {colorBits, rangeBits, parityBits} = getAxisBitStreams(history);
 
   // First pass: get 3-input gate predictions for cross-axis consensus
@@ -1983,14 +1973,16 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
 
 
 function bbStraightForecast(history: Step[]) {
-  if (history.length < MIN_HISTORY_SPINS) {
-    return { group: "BHE" as GroupKey, numbers: GROUPS.BHE, confidence: 0, tier: "Hold · No Bet", reason: `Straight warming — need ${MIN_HISTORY_SPINS} spins (have ${history.length})` };
-  }
-
+  // Per request (July 26): removed the redundant "wait for MIN_HISTORY_SPINS
+  // (13)" gate here too — same fix as analyseAxis and
+  // getPulseBBStraightDivergence above. divergence.holdCount === 3 below is
+  // now the only gate, and it's a legitimate one: it only holds when none of
+  // the three axes currently have a confident gate, not due to an arbitrary
+  // spin count.
   // 3-input gate selector — scores all 256 truth tables per axis
   const divergence = getPulseBBStraightDivergence(history);
 
-  if (divergence.isWarming || divergence.holdCount === 3) {
+  if (divergence.holdCount === 3) {
     return { group: null as GroupKey | null, numbers: [] as SpinValue[], confidence: 0, tier: "Hold · No Bet", reason: divergence.label };
   }
 
@@ -2772,7 +2764,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       engineForecast = { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: pauseReason };
     } else if (selectedEngine === "Straight") {
       const divergence = getPulseBBStraightDivergence(history);
-      if (divergence.isWarming || divergence.holdCount === 3) {
+      if (divergence.holdCount === 3) {
         engineForecast = { group: null, numbers: [], confidence: 0, tier: "Hold · No Bet", reason: divergence.label };
       } else {
         engineForecast = {
