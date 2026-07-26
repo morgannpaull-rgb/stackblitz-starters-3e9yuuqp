@@ -4502,6 +4502,15 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
 
   const applyBBMode = (nextStraight: boolean, nextInverted: boolean) => {
+    // Per request (July 26): selecting a specific engine directly (Straight,
+    // Inverted, Markov, Random) IS the manual/non-Pulse mode — Pulse is
+    // precisely "auto-pick the best engine," so choosing one engine by hand
+    // should always turn it off, not leave it as a separate, easy-to-miss
+    // toggle. Previously this left pulseEnabled untouched, which meant a
+    // session that had stopped under Pulse stayed frozen when switching to
+    // a specific engine here, since the alreadyEnded fix from last time is
+    // gated on pulseEnabled actually being false.
+    setPulseEnabled(false);
     setBbStraightEnabled(nextStraight);
     setBbInvertedEnabled(nextInverted);
     setMarkovEnabled(false);
@@ -4509,11 +4518,12 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, nextStraight, nextInverted, executionMode, tableLimit, perNumberLimit, tierExecution, false, false, stopLossThreshold, givebackThreshold));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, nextStraight, nextInverted, executionMode, tableLimit, perNumberLimit, tierExecution, false, false, stopLossThreshold, givebackThreshold));
     }
   };
 
   const applyMarkovMode = () => {
+    setPulseEnabled(false);
     setBbStraightEnabled(false);
     setBbInvertedEnabled(false);
     setMarkovEnabled(true);
@@ -4521,11 +4531,12 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, true, false, stopLossThreshold, givebackThreshold));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, true, false, stopLossThreshold, givebackThreshold));
     }
   };
 
   const applyRandomMode = () => {
+    setPulseEnabled(false);
     setBbStraightEnabled(false);
     setBbInvertedEnabled(false);
     setMarkovEnabled(false);
@@ -4533,7 +4544,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
 
     const outcomes = history.map((h) => h.outcome);
     if (outcomes.length) {
-      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, pulseEnabled, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, true, stopLossThreshold, givebackThreshold));
+      setHistory(runStrategy(outcomes, strategy, baseUnit, startingBankroll, false, false, false, executionMode, tableLimit, perNumberLimit, tierExecution, false, true, stopLossThreshold, givebackThreshold));
     }
   };
   const applyExecutionMode = (nextMode: ExecutionMode) => {
