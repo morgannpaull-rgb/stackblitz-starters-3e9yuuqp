@@ -1907,7 +1907,23 @@ function analyseAxis(
   // GATE SELECTION — score all 256 3-input truth tables
   const gateResult = selectBest3InputGate(bits);
 
-  // GATE HOLD — no gate beats noise floor
+  // Per request (July 26): split what used to be one "HOLD" case into two,
+  // since they mean different things. "Not enough data to test any rule yet"
+  // (bits.length < 4) is a data constraint, not a confidence signal — the
+  // fallback prediction (andPrediction) is real and available, so use it
+  // instead of discarding it. "Plenty of data, but no gate clears the
+  // confidence threshold" is a genuine low-confidence signal worth keeping
+  // as an actual hold — Straight sitting out when its own search finds
+  // nothing better than chance is intentional, not a warmup artifact.
+  if (bits.length < 4) {
+    return makeResult(
+      andPrediction, "INSUFFICIENT_DATA_FALLBACK", "EXECUTE", false,
+      gateResult.gateId, "AND3-fallback", 0.5,
+      `${axisName} using fallback (${bits.length}/4 bits — not enough yet to test any gate) → ${andPrediction===0?"B/H/E":"R/L/O"}`,
+    );
+  }
+
+  // GATE HOLD — enough data, but no gate beats the noise floor
   if (gateResult.isHold || gateResult.prediction === null) {
     return makeResult(
       andPrediction, "GATE_HOLD", "HOLD", true,
@@ -2723,9 +2739,23 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // the REAL account's dollar ROI and has nothing to do with engine
     // identity. This function now just picks the leader and returns its
     // forecast — always, no gating.
+    //
+    // UNIFORM START (July 26): Inverted, Markov, and Random are all capable
+    // of producing a real prediction from spin 1; Straight's real gate-test
+    // can't mathematically begin before spin 5 (needs 4 bits of axis
+    // history), even with its own fallback covering the gap. Rather than
+    // let three engines quietly accumulate a few spins of unopposed
+    // evaluated score before Straight can compete at all — the same kind of
+    // head-start problem identified earlier with Markov — nobody's
+    // prediction counts toward evaluatedCount/cumulativeAdvantage, and no
+    // real bet is placed, until history.length >= 3 (first real bet at
+    // spin 4). All four engines start competing from exactly the same line.
+    const UNIFORM_START_SPINS = 3;
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
-    for (const step of history) {
+    for (let i = 0; i < history.length; i++) {
+      if (i < UNIFORM_START_SPINS) continue; // don't evaluate anyone's predictions for the first 3 spins
+      const step = history[i];
       const diag = (step as any).allEngineDiagnostics;
       const actual = step.outcomeGroup;
       if (!diag || !actual) continue;
@@ -2738,7 +2768,8 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       }
     }
 
-    const eligible = ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
+    const stillWaitingForUniformStart = history.length < UNIFORM_START_SPINS;
+    const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
@@ -2755,8 +2786,10 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     }
 
     const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : 0;
-    const isPaused = false;
-    const pauseReason: string | null = null;
+    const isPaused = stillWaitingForUniformStart;
+    const pauseReason: string | null = stillWaitingForUniformStart
+      ? `Waiting for uniform start — all four engines begin competing together at spin ${UNIFORM_START_SPINS + 1} (have ${history.length})`
+      : null;
 
     // Get prediction from selected engine
     let engineForecast: any;
