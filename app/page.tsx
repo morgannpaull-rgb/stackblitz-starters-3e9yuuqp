@@ -4554,10 +4554,21 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
         const settled = settleSpin(rows, randomSpin(), baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, randomEnabled, stopLossThreshold, givebackThreshold);
         const autoRunAudit = buildAutoRunAuditEntry(priorRows, settled);
         rows.push({ ...settled, autoRun: true, autoRunAudit });
-        // Stop conditions (loss floor / gains giveback) end the session
-        // outright once triggered, rather than running out the rest of
-        // autoSpins with no further betting.
-        if (settled.sessionEnded) break;
+        // Per request (July 26): no longer stops spin generation once a
+        // stop condition triggers. That conflated "this strategy stops
+        // betting" with "the wheel stops spinning" — in reality those are
+        // independent, and cutting spin generation short meant switching
+        // the Strategy dropdown afterward could only ever replay however
+        // many spins happened to occur before whichever strategy was live
+        // at the time triggered its own stop. The stop itself still fully
+        // applies (settleSpin already forces no further real bets once
+        // sessionEnded is true for the live strategy) — only the outcome
+        // GENERATION keeps going, so the full spin sequence is always
+        // available. This makes switching strategies mid-session behave
+        // the same way the Strategy Comparison table always has: each one
+        // sees the complete sequence and freezes its own bankroll wherever
+        // its own threshold actually hits, independent of any other
+        // strategy's result.
       }
       setHistory(rows);
       setAutoRunning(false);
