@@ -112,6 +112,11 @@ type Step = {
     isPaused?: boolean;
     pauseReason?: string | null;
     currentEngineTrend?: number | null;
+    // Engines currently skipped this spin for declining X% below their own
+    // peak cumulative-advantage score (see ENGINE_DECELERATION_PAUSE_PCT).
+    // They remain eligible again automatically once no longer this far
+    // below their own peak — no separate "resume" state is stored.
+    deceleratingEngines?: string[];
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -2731,8 +2736,19 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // gating just cut the number of betting opportunities without adding
     // real signal to compensate — reverted on that basis.
     const UNIFORM_START_SPINS = 3;
+    // Per request (July 26): a leading engine that decelerates rapidly from
+    // its own peak score gets skipped in favor of the next-highest eligible
+    // engine for that spin only — it can return the moment it stops
+    // declining (i.e. its score is no longer this far below its own peak).
+    // This is a percent-of-own-peak check, same shape as the account-level
+    // Trail-Stop, applied here to each engine's cumulative-advantage score
+    // instead of account ROI. Guarded on peak > 0 for the same reason the
+    // Trail-Stop guards on peakRoi > 0: percent-of-peak is meaningless (and
+    // can misfire backwards) once the peak itself is at or below zero.
+    const ENGINE_DECELERATION_PAUSE_PCT = 0.20;
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
+    const enginePeakScore: Record<string, number> = { Straight: -Infinity, Inverted: -Infinity, Markov: -Infinity, Random: -Infinity };
     for (let i = 0; i < history.length; i++) {
       if (i < UNIFORM_START_SPINS) continue; // don't evaluate anyone's predictions for the first 3 spins — all four start together
       const step = history[i];
@@ -2745,11 +2761,28 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
         const outcome = predicted === actual ? 1 : 0;
         cumulativeAdvantage[engine] += (outcome - getBreakevenRate(predicted));
         evaluatedCount[engine] += 1;
+        if (cumulativeAdvantage[engine] > enginePeakScore[engine]) enginePeakScore[engine] = cumulativeAdvantage[engine];
       }
     }
 
     const stillWaitingForUniformStart = history.length < UNIFORM_START_SPINS;
     const eligible = stillWaitingForUniformStart ? [] : ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
+
+    // Which eligible engines are currently decelerating rapidly from their
+    // own peak? (peak must be > 0 to arm — see comment above.)
+    const isDecelerating = (engine: string): boolean => {
+      const peak = enginePeakScore[engine];
+      if (!(peak > 0)) return false;
+      const current = cumulativeAdvantage[engine];
+      return current <= peak * (1 - ENGINE_DECELERATION_PAUSE_PCT);
+    };
+    const deceleratingEngines = eligible.filter(isDecelerating);
+    // Prefer non-decelerating engines; if that empties the field, fall back
+    // to the full eligible list so there's always a selection (same
+    // neutral-fallback pattern used when nobody is eligible at all yet).
+    const selectionPool = eligible.filter((e) => !isDecelerating(e));
+    const effectiveEligible = selectionPool.length ? selectionPool : eligible;
+
     const lastStep = history[history.length - 1];
     const currentEngine = (lastStep as any)?.pulseSelectedEngine ?? null;
 
@@ -2759,7 +2792,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       selectedEngine = "Straight"; // nobody has an evaluated prediction yet — neutral default
     } else {
       let best = -Infinity;
-      for (const engine of eligible) {
+      for (const engine of effectiveEligible) {
         if (cumulativeAdvantage[engine] > best) { best = cumulativeAdvantage[engine]; selectedEngine = engine; }
       }
       leaderReason = "highest-cumulative-advantage";
@@ -2814,6 +2847,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       isPaused,
       pauseReason,
       currentEngineTrend: null as number | null, // swing-low mechanism removed July 25; field kept for type compatibility
+      deceleratingEngines,
     };
 
     return {
@@ -2823,7 +2857,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       pulseEngineTracker: tracker,
       reason: isPaused
         ? `Pulse · PAUSED — ${pauseReason}`
-        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}`,
+        : `Pulse · ${selectedEngine} selected (cumulative advantage=${cumulativeAdvantage[selectedEngine]?.toFixed(2) ?? "—"} vs ~13.2% blended breakeven, ${engineRates[selectedEngine]}% / n=${engineSamples[selectedEngine]}) · ${ENGINE_ORDER.map((e) => `${e}:${cumulativeAdvantage[e].toFixed(2)}`).join(" · ")}${deceleratingEngines.length ? ` · cooling down: ${deceleratingEngines.join(", ")}` : ""}`,
     };
   }
 
@@ -5812,6 +5846,7 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     const tracker = (f as any).pulseEngineTracker;
     const scores: Record<string, number> = tracker?.challengerZScores ?? {};
     const selectedEngineName: string | null = tracker?.selectedEngine ?? null;
+    const deceleratingEngines: string[] = tracker?.deceleratingEngines ?? [];
 
     return (
       <CollapsiblePanel id="engineDirection" title="Engine Direction">
@@ -5823,12 +5858,14 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
             const engineKey = eng.label; // "Straight" | "Inverted" | "Markov" | "Random"
             const score = scores[engineKey];
             const isSelected = selectedEngineName === engineKey;
+            const isCoolingDown = deceleratingEngines.includes(engineKey);
             return (
               <div key={eng.key} style={{ border: `1px solid ${isSelected ? COLORS.cyan + "55" : t.border}`, borderRadius: 14, padding: 16, background: isSelected ? `${COLORS.cyan}08` : t.panel2 }}>
                 <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
                     <div style={{ fontSize: 16, fontWeight: 950, color: isSelected ? COLORS.cyan : t.text }}>{eng.label}</div>
                     {isSelected && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.cyan, background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px" }}>ACTIVE</div>}
+                    {isCoolingDown && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.amber, background: `${COLORS.amber}18`, border: `1px solid ${COLORS.amber}44`, borderRadius: 6, padding: "2px 8px" }}>COOLING DOWN</div>}
                   </div>
                   <div style={{ fontSize: 13, fontWeight: 900, color: t.subtext }}>score {typeof score === "number" ? score.toFixed(2) : "—"}</div>
                 </div>
@@ -6972,7 +7009,6 @@ const StreakAnalyticsPanel = () => {
     </main>
   </div>;
 }
-
 
 
 
