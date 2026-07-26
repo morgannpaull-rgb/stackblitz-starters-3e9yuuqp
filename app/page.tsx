@@ -112,6 +112,7 @@ type Step = {
     isPaused?: boolean;
     pauseReason?: string | null;
     currentEngineTrend?: number | null;
+    inConfirmedUptrend?: Record<string, boolean>;
   } | null;
   // Per-axis diagnostics for ALL 4 engines, computed every spin regardless of
   // which one Pulse actually selected — lets us audit engines retroactively.
@@ -2849,6 +2850,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       isPaused,
       pauseReason,
       currentEngineTrend: null as number | null, // swing-low mechanism removed July 25; field kept for type compatibility
+      inConfirmedUptrend, // per-engine trend state (July 26 redesign) — which engines are currently eligible (broke above their own last confirmed peak)
     };
 
     return {
@@ -5773,136 +5775,6 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
   };
   const CompactMetrics = () => <CollapsiblePanel id="compactMetrics" title="Compact Metrics"><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><MiniMetric label="Bankroll" value={bankroll.toLocaleString()} accent={net >= 0 ? COLORS.green : COLORS.red} /><MiniMetric label="Net" value={net.toLocaleString()} accent={net >= 0 ? COLORS.green : COLORS.red} /><MiniMetric label="Win Rate" value={winRate} /><MiniMetric label="ROI" value={roi} /></div></CollapsiblePanel>;
 
-  const DimensionPatternPanel = () => {
-    const isPulseAndStraight = pulseEnabled && bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !randomEnabled;
-    const divergence = isPulseAndStraight ? getPulseBBStraightDivergence(history) : null;
-
-    const perfColor = (ps: DimensionPerformanceState) =>
-      ps === "EXECUTE" ? COLORS.green : ps === "HOLD" ? COLORS.red : ps === "WARMING" ? t.subtext : COLORS.amber;
-
-    const renderAxis = (axis: PulseAxisDivergence | undefined, name: string, labels: [string, string]) => {
-      if (!axis) return null;
-      const pc = perfColor(axis.performanceState);
-      const fitPct = Math.round(axis.gateFitScore * 100);
-      const fitColor = fitPct >= 70 ? COLORS.green : fitPct >= 60 ? COLORS.amber : COLORS.red;
-      const gateInfo = axis.isWarming ? null : describeGateBehavior(axis.selectedGate);
-
-      // Last 20 AND conformance sequence
-      const dimIndex = name === "Color" ? 0 : name === "Range" ? 1 : 2;
-      const recentBits = groupSeries(history).map(groupToBits).map((b) => b[dimIndex]);
-      const seq: { match: boolean; bit: 0 | 1 }[] = [];
-      for (let i = 1; i < recentBits.length; i++) {
-        const actualBit = recentBits[i] as 0 | 1;
-        seq.push({ match: getStraightNextBit(recentBits.slice(0,i) as (0|1)[]) === actualBit, bit: actualBit });
-      }
-      const recent20 = seq.slice(-20);
-
-      return (
-        <div style={{ border: `1px solid ${axis.isHold ? COLORS.red+"44" : axis.isWarming ? t.border : COLORS.green+"33"}`, borderRadius: 12, padding: 12, background: axis.isHold ? "rgba(239,68,68,0.04)" : t.panel2 }}>
-
-          {/* Header */}
-          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 10 }}>
-            <div style={{ fontWeight: 950, fontSize: 13 }}>{name}</div>
-            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              {!axis.isWarming && !axis.isHold && gateInfo && (
-                <div style={{ background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: COLORS.cyan }}>
-                  {gateInfo.label}{gateInfo.id !== null ? <span style={{ opacity: 0.6, fontWeight: 700 }}> #{gateInfo.id}</span> : null}
-                </div>
-              )}
-              <div style={{ background: `${pc}18`, border: `1px solid ${pc}44`, borderRadius: 6, padding: "2px 8px", fontSize: 10, fontWeight: 950, color: pc }}>
-                {axis.performanceState}
-              </div>
-            </div>
-          </div>
-
-          {/* Prediction + Gate fit */}
-          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8, marginBottom: 10 }}>
-            <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Predicts</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: t.text, marginTop: 3 }}>
-                {axis.isHold || axis.isWarming ? "—" : axis.overrideBit === 0 ? labels[0] : labels[1]}
-              </div>
-            </div>
-            <div style={{ border: `1px solid ${fitColor}44`, borderRadius: 8, padding: "7px 10px", background: `${fitColor}08` }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Gate Fit</div>
-              <div style={{ fontSize: 16, fontWeight: 950, color: fitColor, marginTop: 3 }}>{axis.isWarming ? "—" : `${fitPct}%`}</div>
-            </div>
-            <div style={{ border: `1px solid ${t.border}`, borderRadius: 8, padding: "7px 10px", background: t.input }}>
-              <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase" }}>Selected Gate</div>
-              <div style={{ fontSize: 13, fontWeight: 950, color: COLORS.cyan, marginTop: 3 }}>
-                {axis.isWarming || !gateInfo ? "—" : <>{gateInfo.label}{gateInfo.id !== null ? <span style={{ fontSize: 10, opacity: 0.6, fontWeight: 700, marginLeft: 4 }}>#{gateInfo.id}</span> : null}</>}
-              </div>
-            </div>
-          </div>
-
-          {/* Gate fit bar */}
-          {!axis.isWarming && (
-            <div style={{ marginBottom: 10 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 700, marginBottom: 4 }}>
-                <span style={{ color: t.subtext }}>3-Input Gate Fit Score</span>
-                <span style={{ color: fitColor }}>{fitPct}% {axis.isHold ? "(below threshold)" : ""}</span>
-              </div>
-              <div style={{ height: 7, borderRadius: 999, background: t.input, border: `1px solid ${t.border}`, overflow: "hidden", position: "relative" }}>
-                <div style={{ width: `${fitPct}%`, height: "100%", background: fitColor, borderRadius: 999, transition: "width 0.3s ease" }} />
-                <div style={{ position: "absolute", top: 0, left: "55%", width: 1, height: "100%", background: `${COLORS.green}66` }} />
-              </div>
-              <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: t.subtext, marginTop: 2 }}>
-                <span>0%</span>
-                <span style={{ color: `${COLORS.green}cc` }}>55% → Trust</span>
-                <span>100%</span>
-              </div>
-            </div>
-          )}
-
-          {/* AND conformance sequence — kept as reference */}
-          <div>
-            <div style={{ fontSize: 9, color: t.subtext, fontWeight: 700, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 5 }}>
-              Last 20 Outcomes · Green = Gate Matched, Red = Gate Missed
-            </div>
-            <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
-              {recent20.map((entry, i) => (
-                <div key={i} style={{ width:22, height:22, borderRadius:5, background:entry.match?"rgba(16,185,129,0.15)":"rgba(239,68,68,0.15)", border:`1px solid ${entry.match?"rgba(16,185,129,0.40)":"rgba(239,68,68,0.40)"}`, display:"flex", alignItems:"center", justifyContent:"center", fontSize:9, fontWeight:950, color:entry.match?COLORS.green:COLORS.red }}>
-                  {labels[entry.bit][0]}
-                </div>
-              ))}
-              {recent20.length === 0 && <span style={{ color: t.subtext, fontSize: 11 }}>Need more spins</span>}
-            </div>
-          </div>
-        </div>
-      );
-    };
-
-    if (!isPulseAndStraight) {
-      return (
-        <CollapsiblePanel id="dimensionPattern" title="Dimension Pattern">
-          <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900, padding: "10px 0" }}>
-            Enable PULSE + STRAIGHT to activate the 3-input gate selector.
-          </div>
-        </CollapsiblePanel>
-      );
-    }
-
-    return (
-      <CollapsiblePanel id="dimensionPattern" title="Dimension Pattern">
-        {divergence && (
-          <div style={{ border:`1px solid ${divergence.isWarming?t.border:divergence.holdCount===3?COLORS.red+"55":COLORS.green+"44"}`, borderRadius:10, padding:"9px 12px", marginBottom:12, background:divergence.holdCount===3?"rgba(239,68,68,0.06)":"rgba(16,185,129,0.04)", display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-            <div style={{ fontWeight:950, fontSize:12, color:divergence.isWarming?t.subtext:divergence.holdCount===3?COLORS.red:COLORS.green }}>
-              {divergence.label}
-            </div>
-            <div style={{ fontWeight:950, fontSize:18, color:COLORS.cyan }}>
-              {divergence.isWarming || divergence.holdCount===3 ? "—" : divergence.group}
-            </div>
-          </div>
-        )}
-        <div style={{ display: "grid", gap: 10 }}>
-          {renderAxis(divergence?.color,  "Color",  ["Black","Red"])}
-          {renderAxis(divergence?.range,  "Range",  ["High","Low"])}
-          {renderAxis(divergence?.parity, "Parity", ["Even","Odd"])}
-        </div>
-      </CollapsiblePanel>
-    );
-  };
-
     const AxisDirectionalAccuracyPanel = () => {
     const diag = (f as any).allEngineDiagnostics;
     if (!diag) return null;
@@ -5948,36 +5820,57 @@ const setPulseEnabledSafely = (nextPulseEnabled: boolean) => {
     };
     const tierColor = (tier: Cell["tier"]) => tier === "strong" ? COLORS.green : tier === "moderate" ? COLORS.amber : tier === "weak" ? COLORS.red : t.subtext;
 
+    const tracker = (f as any).pulseEngineTracker;
+    const scores: Record<string, number> = tracker?.challengerZScores ?? {};
+    const uptrend: Record<string, boolean> = tracker?.inConfirmedUptrend ?? {};
+    const selectedEngineName: string | null = tracker?.selectedEngine ?? null;
+
     return (
       <CollapsiblePanel id="engineDirection" title="Engine Direction">
-        <div style={{ color: t.subtext, fontSize: 11, fontWeight: 800, marginBottom: 10 }}>
-          Every engine's current lean per axis, right now — bar length is signal strength (gate fit% for Straight/Markov, DPI magnitude for Inverted/Random).
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 800, marginBottom: 16 }}>
+          Every engine's own score, trend state, and current lean per axis — this is the same data Pulse uses to decide who to bet on. Only an engine showing UPTREND has broken back above its own last confirmed peak and is eligible to be selected.
         </div>
-        <div style={{ display: "grid", gridTemplateColumns: "62px repeat(3, 1fr)", gap: 8, alignItems: "end", marginBottom: 6 }}>
-          <div />
-          {AXES.map((a) => <div key={a.key} style={{ fontSize: 10, fontWeight: 950, color: t.subtext, textTransform: "uppercase", textAlign: "center" }}>{a.name}</div>)}
-        </div>
-        <div style={{ display: "grid", gap: 8 }}>
-          {ENGINES.map((eng) => (
-            <div key={eng.key} style={{ display: "grid", gridTemplateColumns: "62px repeat(3, 1fr)", gap: 8, alignItems: "center" }}>
-              <div style={{ fontSize: 11, fontWeight: 950 }}>{eng.label}</div>
-              {AXES.map((a) => {
-                const cell = cellFor(eng.key, a.key, a.labels);
-                const color = tierColor(cell.tier);
-                return (
-                  <div key={a.key} style={{ minWidth: 0 }}>
-                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 10, fontWeight: 800, marginBottom: 3, gap: 4 }}>
-                      <span style={{ color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{cell.label}</span>
-                      <span style={{ color: t.subtext, whiteSpace: "nowrap" }}>{cell.value}</span>
-                    </div>
-                    <div style={{ height: 4, borderRadius: 999, background: t.input, border: `1px solid ${t.border}`, overflow: "hidden" }}>
-                      <div style={{ width: `${cell.pct}%`, height: "100%", background: color, borderRadius: 999 }} />
+        <div style={{ display: "grid", gap: 16 }}>
+          {ENGINES.map((eng) => {
+            const engineKey = eng.label; // "Straight" | "Inverted" | "Markov" | "Random"
+            const score = scores[engineKey];
+            const isUp = uptrend[engineKey] === true;
+            const isSelected = selectedEngineName === engineKey;
+            return (
+              <div key={eng.key} style={{ border: `1px solid ${isSelected ? COLORS.cyan + "55" : t.border}`, borderRadius: 14, padding: 16, background: isSelected ? `${COLORS.cyan}08` : t.panel2 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 14 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <div style={{ fontSize: 16, fontWeight: 950, color: isSelected ? COLORS.cyan : t.text }}>{eng.label}</div>
+                    {isSelected && <div style={{ fontSize: 10, fontWeight: 950, color: COLORS.cyan, background: `${COLORS.cyan}18`, border: `1px solid ${COLORS.cyan}44`, borderRadius: 6, padding: "2px 8px" }}>ACTIVE</div>}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                    <div style={{ fontSize: 13, fontWeight: 900, color: t.subtext }}>score {typeof score === "number" ? score.toFixed(2) : "—"}</div>
+                    <div style={{ fontSize: 11, fontWeight: 950, color: isUp ? COLORS.green : t.subtext, background: isUp ? `${COLORS.green}18` : t.input, border: `1px solid ${isUp ? COLORS.green + "55" : t.border}`, borderRadius: 6, padding: "3px 10px" }}>
+                      {isUp ? "UPTREND" : "NOT UP"}
                     </div>
                   </div>
-                );
-              })}
-            </div>
-          ))}
+                </div>
+                <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 14 }}>
+                  {AXES.map((a) => {
+                    const cell = cellFor(eng.key, a.key, a.labels);
+                    const color = tierColor(cell.tier);
+                    return (
+                      <div key={a.key} style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 10, fontWeight: 950, color: t.subtext, textTransform: "uppercase", letterSpacing: 0.6, marginBottom: 4 }}>{a.name}</div>
+                        <div style={{ display: "flex", justifyContent: "space-between", fontSize: 13, fontWeight: 900, marginBottom: 6, gap: 6 }}>
+                          <span style={{ color, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{cell.label}</span>
+                          <span style={{ color: t.subtext, whiteSpace: "nowrap" }}>{cell.value}</span>
+                        </div>
+                        <div style={{ height: 8, borderRadius: 999, background: t.input, border: `1px solid ${t.border}`, overflow: "hidden" }}>
+                          <div style={{ width: `${cell.pct}%`, height: "100%", background: color, borderRadius: 999, transition: "width 0.3s ease" }} />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </CollapsiblePanel>
     );
@@ -6580,7 +6473,7 @@ const StreakAnalyticsPanel = () => {
     </CollapsiblePanel>;
   };
 
-  const Dashboard = () => <section style={{ display: "grid", gridTemplateColumns: "minmax(320px, 360px) minmax(520px, 1fr) minmax(360px, 430px)", gap: 14, alignItems: "start", minWidth: 1240, overflow: "visible" }}><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><SignalPanel /><CompactMetrics /><RouletteWheelPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, overflow: "hidden", alignContent: "start" }}><RouletteTable /><Last20SpinsStrip /><BankrollChart /><DimensionPatternPanel /><AxisDirectionalAccuracyPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><RecentLog /><ComparisonTable compact /></div></section>;
+  const Dashboard = () => <section style={{ display: "grid", gridTemplateColumns: "minmax(320px, 360px) minmax(520px, 1fr) minmax(360px, 430px)", gap: 14, alignItems: "start", minWidth: 1240, overflow: "visible" }}><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><SignalPanel /><CompactMetrics /><RouletteWheelPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, overflow: "hidden", alignContent: "start" }}><RouletteTable /><Last20SpinsStrip /><BankrollChart /><AxisDirectionalAccuracyPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, alignContent: "start" }}><RecentLog /><ComparisonTable compact /></div></section>;
 
 
 
