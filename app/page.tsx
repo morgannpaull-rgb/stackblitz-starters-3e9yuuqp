@@ -2709,93 +2709,37 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
     // fixed blended constant, since basket size varies spin to spin and this
     // is more precise than an average. This means a score of exactly zero
     // now means "breaking even in real money," not merely "beating a coin
-    // flip" — so PULSE_BASELINE_FLOOR (still 0) automatically means the
-    // right thing without needing a separately-tuned threshold.
+    // flip" — but per request (July 25), Pulse no longer gates on this at
+    // all — see below.
     const getBreakevenRate = (group: string | null): number => {
       const basketSize = group ? (GROUPS[group as GroupKey]?.length ?? 5) : 5;
       return basketSize / 36;
     };
 
-    // ─── FRACTAL SWING-LOW — replaces the 10-loss push (per request, July 25) ──
-    // Backtested properly before building (46 pooled session-sequences, 3,680
-    // spins): 12.9% with this rule vs. 13.0% baseline, z=-0.07 — no real
-    // accuracy edge, essentially dead-center zero difference even at this
-    // sample size. Built anyway as a pure risk/drawdown control, same
-    // rationale as the loss-streak rule it replaces: pausing on a genuine
-    // support break cuts exposure during confirmed downturns, independent of
-    // whether that downturn predicts anything about what comes next.
-    //
-    // This uses a real, standard technical-analysis definition, not a guessed
-    // threshold — earlier attempts (counting consecutive rising spins, then a
-    // guessed magnitude-of-bounce threshold) were both arbitrary parameter
-    // sweeps in disguise, which is exactly the "try enough numbers, one looks
-    // good" trap flagged elsewhere in this file. A fractal swing low is
-    // structural instead: a point on the leader's score path counts as a
-    // confirmed trough only once it's provably lower than the
-    // SWING_FRACTAL_WINDOW points immediately before AND after it — the
-    // standard definition used by real swing-point/fractal indicators, with
-    // SWING_FRACTAL_WINDOW=2 being that indicator's canonical default, not a
-    // fitted constant. Once a swing low is confirmed, a later drop below that
-    // level is a support break (pause); recovery back above it releases.
-    const SWING_FRACTAL_WINDOW = 2;
-
-    // Unbounded running sum per engine, replayed from the start of history
-    // every render (stateless, like everything else here) — no window, no
-    // floor, no ratio. Also builds the leader's own score path (leaderScorePath)
-    // so the fractal check below can look both backward and forward from any
-    // given point — forward-looking here means "later spins already in
-    // history," not the future, so this doesn't violate the no-lookahead rule
-    // that applies to the CURRENT spin's own decision.
+    // ─── ENGINE SELECTION ─── bet on whichever engine currently leads, every ──
+    // spin, no per-spin pause. Per request (July 25): the baseline floor and
+    // fractal swing-low (both removed here) were per-spin pauses tied to
+    // which engine was leading — that turned out to be a real source of
+    // confusion once the session-level stop-loss/giveback was also added,
+    // since two independent mechanisms were both capable of withholding a
+    // bet, for different and sometimes overlapping reasons. Simplified so
+    // there is exactly ONE thing that can stop betting: the adjustable
+    // session-level stop-loss/giveback in settleSpin, which is purely about
+    // the REAL account's dollar ROI and has nothing to do with engine
+    // identity. This function now just picks the leader and returns its
+    // forecast — always, no gating.
     const cumulativeAdvantage: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
     const evaluatedCount: Record<string, number> = { Straight: 0, Inverted: 0, Markov: 0, Random: 0 };
-    const leaderScorePath: number[] = [];
     for (const step of history) {
       const diag = (step as any).allEngineDiagnostics;
       const actual = step.outcomeGroup;
       if (!diag || !actual) continue;
-
-      // Who was leading BEFORE this step, using only prior steps' data —
-      // matches how the live decision would actually have been made.
-      const eligibleSoFar = ENGINE_ORDER.filter((e) => evaluatedCount[e] >= 1);
-      const leaderAtStep = eligibleSoFar.length
-        ? eligibleSoFar.reduce((best, e) => (cumulativeAdvantage[e] > cumulativeAdvantage[best] ? e : best), eligibleSoFar[0])
-        : "Straight";
-      leaderScorePath.push(cumulativeAdvantage[leaderAtStep]);
-
       for (const engine of ENGINE_ORDER) {
         const predicted = diag[engineDiagKey[engine]]?.group ?? null;
         if (!predicted) continue;
         const outcome = predicted === actual ? 1 : 0;
         cumulativeAdvantage[engine] += (outcome - getBreakevenRate(predicted));
         evaluatedCount[engine] += 1;
-      }
-    }
-
-    // Single forward pass: confirm fractal swing lows as soon as enough
-    // later points exist to verify them, and track support-break/release
-    // state as it would have evolved in real time.
-    const isFractalLow = (i: number): boolean => {
-      const w = SWING_FRACTAL_WINDOW;
-      if (i - w < 0 || i + w >= leaderScorePath.length) return false;
-      for (let k = i - w; k <= i + w; k++) {
-        if (k === i) continue;
-        if (leaderScorePath[k] <= leaderScorePath[i]) return false;
-      }
-      return true;
-    };
-    let confirmedTrough: number | null = null;
-    let isSwingPaused = false;
-    for (let i = 0; i < leaderScorePath.length; i++) {
-      const confirmIdx = i - SWING_FRACTAL_WINDOW;
-      if (confirmIdx >= 0 && isFractalLow(confirmIdx)) {
-        confirmedTrough = leaderScorePath[confirmIdx];
-      }
-      if (confirmedTrough !== null) {
-        if (leaderScorePath[i] < confirmedTrough && !isSwingPaused) {
-          isSwingPaused = true;
-        } else if (isSwingPaused && leaderScorePath[i] > confirmedTrough) {
-          isSwingPaused = false;
-        }
       }
     }
 
@@ -2815,29 +2759,9 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       leaderReason = "highest-cumulative-advantage";
     }
 
-    // ─── BASELINE FLOOR — pause if even the leader is below zero ────────────
-    // Per request (July 24): only bet when the leading engine's cumulative
-    // advantage score is at or above zero — i.e., performing at or above the
-    // 12.5% baseline, not merely "the least bad of four bad options." This is
-    // a continuous, stateless check: re-evaluated fresh every spin from the
-    // current scores, no separate release condition needed. If the leader's
-    // score climbs back to zero or above on any later spin, betting simply
-    // resumes that spin — nothing to track in between.
-    const PULSE_BASELINE_FLOOR = 0;
-    const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : -Infinity;
-    const belowBaselineFloor = eligible.length > 0 && leaderScore < PULSE_BASELINE_FLOOR;
-
-    // Precedence: below-baseline is checked and reported FIRST (per request,
-    // July 25) — if a spin is both below the money-breakeven floor AND mid a
-    // swing-low support break, the reported reason is the baseline one. Both
-    // conditions still independently cause a pause either way; this only
-    // changes which explanation is shown when they happen to overlap.
-    const isPaused = belowBaselineFloor || isSwingPaused;
-    const pauseReason: string | null = belowBaselineFloor
-      ? `${selectedEngine} is the best available engine but still below money-breakeven (score ${leaderScore.toFixed(2)} vs. ~13.2% blended breakeven, not just the 12.5% chance rate) — no engine currently profitable`
-      : isSwingPaused
-      ? `${selectedEngine}'s score (${leaderScore.toFixed(2)}) has broken below a confirmed swing low (${confirmedTrough?.toFixed(2)}) — will resume once it recovers back above that level`
-      : null;
+    const leaderScore = eligible.length ? cumulativeAdvantage[selectedEngine] : 0;
+    const isPaused = false;
+    const pauseReason: string | null = null;
 
     // Get prediction from selected engine
     let engineForecast: any;
@@ -2881,7 +2805,7 @@ function getActiveDecisionCore(history: Step[], pulseEnabled: boolean, bbStraigh
       zTrendDelta: null as number | null,
       isPaused,
       pauseReason,
-      currentEngineTrend: confirmedTrough,
+      currentEngineTrend: null as number | null, // swing-low mechanism removed July 25; field kept for type compatibility
     };
 
     return {
@@ -6790,7 +6714,7 @@ const StreakAnalyticsPanel = () => {
     const switches = rows.filter((row) => row.switched);
     return <Panel title="PULSE SWITCH LOG">
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 12, marginBottom: 10 }}>
-        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Every spin, each engine's cumulative advantage — an unbounded running sum of (outcome − breakeven rate for that spin's predicted group) since the start of the session, not a ratio — is compared, and whichever engine has the highest score leads. Breakeven is basket-size-specific (11.11% for 4-number groups, 13.89% for 5-number groups — the true money-breakeven given the 35:1 payout, not just the 12.5% fair-odds rate), recalibrated July 25 so a score of zero means actually breaking even in dollars. Switching is allowed, but an engine can only overtake another by accumulating real evidence over time. Betting pauses if the leader's score drops below breakeven, or if it breaks below a confirmed swing-low support level on its own score path (fractal-based, not a guessed threshold) — resuming once it recovers back above that level. Neither pause condition has shown a real accuracy edge in backtesting; both are risk/drawdown controls, not signals.</div>
+        <div style={{ color: t.subtext, fontSize: 12, fontWeight: 900 }}>Every spin, each engine's cumulative advantage — an unbounded running sum of (outcome − breakeven rate for that spin's predicted group) since the start of the session, not a ratio — is compared, and whichever engine has the highest score leads. Breakeven is basket-size-specific (11.11% for 4-number groups, 13.89% for 5-number groups — the true money-breakeven given the 35:1 payout, not just the 12.5% fair-odds rate). Switching is allowed, but an engine can only overtake another by accumulating real evidence over time. Pulse bets on whichever engine leads every single spin, with no per-spin pause — the earlier baseline-floor and swing-low pauses were removed (July 25) since they were tied to engine identity and created confusion once the session-level stop-loss/giveback was added. The only thing that can stop betting now is that session-level stop (adjustable in Settings), which is purely about the real account's dollar ROI and has nothing to do with which engine is leading.</div>
         <Button variant="secondary" onClick={downloadPulseSwitchLogCSV} disabled={!rows.length}>SWITCH LOG CSV</Button>
       </div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 8, marginBottom: 10 }}>
