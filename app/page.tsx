@@ -2051,6 +2051,61 @@ function cadenceForecast(history: Step[]) {
   };
 }
 
+// =====================================================
+// SCOUT — engine-selector ported from the roulette (EdgeLab) project's Pulse
+// mechanism, per request July 26. Kept entirely separate from this file's own
+// Pulse (which is an enhancer layered on a manually-chosen engine, and is
+// untouched by this). Scout is a different kind of mechanism: every hand, it
+// scores all four engines (Straight, Inverted, Markov, Cadence) on a running
+// cumulative-advantage total — sum of (win − 0.5 breakeven) since the shoe
+// started, recomputed fresh from history each time — and whichever engine
+// currently has the highest score is the one Scout picks. It doesn't touch
+// settleSpin/runStrategy/the betting pipeline at all: it just decides which
+// of the existing Straight/Inverted/Markov/Cadence toggles should be on,
+// exactly as if you'd tapped that Play Mode button yourself. Pulse still
+// works exactly as before on top of whichever engine Scout selects.
+// First 3 hands are a uniform start — nobody's forecast counts yet, so all
+// four begin competing from the same line.
+// =====================================================
+const SCOUT_ENGINE_ORDER = ["BB_STRAIGHT", "BB_INVERTED", "MARKOV", "CADENCE"] as const;
+const SCOUT_UNIFORM_START = 3;
+
+function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" {
+  const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
+  const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
+
+  for (let i = SCOUT_UNIFORM_START; i < history.length; i += 1) {
+    const prior = history.slice(0, i);
+    const actual = spinToBaccaratOutcome(history[i].outcome);
+    if (!actual) continue;
+
+    const forecasts: Record<string, GroupKey | null> = {
+      BB_STRAIGHT: bbStraightForecast(prior).group ?? null,
+      BB_INVERTED: bbInvertedForecast(prior).group ?? null,
+      MARKOV: markovForecast(prior).group ?? null,
+      CADENCE: cadenceForecast(prior).group ?? null,
+    };
+
+    for (const engine of SCOUT_ENGINE_ORDER) {
+      const predictedSide = getBaccaratSideFromForecastGroup(forecasts[engine]);
+      if (!predictedSide) continue;
+      const outcome = predictedSide === actual ? 1 : 0;
+      cumulative[engine] += outcome - 0.5;
+      evaluated[engine] += 1;
+    }
+  }
+
+  const eligible = SCOUT_ENGINE_ORDER.filter((e) => evaluated[e] >= 1);
+  if (eligible.length === 0) return "BB_STRAIGHT"; // neutral default before uniform start
+
+  let best: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" = eligible[0];
+  let bestScore = -Infinity;
+  for (const engine of eligible) {
+    if (cumulative[engine] > bestScore) { bestScore = cumulative[engine]; best = engine; }
+  }
+  return best;
+}
+
 
 // =====================================================
 // INDEPENDENT MARKOV PLAY MODE
@@ -4708,6 +4763,7 @@ export default function Page() {
   const [bbInvertedEnabled, setBbInvertedEnabled] = useState(false);
   const [markovEnabled, setMarkovEnabled] = useState(false);
   const [cadenceEnabled, setCadenceEnabled] = useState(false);
+  const [scoutEnabled, setScoutEnabled] = useState(false);
   // Execution Mode UI removed for Baccarat; internal execution remains locked to direct Player/Banker settlement.
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("Stream Direct");
   const [executeWeak, setExecuteWeak] = useState(DEFAULT_EXECUTE_WEAK);
@@ -4986,6 +5042,26 @@ export default function Page() {
     setCadenceEnabled(true);
     replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, true);
   };
+
+  // SCOUT SYNC — recomputes fresh from displayHistory any time it changes,
+  // and (only while Scout is on) drives the same manual engine toggles a
+  // person would tap by hand. Does not touch settleSpin/runStrategy or any
+  // Pulse logic at all.
+  const scoutPick = useMemo(() => (scoutEnabled ? getScoutSelectedEngine(displayHistory) : null), [scoutEnabled, displayHistory]);
+  useEffect(() => {
+    if (!scoutEnabled || !scoutPick) return;
+    const alreadyMatches =
+      (scoutPick === "BB_STRAIGHT" && bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !cadenceEnabled) ||
+      (scoutPick === "BB_INVERTED" && bbStraightEnabled && bbInvertedEnabled && !markovEnabled && !cadenceEnabled) ||
+      (scoutPick === "MARKOV" && markovEnabled) ||
+      (scoutPick === "CADENCE" && cadenceEnabled);
+    if (alreadyMatches) return;
+    if (scoutPick === "BB_STRAIGHT") applyBBMode(true, false);
+    else if (scoutPick === "BB_INVERTED") applyBBMode(true, true);
+    else if (scoutPick === "MARKOV") applyMarkovMode();
+    else if (scoutPick === "CADENCE") applyCadenceMode();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scoutPick, scoutEnabled]);
   const applyExecutionMode = (_nextMode: ExecutionMode) => {
     const nextMode: ExecutionMode = "Stream Direct";
     setExecutionMode(nextMode);
@@ -5460,6 +5536,7 @@ export default function Page() {
       : "Awaiting Player/Banker signal.";
     return <Panel title="Signal State" style={{ minHeight: 344 }}>
       <button onClick={applyPulseMode} style={{ width: "100%", height: 34, borderRadius: 10, border: `1px solid ${pulseEnabled ? COLORS.cyan : COLORS.red}`, background: pulseEnabled ? "rgba(34,199,243,0.16)" : "rgba(239,68,68,0.10)", color: pulseEnabled ? COLORS.cyan : COLORS.red, fontWeight: 950, cursor: "pointer", marginBottom: 8 }}>{pulseEnabled ? "PULSE ON" : "PULSE OFF"}</button>
+      <button onClick={() => setScoutEnabled((v) => !v)} style={{ width: "100%", height: 34, borderRadius: 10, border: `1px solid ${scoutEnabled ? COLORS.amber : COLORS.red}`, background: scoutEnabled ? "rgba(245,158,11,0.16)" : "rgba(239,68,68,0.10)", color: scoutEnabled ? COLORS.amber : COLORS.red, fontWeight: 950, cursor: "pointer", marginBottom: 8 }}>{scoutEnabled ? "SCOUT ON" : "SCOUT OFF"}</button>
       <div style={{ fontSize: 10, color: t.subtext, fontWeight: 950, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Play Mode</div>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(5, 1fr)", gap: 8, marginBottom: 10 }}>
         <button onClick={() => applyBBMode(false, false)} style={{ height: 34, borderRadius: 10, border: `1px solid ${!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !cadenceEnabled ? COLORS.red : t.borderStrong}`, background: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !cadenceEnabled ? "rgba(239,68,68,0.10)" : t.input, color: !bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !cadenceEnabled ? COLORS.red : t.subtext, fontWeight: 950, cursor: "pointer", whiteSpace: "nowrap", fontSize: 12 }}>OFF</button>
