@@ -2670,10 +2670,11 @@ type PulseEngineSource = "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE";
 
 function getEngineRowSource(row: Step): PulseEngineSource | null {
   const selected = row.pulseDiagnostics?.selectedEngine;
-  if (selected === "BB_STRAIGHT" || selected === "BB_INVERTED" || selected === "MARKOV") return selected;
+  if (selected === "BB_STRAIGHT" || selected === "BB_INVERTED" || selected === "MARKOV" || selected === "CADENCE") return selected;
   if (row.note.includes("BB_STRAIGHT") || row.note.includes("Straight BB") || row.note.includes("BB Straight")) return "BB_STRAIGHT";
   if (row.note.includes("BB_INVERTED") || row.note.includes("Inverted BB") || row.note.includes("BB Inverted")) return "BB_INVERTED";
   if (row.note.includes("MARKOV") || row.note.includes("Markov")) return "MARKOV";
+  if (row.note.includes("CADENCE") || row.note.includes("Cadence")) return "CADENCE";
   return null;
 }
 
@@ -2877,7 +2878,7 @@ function getMarkovPulse(history: Step[]) {
 }
 
 
-function getMarkovAssistForBbPulse(history: Step[], engine: "BB_STRAIGHT" | "BB_INVERTED") {
+function getMarkovAssistForBbPulse(history: Step[], engine: "BB_STRAIGHT" | "BB_INVERTED" | "CADENCE") {
   // MARKOV ASSIST FOR BB ENGINES ONLY
   // This is not the standalone Markov engine and does not create predictions.
   // It answers one question for BB Straight / BB Inverted + Pulse:
@@ -2896,7 +2897,7 @@ function getMarkovAssistForBbPulse(history: Step[], engine: "BB_STRAIGHT" | "BB_
   const bbStraightTrapCadence = recent.includes("11011011") || recent.endsWith("11011") || recent.endsWith("1101");
   const bbInvertedTrapCadence = recent.includes("00100100") || recent.endsWith("00100") || recent.endsWith("0010");
   const alternatingCadence = recent.includes("101101101") || recent.includes("010010010");
-  const engineCadenceRisk = engine === "BB_STRAIGHT" ? bbStraightTrapCadence || alternatingCadence : bbInvertedTrapCadence || alternatingCadence;
+  const engineCadenceRisk = engine === "BB_STRAIGHT" || engine === "CADENCE" ? bbStraightTrapCadence || alternatingCadence : bbInvertedTrapCadence || alternatingCadence;
 
   let markovTrials = 0;
   let markovWins = 0;
@@ -3095,7 +3096,7 @@ function getPulseLossProtection(history: Step[], engine: PulseEngineSource) {
   // Four straight losses should warn/downgrade, not lock the engine in Observe.
   // Straight only enters a true hold on a deeper confirmed loss cluster, and it
   // can re-enter after the first shadow/real recovery win through consensusReEntry.
-  const isStraight = engine === "BB_STRAIGHT";
+  const isStraight = engine === "BB_STRAIGHT" || engine === "CADENCE";
   const active = isStraight ? stats.lossRun >= 4 || recentLosses >= 4 : stats.lossRun >= 4 || recentLosses >= 5;
   const severe = isStraight ? stats.lossRun >= 6 || recentLosses >= 5 : stats.lossRun >= 5 || recentLosses >= 5;
 
@@ -3311,7 +3312,7 @@ function getPulseEngineSpecificConfidenceModulation(history: Step[], engine: Pul
     ? Math.max(0, Math.min(100, Math.round(100 - Math.min(90, Math.abs(dpiValue) * 7 + recentLossPressure * 5))))
     : 0;
 
-  if (engine === "BB_STRAIGHT") {
+  if (engine === "BB_STRAIGHT" || engine === "CADENCE") {
     const penalty = compressionRisk >= 85 ? -16 : compressionRisk >= 70 ? -11 : compressionRisk >= 55 ? -6 : 0;
     return {
       adjustment: penalty,
@@ -3371,7 +3372,7 @@ function getPulseSevenComponentState(
   const lossProtection = getPulseLossProtection(history, engine);
   const consensus = getPulseConsensusReEntry(history, engine, forecastGroup);
   const cadence =
-    engine === "BB_STRAIGHT" || engine === "BB_INVERTED"
+    engine === "BB_STRAIGHT" || engine === "BB_INVERTED" || engine === "CADENCE"
       ? getMarkovAssistForBbPulse(history, engine)
       : getPulseAuthorityForStandaloneMarkov(history);
 
