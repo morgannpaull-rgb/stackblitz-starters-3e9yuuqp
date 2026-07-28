@@ -4121,8 +4121,14 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
 
   // RELAXED PUSH LOGIC
   // Any executable forecast must settle WIN/LOSS.
-  // PUSH only occurs during true HOLD / Observe / no-forecast states.
-  const executableForecast = !!lockedForecastGroup && f.source !== "NONE" && executionAllowed;
+  // PUSH only occurs during true HOLD / Observe / no-forecast states — and,
+  // per a bug found and fixed July 28, during any other state where `active`
+  // is false (no real bet placed), including the engine-decline halt. Before
+  // this fix, `executableForecast` didn't check `active`, so a held/halted
+  // hand's shadow forecast-vs-outcome match could still force result to
+  // "win"/"loss" using the correctly-zeroed exposure, producing a wrong
+  // "LOSS" label on a $0 hand.
+  const executableForecast = active && !!lockedForecastGroup && f.source !== "NONE" && executionAllowed;
 
   if (executableForecast) {
     if (combinedHit) {
@@ -5775,8 +5781,8 @@ export default function Page() {
       const endBankroll = rows[rows.length - 1].bankroll;
       const groups = rows.map((row) => row.outcomeGroup);
       const e = entropy(groups);
-      const tdaHolds = rows.filter((row) => row.note.includes("TDA") || !row.predictedGroup).length;
-      const executed = rows.filter((row) => row.predictedGroup).length;
+      const tdaHolds = rows.filter((row) => !(row.unitBet > 0)).length;
+      const executed = rows.filter((row) => row.unitBet > 0).length;
       const coreMisses = rows.filter((row) => row.coreResult === "loss").length;
       const overlayMisses = rows.filter((row) => row.overlayResult === "loss").length;
       const tiers = Array.from(new Set(rows.map((row) => row.tier))).join(" / ");
@@ -5856,7 +5862,7 @@ export default function Page() {
             <tbody>
               {audit.rows.map((row) => {
                 const outcomeLabel = formatSpinAsBaccarat(row.outcome);
-                const executionLabel = row.predictedGroup ? "EXEC" : "HOLD";
+                const executionLabel = row.unitBet > 0 ? "EXEC" : "HOLD";
                 const nextRow = displayHistory.find((item) => item.spin === row.spin + 1) ?? null;
                 const previousRow = displayHistory.find((item) => item.spin === row.spin - 1) ?? null;
                 const forecastLabel = row.predictedGroup || row.forecastGroup ? formatGroupAsBaccarat(row.predictedGroup ?? row.forecastGroup) : "HOLD";
