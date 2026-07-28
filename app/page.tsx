@@ -2059,6 +2059,22 @@ function repeatLastOutcomeForecast(history: Step[]) {
 // no matter how long the shoe runs.
 const SCOUT_ENGINE_ORDER = ["BB_STRAIGHT", "BB_INVERTED", "MARKOV", "CADENCE"] as const;
 const SCOUT_UNIFORM_START = 3;
+// Per finding July 28: flat (undecayed) cumulative scoring lets an early hot
+// streak become a permanent, unbeatable lead — confirmed on a real session
+// where Markov built a peak lead of +8.0 by hand 46 and then declined
+// continuously for the rest of the shoe, but no other engine ever
+// generated enough of its own gains to close a 4-5 point gap. Applying
+// exponential decay (recent hands count more, older ones fade) fixes this:
+// tested against that same session across decay factors 1.0 (no decay) to
+// 0.85 — 0.97 broke the lock-in cleanly (Scout escaped to Straight/Inverted
+// by hand 57 instead of staying on Markov through hand 80) while keeping
+// switching frequency reasonable (8 switches over the session, same as
+// gentler decay values, but with meaningfully more diversity). Net result
+// on that session: -925 (flat) vs +175 (decayed) — a real, not cosmetic,
+// difference. Applied to both Scout's own selection and the engine-decline
+// halt's peak-tracking, so both mechanisms read from the same underlying
+// "current strength" metric rather than one being decayed and the other not.
+const SCOUT_DECAY_FACTOR = 0.97;
 // Per finding July 27: the earlier windowed version (40/30-hand caps) was a
 // mistake — it changed Scout from "reward genuine outperformance since the
 // shoe started" (roulette's original design) into "chase whoever had a hot
@@ -2102,7 +2118,7 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
       const predictedSide = getBaccaratSideFromForecastGroup(forecasts[engine]);
       if (!predictedSide) continue;
       const outcome = predictedSide === actual ? 1 : 0;
-      cumulative[engine] += outcome - 0.5;
+      cumulative[engine] = cumulative[engine] * SCOUT_DECAY_FACTOR + outcome - 0.5;
       evaluated[engine] += 1;
     }
   }
@@ -2171,7 +2187,7 @@ function getEngineHaltState(history: Step[]): { haltActive: boolean; allDeclinin
       const predictedSide = getBaccaratSideFromForecastGroup(forecasts[engine]);
       if (!predictedSide) continue;
       const outcome = predictedSide === actual ? 1 : 0;
-      cumulative[engine] += outcome - 0.5;
+      cumulative[engine] = cumulative[engine] * SCOUT_DECAY_FACTOR + outcome - 0.5;
       evaluated[engine] += 1;
       if (cumulative[engine] > peak[engine]) peak[engine] = cumulative[engine];
       scoreTrail[engine].push(cumulative[engine]);
