@@ -65,6 +65,10 @@ type Step = {
   etrBetType?: ETRBetType;
   recoveryStep?: number;
   oneThreeTwoSixStep?: number;
+  // Set once the all-engines-declining-from-peak circuit breaker fires (see
+  // getEngineDeclineHaltTriggered) — permanent for the rest of the session,
+  // same semantics as roulette's Stop-Loss/Trail-Stop.
+  sessionEnded?: boolean;
 };
 
 type SavedSession = {
@@ -2131,6 +2135,79 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
   return best;
 }
 
+// =====================================================
+// ENGINE DECLINE HALT — per request July 27, updated same day to be
+// releasable rather than permanent. A circuit breaker separate from Scout:
+// tracks each of the four engines' own peak cumulative-advantage score
+// reached since the session started, and halts betting once EVERY engine's
+// current score is below its own peak by more than ENGINE_DECLINE_MIN_MARGIN
+// at the same time — including whichever one currently has the highest
+// score. The point is to catch "everything is worse than it's been, even
+// the best option," not just "one engine is down."
+//
+// Unlike roulette's Stop-Loss/Trail-Stop (permanent once triggered), this
+// halt is re-evaluated fresh every hand and releases automatically the
+// moment ANY engine shows upward movement over the last
+// ENGINE_RECOVERY_LOOKBACK hands — even if that engine is still below its
+// own all-time peak. It doesn't need to fully recover, just start moving
+// the right direction again. Both engineHaltActive and the two settings
+// below are what settleSpin reads to decide whether to bet this hand.
+// =====================================================
+const ENGINE_DECLINE_MIN_MARGIN = 1; // tuned July 27 against real session data — 0 fired at hand 9/80 (too early, noise); 1 fires at hand 23/80 (meaningful, still early); 2 fires at hand 74/80 (too late to be useful)
+const ENGINE_RECOVERY_LOOKBACK = 5; // hands to look back when checking whether any engine has started trending upward again
+const _engineHaltCache = new Map<string, { haltActive: boolean; allDeclining: boolean; anyRecovering: boolean }>();
+
+function getEngineHaltState(history: Step[]): { haltActive: boolean; allDeclining: boolean; anyRecovering: boolean } {
+  const cacheKey = history.length + ":" + history.map((h) => h.outcome).join(",");
+  const cached = _engineHaltCache.get(cacheKey);
+  if (cached) return cached;
+
+  const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
+  const peak: Record<string, number> = { BB_STRAIGHT: -Infinity, BB_INVERTED: -Infinity, MARKOV: -Infinity, CADENCE: -Infinity };
+  const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
+  const scoreTrail: Record<string, number[]> = { BB_STRAIGHT: [], BB_INVERTED: [], MARKOV: [], CADENCE: [] };
+
+  for (let i = SCOUT_UNIFORM_START; i < history.length; i += 1) {
+    const prior = history.slice(0, i);
+    const actual = spinToBaccaratOutcome(history[i].outcome);
+    if (!actual) continue;
+
+    const forecasts: Record<string, GroupKey | null> = {
+      BB_STRAIGHT: bbStraightForecast(prior).group ?? null,
+      BB_INVERTED: bbInvertedForecast(prior).group ?? null,
+      MARKOV: markovForecast(prior).group ?? null,
+      CADENCE: cadenceForecast(prior).group ?? null,
+    };
+
+    for (const engine of SCOUT_ENGINE_ORDER) {
+      const predictedSide = getBaccaratSideFromForecastGroup(forecasts[engine]);
+      if (!predictedSide) continue;
+      const outcome = predictedSide === actual ? 1 : 0;
+      cumulative[engine] += outcome - 0.5;
+      evaluated[engine] += 1;
+      if (cumulative[engine] > peak[engine]) peak[engine] = cumulative[engine];
+      scoreTrail[engine].push(cumulative[engine]);
+    }
+  }
+
+  const allEvaluated = SCOUT_ENGINE_ORDER.every((e) => evaluated[e] >= 1);
+  const allDeclining = allEvaluated && SCOUT_ENGINE_ORDER.every((e) => cumulative[e] < peak[e] - ENGINE_DECLINE_MIN_MARGIN);
+
+  const anyRecovering = allEvaluated && SCOUT_ENGINE_ORDER.some((engine) => {
+    const trail = scoreTrail[engine];
+    if (trail.length < 2) return false;
+    const lookbackIdx = Math.max(0, trail.length - 1 - ENGINE_RECOVERY_LOOKBACK);
+    return trail[trail.length - 1] > trail[lookbackIdx];
+  });
+
+  const haltActive = allDeclining && !anyRecovering;
+  const result = { haltActive, allDeclining, anyRecovering };
+
+  if (_engineHaltCache.size > 200) _engineHaltCache.delete(_engineHaltCache.keys().next().value);
+  _engineHaltCache.set(cacheKey, result);
+  return result;
+}
+
 
 // =====================================================
 // INDEPENDENT MARKOV PLAY MODE
@@ -3966,7 +4043,18 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
   const executionAllowed = shouldExecuteTier(f.tier, f.source, tierExecution, (f as any).rv, (f as any).entropyExtreme);
   const dimensionTDAAllowed = true; // TDA diagnostic only, not a hard gate.
+
+  // ENGINE DECLINE HALT — live condition, re-evaluated every hand, not a
+  // permanent ratchet. Checked using only PRIOR history (never this hand's
+  // own outcome), matching the "decide before observing" principle used
+  // everywhere else in this file. Auto-releases the moment any engine shows
+  // upward movement over the last ENGINE_RECOVERY_LOOKBACK hands, even if
+  // it's still below its own peak — see getEngineHaltState.
+  const haltState = getEngineHaltState(history);
+  const sessionEnded = haltState.haltActive;
+
   const active =
+    !sessionEnded &&
     f.source !== "NONE" &&
     executionAllowed &&
     (
@@ -4078,7 +4166,9 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
     exposure,
     net,
     bankroll: bankroll + net,
-    note: active
+    note: sessionEnded
+      ? "PAUSED — all four engines below their own peak, none trending up yet"
+      : active
       ? `${formatBaccaratEngineLabel(f.source, f.tier)} · Bet ${formatGroupAsBaccaratShort(settledForecastGroup)}${f.source === "PULSE" && (f as any).dimensionTDA?.compressed ? " · Compression" : ""}${f.source === "PULSE" ? ` · Conf ${f.confidence}%` : ""}${overlayHit ? " · Overlay Hit" : ""}${hasStreamConflict(lockedForecastGroup, executionMode, f.source) ? " · Stream Conflict" : ""}${etrNote}${oneThreeTwoSixNote}`
       : !dimensionTDAAllowed
       ? `No Bet · Baccarat alignment below ${((f as any).dimensionTDA?.min ?? DEFAULT_DIMENSION_GATE_MIN)}%`
@@ -4099,6 +4189,7 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
     etrBetType: active ? etrPlan.etrBetType : "flat",
     recoveryStep: active ? etrPlan.recoveryStep : 0,
     oneThreeTwoSixStep,
+    sessionEnded,
   };
 }
 
@@ -5613,6 +5704,12 @@ export default function Page() {
       {scoutEnabled && (
         <div style={{ textAlign: "center", fontSize: 10, fontWeight: 900, color: COLORS.amber, letterSpacing: 0.4, marginBottom: 8 }}>
           → {{ BB_STRAIGHT: "STRAIGHT", BB_INVERTED: "INVERTED", MARKOV: "MARKOV", CADENCE: "CADENCE" }[scoutPick ?? "BB_STRAIGHT"]}
+        </div>
+      )}
+      {displayHistory.at(-1)?.sessionEnded && (
+        <div style={{ textAlign: "center", fontSize: 11, fontWeight: 950, color: COLORS.red, background: "rgba(239,68,68,0.14)", border: `1px solid ${COLORS.red}55`, borderRadius: 8, padding: "8px 10px", marginBottom: 10, lineHeight: 1.4 }}>
+          BETTING PAUSED
+          <div style={{ fontSize: 10, fontWeight: 800, color: t.subtext, marginTop: 3 }}>All four engines below their own peak. Resumes automatically once one starts trending up.</div>
         </div>
       )}
       <div style={{ fontSize: 10, color: t.subtext, fontWeight: 950, letterSpacing: 0.8, textTransform: "uppercase", marginBottom: 6 }}>Play Mode</div>
