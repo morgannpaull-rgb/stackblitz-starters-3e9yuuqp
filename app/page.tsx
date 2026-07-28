@@ -2263,6 +2263,16 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   // showing whatever you last picked manually. If Baccarat's own Pulse
   // (a separate, unrelated enhancer) is also on, it still enhances
   // whichever engine Scout selects, exactly as it would for a manual pick.
+  //
+  // Bug found and fixed July 27: if Scout's picked engine had no forecast
+  // group that hand (a hold state), this block used to fall all the way
+  // through to the manual Play Mode flags below — meaning Scout would
+  // silently bet whatever engine happened to still be manually selected
+  // underneath it, contaminating Scout's real results with leftover manual
+  // state (confirmed: this made Scout track Straight almost exactly when
+  // Straight was the last manual pick, unrelated to Scout's own scoring).
+  // Scout now always returns its OWN hold decision instead of falling
+  // through, so it can never inherit a manual selection while it's on.
   if (scoutEnabled) {
     const picked = getScoutSelectedEngine(history);
     const forecastByPick: Record<string, any> = { BB_STRAIGHT: straight, BB_INVERTED: inverted, MARKOV: markov, CADENCE: cadence };
@@ -2275,6 +2285,15 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
       };
       return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
     }
+    return {
+      group: null as GroupKey | null,
+      numbers: [] as SpinValue[],
+      confidence: 0,
+      tier: "No Prediction",
+      reason: `Scout picked ${picked}, but it has no forecast this hand — holding rather than falling back to a manual selection.`,
+      source: picked as PulseEngineSource,
+      mode,
+    };
   }
 
   // HARD PLAY-MODE AUTHORITY
