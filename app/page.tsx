@@ -2056,27 +2056,43 @@ function cadenceForecast(history: Step[]) {
 // SCOUT — engine-selector ported from the roulette (EdgeLab) project's Pulse
 // mechanism, per request July 26. Kept entirely separate from this file's own
 // Pulse (which is an enhancer layered on a manually-chosen engine, and is
-// untouched by this). Scout is a different kind of mechanism: every hand, it
-// scores all four engines (Straight, Inverted, Markov, Cadence) on a running
-// cumulative-advantage total — sum of (win − 0.5 breakeven) since the shoe
-// started, recomputed fresh from history each time — and whichever engine
-// currently has the highest score is the one Scout picks. It doesn't touch
-// settleSpin/runStrategy/the betting pipeline at all: it just decides which
-// of the existing Straight/Inverted/Markov/Cadence toggles should be on,
-// exactly as if you'd tapped that Play Mode button yourself. Pulse still
-// works exactly as before on top of whichever engine Scout selects.
-// First 3 hands are a uniform start — nobody's forecast counts yet, so all
-// four begin competing from the same line.
-// =====================================================
+// untouched by this). Scout is a different kind of mechanism: it scores all
+// four engines (Straight, Inverted, Markov, Cadence) on a cumulative-
+// advantage total — sum of (win − 0.5 breakeven) — over a bounded recent
+// window, and whichever engine currently has the highest score is the one
+// Scout picks. It doesn't touch settleSpin/runStrategy/the betting pipeline
+// at all beyond reading history: it's called fresh inside getActiveDecision,
+// which itself runs once per hand — so this MUST stay cheap regardless of
+// how long the shoe has gotten, or it locks the page on longer sessions/
+// AutoRun batches (found and fixed July 26: the original version scanned
+// the entire shoe from scratch on every single hand, which made building a
+// long history effectively cubic-time). Both the number of hands evaluated
+// and the amount of history each forecast call is allowed to see are capped
+// to small constants, so the total cost stays roughly linear in shoe length
+// no matter how long the shoe runs.
 const SCOUT_ENGINE_ORDER = ["BB_STRAIGHT", "BB_INVERTED", "MARKOV", "CADENCE"] as const;
 const SCOUT_UNIFORM_START = 3;
+const SCOUT_EVAL_WINDOW = 40;      // only score the most recent N hands, not the whole shoe
+const SCOUT_FORECAST_CONTEXT = 30; // each forecast call only sees the most recent N hands before it
+
+const _scoutCache = new Map<string, "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE">();
 
 function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" {
+  // Cache key uses only the outcome sequence (what Scout actually depends
+  // on) — not bet size, bankroll, tier, or anything strategy-specific. This
+  // is what lets all 13 Strategy Comparison replays, which share the same
+  // underlying hands and differ only in bet sizing, hit the same cache entry
+  // instead of each independently re-running the full scoring scan.
+  const cacheKey = history.length + ":" + history.slice(-SCOUT_EVAL_WINDOW).map((h) => h.outcome).join(",");
+  const cached = _scoutCache.get(cacheKey);
+  if (cached) return cached;
+
   const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
   const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
 
-  for (let i = SCOUT_UNIFORM_START; i < history.length; i += 1) {
-    const prior = history.slice(0, i);
+  const startIdx = Math.max(SCOUT_UNIFORM_START, history.length - SCOUT_EVAL_WINDOW);
+  for (let i = startIdx; i < history.length; i += 1) {
+    const prior = history.slice(Math.max(0, i - SCOUT_FORECAST_CONTEXT), i);
     const actual = spinToBaccaratOutcome(history[i].outcome);
     if (!actual) continue;
 
@@ -2097,13 +2113,18 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
   }
 
   const eligible = SCOUT_ENGINE_ORDER.filter((e) => evaluated[e] >= 1);
-  if (eligible.length === 0) return "BB_STRAIGHT"; // neutral default before uniform start
+  if (eligible.length === 0) {
+    _scoutCache.set(cacheKey, "BB_STRAIGHT"); // neutral default before uniform start
+    return "BB_STRAIGHT";
+  }
 
   let best: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" = eligible[0];
   let bestScore = -Infinity;
   for (const engine of eligible) {
     if (cumulative[engine] > bestScore) { bestScore = cumulative[engine]; best = engine; }
   }
+  if (_scoutCache.size > 200) _scoutCache.delete(_scoutCache.keys().next().value);
+  _scoutCache.set(cacheKey, best);
   return best;
 }
 
