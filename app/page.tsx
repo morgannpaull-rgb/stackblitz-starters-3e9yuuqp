@@ -1688,16 +1688,10 @@ type PulseAxisDivergence = {
 };
 
 type PulseDivergenceResult = {
-  color: PulseAxisDivergence;
-  range: PulseAxisDivergence;
-  parity: PulseAxisDivergence;
-  colorBit: 0 | 1;
-  rangeBit: 0 | 1;
-  parityBit: 0 | 1;
+  side: PulseAxisDivergence; // the one real axis: Banker/Player
+  sideBit: 0 | 1;
   group: GroupKey;
-  overrideCount: number;
-  holdCount: number;
-  isWarming: boolean;
+  isHold: boolean;
   label: string;
 };
 
@@ -1871,12 +1865,7 @@ function computeAxisConfidence(bits: (0|1)[], gateId: number, window=AXIS_CONF_W
 }
 
 // ── Main per-axis analyser ──────────────────────────────────────────────────
-function analyseAxis(
-  bits: (0|1)[],
-  axisName: string,
-  gatePredOtherA: 0|1,
-  gatePredOtherB: 0|1,
-): PulseAxisDivergence {
+function analyseAxis(bits: (0|1)[], axisName: string): PulseAxisDivergence {
   const andPrediction: 0|1 = getStraightNextBit(bits) as 0|1;
   const isWarming = false;
 
@@ -1912,7 +1901,7 @@ function analyseAxis(
     return makeResult(
       andPrediction, "INSUFFICIENT_DATA_FALLBACK", "EXECUTE", false,
       gateResult.gateId, "AND3-fallback", 0.5,
-      `${axisName} using fallback (${bits.length}/4 bits — not enough yet to test any gate) → ${andPrediction===0?"B/H/E":"R/L/O"}`,
+      `${axisName} using fallback (${bits.length}/4 hands — not enough yet to test any gate) → ${andPrediction===0?"Player":"Banker"}`,
     );
   }
 
@@ -1932,41 +1921,25 @@ function analyseAxis(
     gatePrediction !== andPrediction ? `GATE_${gateResult.gateName}` : "NONE",
     "EXECUTE", false,
     gateResult.gateId, gateResult.gateName, gateResult.fitScore,
-    `${axisName} EXECUTE · ${gateLabel} → ${gatePrediction===0?"B/H/E":"R/L/O"}`,
+    `${axisName} EXECUTE · ${gateLabel} → ${gatePrediction===0?"Player":"Banker"}`,
   );
 }
 
-// ── Main entry point ─────────────────────────────────────────────────────────
+// ── Main entry point — single axis: Banker vs Player ─────────────────────────
+// Per request July 28: Baccarat has exactly one meaningful axis (which side
+// won), not three. The roulette-derived Color/Range/Parity structure has
+// been removed entirely, not just hardcoded — the 256-gate search now runs
+// once, against the Player/Banker outcome stream directly.
 function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
-  const {colorBits, rangeBits, parityBits} = getAxisBitStreams(history);
+  const { colorBits } = getAxisBitStreams(history);
+  const side = analyseAxis(colorBits, "Banker/Player");
 
-  const gC = selectBest3InputGate(colorBits);
-  const gR = selectBest3InputGate(rangeBits);
-  const gP = selectBest3InputGate(parityBits);
-  const predC = gC.isHold || gC.prediction===null ? getStraightNextBit(colorBits)  as 0|1 : gC.prediction;
-  const predR = gR.isHold || gR.prediction===null ? getStraightNextBit(rangeBits)  as 0|1 : gR.prediction;
-  const predP = gP.isHold || gP.prediction===null ? getStraightNextBit(parityBits) as 0|1 : gP.prediction;
+  const sideBit = side.overrideBit;
+  const group = bitsToGroup(sideBit, 0, 0); // Range/Parity have no meaning in Baccarat; fixed so the rest of the pipeline's GroupKey plumbing still works
 
-  const color  = analyseAxis(colorBits,  "Color",  predR, predP);
-  const range  = analyseAxis(rangeBits,  "Range",  predC, predP);
-  const parity = analyseAxis(parityBits, "Parity", predC, predR);
+  const label = side.isHold ? "HOLD — no gate found" : `EXECUTE · ${side.selectedGate}(#${side.gateFitScore >= 0 ? Math.round(side.gateFitScore*100) : 0}%)`;
 
-  const colorBit  = color.overrideBit;
-  const rangeBit  = range.overrideBit;
-  const parityBit = parity.overrideBit;
-  const group     = bitsToGroup(colorBit, rangeBit, parityBit);
-
-  const holdCount     = [color,range,parity].filter(a=>a.isHold).length;
-  const execCount     = [color,range,parity].filter(a=>a.performanceState==="EXECUTE").length;
-  const overrideCount = [color,range,parity].filter(a=>a.overrideActive).length;
-
-  const label = holdCount===3
-    ? "All Dimensions HOLD"
-    : holdCount>0
-    ? `${holdCount}/3 HOLD · ${execCount} EXECUTE`
-    : `Straight · All EXECUTE`;
-
-  return { color,range,parity,colorBit,rangeBit,parityBit,group,overrideCount,holdCount,isWarming:false,label };
+  return { side, sideBit, group, isHold: side.isHold, label };
 }
 // ─── END 256-GATE STRAIGHT LOGIC ──────────────────────────────────────────────
 
@@ -1974,7 +1947,7 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
 function bbStraightForecast(history: Step[]) {
   const divergence = getPulseBBStraightDivergence(history);
 
-  if (divergence.holdCount === 3) {
+  if (divergence.isHold) {
     return { group: null as GroupKey | null, numbers: [] as SpinValue[], confidence: 0, tier: "No Prediction", reason: divergence.label };
   }
 
@@ -1984,7 +1957,7 @@ function bbStraightForecast(history: Step[]) {
     numbers: group ? GROUPS[group] : [],
     confidence: 65,
     tier: "BB Straight",
-    reason: `3-input gate · ${divergence.label}`,
+    reason: `Single-axis gate (Banker/Player) · ${divergence.label}`,
     pulseDivergence: divergence,
   };
 }
@@ -2048,6 +2021,21 @@ function cadenceForecast(history: Step[]) {
     axisDpi: locked.axisDpi,
     axisModes: locked.axisModes,
     reason: `Cadence locked run-length assembly · Color ${locked.axisDpi.color} · Range ${locked.axisDpi.range} · Parity ${locked.axisDpi.parity}.`
+  };
+}
+
+// Per request July 28: the no-signal fallback for Straight/Markov in manual
+// mode (Scout off) now just repeats the last hand's own outcome, instead of
+// borrowing Cadence's prediction. If there's no history yet, defaults to
+// Player (BHE) same as every other engine's empty-history default.
+function repeatLastOutcomeForecast(history: Step[]) {
+  const group: GroupKey = history.length ? history[history.length - 1].outcomeGroup : "BHE";
+  return {
+    group,
+    numbers: GROUPS[group],
+    confidence: 50,
+    tier: "BB Straight",
+    reason: `No gate signal — repeating the last outcome (${formatGroupAsBaccaratShort(group)}).`,
   };
 }
 
@@ -2396,11 +2384,26 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
     return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
   }
 
-  if (markovEnabled && markov.group) {
+  // Per request July 28: with Scout off, force a real bet even when the
+  // selected engine's own search comes up completely empty (Markov's
+  // warmup period, or Straight's 256-gate search finding no gate on any
+  // axis) — fall back to Cadence's forecast, which always produces a real
+  // group, rather than holding. Scout itself is unaffected (it already
+  // holds cleanly on a no-signal pick, per the July 27 fix above).
+  if (markovEnabled) {
+    if (markov.group) {
+      const decision = {
+        ...markov,
+        source: "MARKOV" as const,
+        mode,
+      };
+      return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
+    }
     const decision = {
-      ...markov,
+      ...repeatLastOutcomeForecast(history),
       source: "MARKOV" as const,
       mode,
+      reason: `Markov has no forecast yet (${history.length}/6 hands) — repeating the last outcome instead of holding.`,
     };
     return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
   }
@@ -2414,11 +2417,20 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
     return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
   }
 
-  if (bbStraightEnabled && straight.group) {
+  if (bbStraightEnabled) {
+    if (straight.group) {
+      const decision = {
+        ...straight,
+        source: "BB_STRAIGHT" as const,
+        mode,
+      };
+      return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
+    }
     const decision = {
-      ...straight,
+      ...repeatLastOutcomeForecast(history),
       source: "BB_STRAIGHT" as const,
       mode,
+      reason: "Straight's gate search found nothing — repeating the last outcome instead of holding.",
     };
     return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
   }
@@ -4050,7 +4062,9 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   // everywhere else in this file. Auto-releases the moment any engine shows
   // upward movement over the last ENGINE_RECOVERY_LOOKBACK hands, even if
   // it's still below its own peak — see getEngineHaltState.
-  const haltState = getEngineHaltState(history);
+  // Per request July 28: only allowed to trigger while Scout is on — it
+  // never activates in manual (non-Scout) mode.
+  const haltState = scoutEnabled ? getEngineHaltState(history) : { haltActive: false, allDeclining: false, anyRecovering: false };
   const sessionEnded = haltState.haltActive;
 
   const active =
