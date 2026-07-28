@@ -2088,6 +2088,24 @@ const SCOUT_UNIFORM_START = 3;
 // halt's peak-tracking, so both mechanisms read from the same underlying
 // "current strength" metric rather than one being decayed and the other not.
 const SCOUT_DECAY_FACTOR = 0.97;
+// Per finding July 28 (second round): even with decay, Scout could still lock
+// onto a leader with a wafer-thin edge (noise) or get stuck on a declining
+// leader while a genuinely-recovering engine sat just behind it, never able
+// to reach the top. Two more rules, tested together against a real session
+// where the undamped version spiraled to -$10,050: a SCOUT_LEADER_GAP so a
+// switch only happens when the new leader is ahead by a real margin (not
+// any margin at all), and a SCOUT_MOMENTUM_GAP escape hatch — if the CURRENT
+// pick is declining over the last ENGINE_RECOVERY_LOOKBACK hands, Scout can
+// switch to whichever engine (even a non-leader) has the best recent
+// momentum, but only if that momentum edge clears its own gap. Swept
+// leader gap 0.5-1.5 alone (didn't fix the specific session — it just made
+// Scout stickier to whatever it already had), and momentum gap 0/0.25/0.5/1.0
+// combined with leader gap 1.0 (0.5 was the best of those: $4,725 final vs
+// -$10,050 undamped-nothing, using fewer total switches than an undamped
+// momentum-override alone). Both reuse ENGINE_RECOVERY_LOOKBACK (5 hands)
+// for the momentum window, same as the halt's own recovery check.
+const SCOUT_LEADER_GAP = 1.0;
+const SCOUT_MOMENTUM_GAP = 0.5;
 // Per finding July 27: the earlier windowed version (40/30-hand caps) was a
 // mistake — it changed Scout from "reward genuine outperformance since the
 // shoe started" (roulette's original design) into "chase whoever had a hot
@@ -2114,8 +2132,57 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
 
   const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
   const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
+  const scoreTrail: Record<string, number[]> = { BB_STRAIGHT: [], BB_INVERTED: [], MARKOV: [], CADENCE: [] };
+  let currentPick: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | null = null;
+
+  const momentumOf = (engine: string) => {
+    const trail = scoreTrail[engine];
+    if (trail.length < 2) return 0;
+    const idx = Math.max(0, trail.length - 1 - ENGINE_RECOVERY_LOOKBACK);
+    return trail[trail.length - 1] - trail[idx];
+  };
+
+  // Decides what the pick SHOULD be given state as of right now, applying
+  // (in order): stay put if nothing is eligible yet or current pick isn't
+  // eligible -> pick the leader outright; otherwise, if the current pick is
+  // declining over the recovery window, allow a switch to whichever engine
+  // (leader or not) has the best momentum, but only if that edge clears
+  // SCOUT_MOMENTUM_GAP; otherwise, allow a normal switch to the leader only
+  // if its score edge over the current pick clears SCOUT_LEADER_GAP.
+  const decidePick = (): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | null => {
+    const eligible = SCOUT_ENGINE_ORDER.filter((e) => evaluated[e] >= 1);
+    if (eligible.length === 0) return null;
+
+    let leader: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" = eligible[0];
+    let best = -Infinity;
+    for (const e of eligible) { if (cumulative[e] > best) { best = cumulative[e]; leader = e; } }
+
+    if (currentPick === null || !eligible.includes(currentPick)) return leader;
+
+    const currentMomentum = momentumOf(currentPick);
+    if (currentMomentum < 0) {
+      let bestMomentum = -Infinity;
+      let bestMomentumEngine = currentPick;
+      for (const e of eligible) {
+        const m = momentumOf(e);
+        if (m > bestMomentum) { bestMomentum = m; bestMomentumEngine = e; }
+      }
+      if (bestMomentumEngine !== currentPick && (bestMomentum - currentMomentum) >= SCOUT_MOMENTUM_GAP) {
+        return bestMomentumEngine;
+      }
+      return currentPick;
+    }
+
+    if (leader !== currentPick && (cumulative[leader] - cumulative[currentPick]) >= SCOUT_LEADER_GAP) {
+      return leader;
+    }
+    return currentPick;
+  };
 
   for (let i = SCOUT_UNIFORM_START; i < history.length; i += 1) {
+    const decided = decidePick();
+    if (decided !== null) currentPick = decided;
+
     const prior = history.slice(0, i);
     const actual = spinToBaccaratOutcome(history[i].outcome);
     if (!actual) continue;
@@ -2133,23 +2200,18 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
       const outcome = predictedSide === actual ? 1 : 0;
       cumulative[engine] = cumulative[engine] * SCOUT_DECAY_FACTOR + outcome - 0.5;
       evaluated[engine] += 1;
+      scoreTrail[engine].push(cumulative[engine]);
     }
   }
 
-  const eligible = SCOUT_ENGINE_ORDER.filter((e) => evaluated[e] >= 1);
-  if (eligible.length === 0) {
-    _scoutCache.set(cacheKey, "BB_STRAIGHT"); // neutral default before uniform start
-    return "BB_STRAIGHT";
-  }
+  // Final decision for the upcoming hand, using state built from the entire
+  // history passed in.
+  const finalDecision = decidePick();
+  const result = finalDecision ?? "BB_STRAIGHT";
 
-  let best: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" = eligible[0];
-  let bestScore = -Infinity;
-  for (const engine of eligible) {
-    if (cumulative[engine] > bestScore) { bestScore = cumulative[engine]; best = engine; }
-  }
   if (_scoutCache.size > 200) _scoutCache.delete(_scoutCache.keys().next().value);
-  _scoutCache.set(cacheKey, best);
-  return best;
+  _scoutCache.set(cacheKey, result);
+  return result;
 }
 
 // =====================================================
@@ -4100,6 +4162,7 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
     f.source !== "NONE" &&
     executionAllowed &&
     (
+      tierExecution.executeObservation ||
       !(f as any).pulseGate ||
       (f as any).pulseGate.allow ||
       !(f as any).observe
