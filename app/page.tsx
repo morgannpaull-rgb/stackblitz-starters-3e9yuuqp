@@ -163,8 +163,6 @@ const STRATEGIES: Strategy[] = [
   "D'Alembert",
   "ReverseD'Alembert",
   "1-3-2-6",
-  "ETR",
-  "ETR-C",
 ];
 const VIEWS: ViewKey[] = ["Dashboard", "Analytics", "Reports", "Sessions"];
 const EXECUTION_MODES: ExecutionMode[] = ["Stream Direct"];
@@ -344,17 +342,32 @@ function getStrategyOpenLossExposure(history: Step[]) {
   return exposure;
 }
 
+function getFibonacciNumber(n: number): number {
+  // Sequence: F(0)=1, F(1)=1, F(2)=2, F(3)=3, F(4)=5, F(5)=8, F(6)=13, F(7)=21,
+  // F(8)=34, F(9)=55, ... — computed iteratively so there is no ceiling on how
+  // far this can go, per request July 28 (previously hard-capped at F(7)=21,
+  // which silently prevented the progression from ever escalating past a
+  // 21x base-unit bet no matter how many consecutive losses occurred).
+  if (n <= 1) return 1;
+  let a = 1;
+  let b = 1;
+  for (let i = 2; i <= n; i += 1) {
+    const next = a + b;
+    a = b;
+    b = next;
+  }
+  return b;
+}
+
 function getFibonacciProgressionIndex(history: Step[]) {
-  // TRUE FIBONACCI PROGRESSION LOCK
-  // Sequence: 1, 1, 2, 3, 5, 8, 13, 21.
-  // Loss -> advance exactly ONE step forward.
+  // TRUE FIBONACCI PROGRESSION LOCK — uncapped per request July 28.
+  // Loss -> advance exactly ONE step forward, with no ceiling.
   // Win -> move exactly TWO steps back, never below zero.
   // Push / No Bet / Pulse Hold / shadow diagnostic rows -> HOLD current step.
-  const fibMaxIndex = 7;
   let index = 0;
 
   getResolvedStrategyResults(history).forEach((row) => {
-    if (row.result === "loss") index = Math.min(fibMaxIndex, index + 1);
+    if (row.result === "loss") index = index + 1;
     if (row.result === "win") index = Math.max(0, index - 2);
   });
 
@@ -3937,8 +3950,7 @@ function getUnitBet(
     // flat confirmation arms recovery; the following hand begins recovery.
     rawUnit = getEtrRecoveryPlan(strategy, baseUnit, history).rawUnit;
   } else if (strategy === "Fibonacci") {
-    const fib = [1, 1, 2, 3, 5, 8, 13, 21];
-    rawUnit = baseUnit * fib[getFibonacciProgressionIndex(history)];
+    rawUnit = baseUnit * getFibonacciNumber(getFibonacciProgressionIndex(history));
   } else if (strategy === "D'Alembert") {
     rawUnit = baseUnit * (1 + getDAlembertProgressionIndex(history));
   } else if (strategy === "ReverseD'Alembert") {
