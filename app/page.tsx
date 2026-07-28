@@ -112,12 +112,12 @@ const DEFAULT_BASE_UNIT = 25;
 const DEFAULT_AUTO_SPINS = 80;
 const DEFAULT_NUMBER_OF_SHOES = 1;
 const DEFAULT_TABLE_LIMIT = 10000;
-const DEFAULT_PER_NUMBER_LIMIT = 300;
+const DEFAULT_PER_NUMBER_LIMIT = 10000;
 const DEFAULT_EXPOSURE_CAP_PERCENT = 2;
 const MAX_ETR_C_RECOVERY_BET = 500;
 const MAX_ETR_C_RECOVERY_STEPS = 5;
 const DEFAULT_EXECUTE_WEAK = true;
-const DEFAULT_EXECUTE_OBSERVATION = false;
+const DEFAULT_EXECUTE_OBSERVATION = true;
 
 type TierExecutionSettings = {
   executeWeak: boolean;
@@ -161,11 +161,6 @@ const STRATEGIES: Strategy[] = [
   "1-3-2-6",
   "ETR",
   "ETR-C",
-  "Step Recovery",
-  "Exposure Cap",
-  "Confidence-65",
-  "Confidence-75",
-  "Progressive Confidence",
 ];
 const VIEWS: ViewKey[] = ["Dashboard", "Analytics", "Reports", "Sessions"];
 const EXECUTION_MODES: ExecutionMode[] = ["Stream Direct"];
@@ -2072,27 +2067,35 @@ function cadenceForecast(history: Step[]) {
 // no matter how long the shoe runs.
 const SCOUT_ENGINE_ORDER = ["BB_STRAIGHT", "BB_INVERTED", "MARKOV", "CADENCE"] as const;
 const SCOUT_UNIFORM_START = 3;
-const SCOUT_EVAL_WINDOW = 40;      // only score the most recent N hands, not the whole shoe
-const SCOUT_FORECAST_CONTEXT = 30; // each forecast call only sees the most recent N hands before it
+// Per finding July 27: the earlier windowed version (40/30-hand caps) was a
+// mistake — it changed Scout from "reward genuine outperformance since the
+// shoe started" (roulette's original design) into "chase whoever had a hot
+// streak in the last ~40 hands," which measurably made things worse (real
+// session replay: -650 net windowed vs -150 unwindowed on the same 80
+// hands). The _scoutCache below already solves the actual performance
+// problem (the Strategy Comparison table calling this once per betting
+// strategy on identical data), so the window was never load-bearing for
+// speed — confirmed: full-history scoring + this cache stays under 1.5s
+// even across all 13 comparison strategies. No window at all now; every
+// hand since the shoe started counts, exactly like roulette's Pulse.
 
 const _scoutCache = new Map<string, "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE">();
 
 function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" {
-  // Cache key uses only the outcome sequence (what Scout actually depends
+  // Cache key uses the full outcome sequence (what Scout actually depends
   // on) — not bet size, bankroll, tier, or anything strategy-specific. This
   // is what lets all 13 Strategy Comparison replays, which share the same
   // underlying hands and differ only in bet sizing, hit the same cache entry
   // instead of each independently re-running the full scoring scan.
-  const cacheKey = history.length + ":" + history.slice(-SCOUT_EVAL_WINDOW).map((h) => h.outcome).join(",");
+  const cacheKey = history.length + ":" + history.map((h) => h.outcome).join(",");
   const cached = _scoutCache.get(cacheKey);
   if (cached) return cached;
 
   const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
   const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
 
-  const startIdx = Math.max(SCOUT_UNIFORM_START, history.length - SCOUT_EVAL_WINDOW);
-  for (let i = startIdx; i < history.length; i += 1) {
-    const prior = history.slice(Math.max(0, i - SCOUT_FORECAST_CONTEXT), i);
+  for (let i = SCOUT_UNIFORM_START; i < history.length; i += 1) {
+    const prior = history.slice(0, i);
     const actual = spinToBaccaratOutcome(history[i].outcome);
     if (!actual) continue;
 
@@ -7029,7 +7032,7 @@ const StreakAnalyticsPanel = () => {
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Sora, Arial, sans-serif", display: "grid", gridTemplateColumns: "82px minmax(0, 1fr)" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
-    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><NumericInput value={tableLimit} min={1} onCommit={(n: number) => { setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Hand Limit</div><NumericInput value={perNumberLimit} min={1} onCommit={(n: number) => { setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Exposure Cap %</div><NumericInput value={exposureCapPercent} min={0.1} max={100} allowDecimal={true} onCommit={(n: number) => { setExposureCapPercent(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, n, cadenceEnabled, scoutEnabled)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Exposure Cap default is 2% of current bankroll and can be increased here. Limits are enforced on every strategy replay. Unit bet is capped by both the per-hand limit and the total table limit across the active Baccarat side.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${!executeObservation ? COLORS.green : t.borderStrong}`, background: !executeObservation ? "rgba(34,197,94,0.13)" : t.input, color: !executeObservation ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe {!executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe ON.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
+    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><NumericInput value={tableLimit} min={1} onCommit={(n: number) => { setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Hand Limit</div><NumericInput value={perNumberLimit} min={1} onCommit={(n: number) => { setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Exposure Cap %</div><NumericInput value={exposureCapPercent} min={0.1} max={100} allowDecimal={true} onCommit={(n: number) => { setExposureCapPercent(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, n, cadenceEnabled, scoutEnabled)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Exposure Cap default is 2% of current bankroll and can be increased here. Limits are enforced on every strategy replay. Unit bet is capped by both the per-hand limit and the total table limit across the active Baccarat side.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${!executeObservation ? COLORS.green : t.borderStrong}`, background: !executeObservation ? "rgba(34,197,94,0.13)" : t.input, color: !executeObservation ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe {!executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe OFF.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
     {showGlossary ? <div
       style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.72)", zIndex: 9998, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={() => setShowGlossary(false)}
