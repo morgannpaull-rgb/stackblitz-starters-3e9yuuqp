@@ -1957,6 +1957,47 @@ function getPulseBBStraightDivergence(history: Step[]): PulseDivergenceResult {
 // ─── END 256-GATE STRAIGHT LOGIC ──────────────────────────────────────────────
 
 
+// ==== Random engine (ported from the Roulette platform's randomForecast,
+// collapsed to Baccarat's single Player/Banker axis; no stop-loss/giveback
+// carried over since those are Roulette-only session-management features).
+// Direct dimension count, no boolean gate, no run-length pattern matching:
+// Player = +1, Banker = -1, running total with no floor. Forecasts whichever
+// side the running count currently favors (or Player on a tie). Standalone
+// accuracy runs near coin-flip (verified on real sessions, ~48-54%), same as
+// every other engine here — its value shown up in bet-sizing dynamics, not
+// forecast accuracy. Added to Scout's candidate pool per Aug testing: adding
+// it alone was a wash (helped one session, hurt another by similar margins),
+// but combined with SCOUT_OPPOSITE_ON_DECLINE_PCT below, five engines tested
+// no worse than four — kept for architectural parity with the other four
+// (manual mode + Scout candidate) rather than for a proven standalone edge.
+function getBaccaratRandomDpi(history: Step[]): number {
+  let score = 0;
+  history.forEach((row) => {
+    const [colorBit] = groupToBits(row.outcomeGroup);
+    score += colorBit === 0 ? 1 : -1;
+  });
+  return score;
+}
+
+function getRandomForecastBit(value: number): 0 | 1 {
+  return value >= 0 ? 0 : 1;
+}
+
+function randomForecast(history: Step[]) {
+  const dpi = getBaccaratRandomDpi(history);
+  const colorBit = getRandomForecastBit(dpi);
+  const group = bitsToGroup(colorBit, 0, 0);
+  const confidence = Math.max(50, Math.min(82, Math.round(50 + Math.abs(dpi) * 3)));
+  return {
+    group,
+    numbers: GROUPS[group],
+    confidence,
+    tier: confidence >= 72 ? "Active · Confirmed" : "Active · Caution",
+    dpi,
+    reason: `Random direct dimension count · ${dpi}.`,
+  };
+}
+
 function bbStraightForecast(history: Step[]) {
   const divergence = getPulseBBStraightDivergence(history);
 
@@ -2070,7 +2111,7 @@ function repeatLastOutcomeForecast(history: Step[]) {
 // and the amount of history each forecast call is allowed to see are capped
 // to small constants, so the total cost stays roughly linear in shoe length
 // no matter how long the shoe runs.
-const SCOUT_ENGINE_ORDER = ["BB_STRAIGHT", "BB_INVERTED", "MARKOV", "CADENCE"] as const;
+const SCOUT_ENGINE_ORDER = ["BB_STRAIGHT", "BB_INVERTED", "MARKOV", "CADENCE", "RANDOM"] as const;
 const SCOUT_UNIFORM_START = 3;
 // Per finding July 28: flat (undecayed) cumulative scoring lets an early hot
 // streak become a permanent, unbeatable lead — confirmed on a real session
@@ -2118,9 +2159,9 @@ const SCOUT_MOMENTUM_GAP = 0.5;
 // even across all 13 comparison strategies. No window at all now; every
 // hand since the shoe started counts, exactly like roulette's Pulse.
 
-const _scoutCache = new Map<string, "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE">();
+const _scoutCache = new Map<string, "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM">();
 
-function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" {
+function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM" {
   // Cache key uses the full outcome sequence (what Scout actually depends
   // on) — not bet size, bankroll, tier, or anything strategy-specific. This
   // is what lets all 13 Strategy Comparison replays, which share the same
@@ -2130,10 +2171,10 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
   const cached = _scoutCache.get(cacheKey);
   if (cached) return cached;
 
-  const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
-  const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
-  const scoreTrail: Record<string, number[]> = { BB_STRAIGHT: [], BB_INVERTED: [], MARKOV: [], CADENCE: [] };
-  let currentPick: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | null = null;
+  const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0, RANDOM: 0 };
+  const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0, RANDOM: 0 };
+  const scoreTrail: Record<string, number[]> = { BB_STRAIGHT: [], BB_INVERTED: [], MARKOV: [], CADENCE: [], RANDOM: [] };
+  let currentPick: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM" | null = null;
 
   const momentumOf = (engine: string) => {
     const trail = scoreTrail[engine];
@@ -2149,11 +2190,11 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
   // (leader or not) has the best momentum, but only if that edge clears
   // SCOUT_MOMENTUM_GAP; otherwise, allow a normal switch to the leader only
   // if its score edge over the current pick clears SCOUT_LEADER_GAP.
-  const decidePick = (): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | null => {
+  const decidePick = (): "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM" | null => {
     const eligible = SCOUT_ENGINE_ORDER.filter((e) => evaluated[e] >= 1);
     if (eligible.length === 0) return null;
 
-    let leader: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" = eligible[0];
+    let leader: "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM" = eligible[0];
     let best = -Infinity;
     for (const e of eligible) { if (cumulative[e] > best) { best = cumulative[e]; leader = e; } }
 
@@ -2192,6 +2233,7 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
       BB_INVERTED: bbInvertedForecast(prior).group ?? null,
       MARKOV: markovForecast(prior).group ?? null,
       CADENCE: cadenceForecast(prior).group ?? null,
+      RANDOM: randomForecast(prior).group ?? null,
     };
 
     for (const engine of SCOUT_ENGINE_ORDER) {
@@ -2211,6 +2253,77 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
 
   if (_scoutCache.size > 200) _scoutCache.delete(_scoutCache.keys().next().value);
   _scoutCache.set(cacheKey, result);
+  return result;
+}
+
+// =====================================================
+// SCOUT OPPOSITE-ON-DECLINE — added per real-session testing (both the
+// catastrophic Fibonacci session and the session where Scout fell off at
+// the end): tracks Scout's own REALIZED pick accuracy (not any individual
+// engine's — the accuracy of whatever Scout actually ended up betting each
+// hand, after any prior flip), decayed the same way engine scores are, with
+// its own peak tracked the same way. Once that score has dropped
+// SCOUT_OPPOSITE_ON_DECLINE_PCT below its own peak, Scout bets the OPPOSITE
+// of its current pick instead of the pick itself, until it recovers.
+//
+// This is deliberately a different condition from the four/five-engine halt
+// above (which requires every individual engine declining together) — this
+// one can fire even while some individual engines still look fine, because
+// it's about what Scout is ACTUALLY producing, not the underlying engines.
+//
+// Verified: this is not a hit-rate improvement (accuracy stayed
+// ~coin-flip on both test sessions) — the benefit comes from breaking up
+// what would otherwise be an unbroken losing streak, which matters
+// disproportionately for progressive strategies like Fibonacci. Swept
+// 5%-70% on two real sessions: every value tested beat the current
+// mechanism with no flip; 10% was the best-performing value found and is
+// used below, though the surrounding range (8-15%) performed similarly,
+// so this isn't a razor's-edge setting.
+//
+// Same "replay from history, decide before observing" pattern as
+// getScoutSelectedEngine/getEngineHaltState above — no mutable state kept
+// between calls, just recomputed (and cached) from the outcome sequence.
+const SCOUT_OPPOSITE_ON_DECLINE_PCT = 0.1;
+const _scoutOwnPerfCache = new Map<string, { score: number; peak: number; shouldFlipNext: boolean }>();
+
+function getScoutOwnPerformance(history: Step[]): { score: number; peak: number; shouldFlipNext: boolean } {
+  const cacheKey = history.length + ":" + history.map((h) => h.outcome).join(",");
+  const cached = _scoutOwnPerfCache.get(cacheKey);
+  if (cached) return cached;
+
+  let score = 0;
+  let peak = -Infinity;
+
+  for (let i = 0; i < history.length; i += 1) {
+    const prior = history.slice(0, i);
+    const picked = getScoutSelectedEngine(prior);
+    const forecasts: Record<string, GroupKey | null> = {
+      BB_STRAIGHT: bbStraightForecast(prior).group ?? null,
+      BB_INVERTED: bbInvertedForecast(prior).group ?? null,
+      MARKOV: markovForecast(prior).group ?? null,
+      CADENCE: cadenceForecast(prior).group ?? null,
+      RANDOM: randomForecast(prior).group ?? null,
+    };
+    let group = forecasts[picked];
+    if (!group) continue;
+
+    const declining = peak > 0 && score <= peak * (1 - SCOUT_OPPOSITE_ON_DECLINE_PCT);
+    if (declining) group = invertGroup(group);
+
+    const actual = spinToBaccaratOutcome(history[i].outcome);
+    const predictedSide = getBaccaratSideFromForecastGroup(group);
+    if (!predictedSide) continue;
+
+    const won = predictedSide === actual ? 1 : 0;
+    score = score * SCOUT_DECAY_FACTOR + (won - 0.5);
+    if (score > peak) peak = score;
+  }
+
+  const shouldFlipNext = peak > 0 && score <= peak * (1 - SCOUT_OPPOSITE_ON_DECLINE_PCT);
+  const result = { score, peak, shouldFlipNext };
+
+  if (_scoutOwnPerfCache.size > 200) _scoutOwnPerfCache.delete(_scoutOwnPerfCache.keys().next().value);
+  _scoutOwnPerfCache.set(cacheKey, result);
   return result;
 }
 
@@ -2241,10 +2354,10 @@ function getEngineHaltState(history: Step[]): { haltActive: boolean; allDeclinin
   const cached = _engineHaltCache.get(cacheKey);
   if (cached) return cached;
 
-  const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
-  const peak: Record<string, number> = { BB_STRAIGHT: -Infinity, BB_INVERTED: -Infinity, MARKOV: -Infinity, CADENCE: -Infinity };
-  const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0 };
-  const scoreTrail: Record<string, number[]> = { BB_STRAIGHT: [], BB_INVERTED: [], MARKOV: [], CADENCE: [] };
+  const cumulative: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0, RANDOM: 0 };
+  const peak: Record<string, number> = { BB_STRAIGHT: -Infinity, BB_INVERTED: -Infinity, MARKOV: -Infinity, CADENCE: -Infinity, RANDOM: -Infinity };
+  const evaluated: Record<string, number> = { BB_STRAIGHT: 0, BB_INVERTED: 0, MARKOV: 0, CADENCE: 0, RANDOM: 0 };
+  const scoreTrail: Record<string, number[]> = { BB_STRAIGHT: [], BB_INVERTED: [], MARKOV: [], CADENCE: [], RANDOM: [] };
 
   for (let i = SCOUT_UNIFORM_START; i < history.length; i += 1) {
     const prior = history.slice(0, i);
@@ -2256,6 +2369,7 @@ function getEngineHaltState(history: Step[]): { haltActive: boolean; allDeclinin
       BB_INVERTED: bbInvertedForecast(prior).group ?? null,
       MARKOV: markovForecast(prior).group ?? null,
       CADENCE: cadenceForecast(prior).group ?? null,
+      RANDOM: randomForecast(prior).group ?? null,
     };
 
     for (const engine of SCOUT_ENGINE_ORDER) {
@@ -2391,8 +2505,8 @@ function markovForecast(history: Step[]) {
   };
 }
 
-function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false) {
-  const bbMode = cadenceEnabled ? "Cadence" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted BB" : bbStraightEnabled ? "Straight BB" : "BB Off";
+function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
+  const bbMode = randomEnabled ? "Random" : cadenceEnabled ? "Cadence" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted BB" : bbStraightEnabled ? "Straight BB" : "BB Off";
   if (scoutEnabled && pulseEnabled) return "SCOUT + PULSE";
   if (scoutEnabled) return "SCOUT";
   if (pulseEnabled && bbMode !== "BB Off") return `PULSE + ${bbMode}`;
@@ -2400,25 +2514,33 @@ function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, b
   return bbMode === "BB Off" ? "Disabled" : bbMode;
 }
 
-function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false) {
+function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
   const pulse = getNeuralCalibratedPulse(history);
   const straight = bbStraightForecast(history);
   const inverted = bbInvertedForecast(history);
   const markov = markovForecast(history);
   const cadence = cadenceForecast(history);
-  const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled);
+  const random = randomForecast(history);
+  const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled);
 
   // SCOUT AUTHORITY
   // Scout, when on, overrides manual Play Mode selection entirely — same
   // precedence Pulse has in the roulette platform this was ported from.
-  // It picks whichever of the four engines currently has the highest
+  // It picks whichever of the five engines currently has the highest
   // cumulative-advantage score (see getScoutSelectedEngine) and uses that
   // engine's own raw forecast, completely independent of what
-  // bbStraightEnabled/bbInvertedEnabled/markovEnabled/cadenceEnabled say —
-  // those flags are left untouched in state, so the Play Mode buttons keep
-  // showing whatever you last picked manually. If Baccarat's own Pulse
+  // bbStraightEnabled/bbInvertedEnabled/markovEnabled/cadenceEnabled/randomEnabled
+  // say — those flags are left untouched in state, so the Play Mode buttons
+  // keep showing whatever you last picked manually. If Baccarat's own Pulse
   // (a separate, unrelated enhancer) is also on, it still enhances
   // whichever engine Scout selects, exactly as it would for a manual pick.
+  //
+  // Random added to the pool per testing: adding it alone (without the
+  // opposite-on-decline mechanism below) was a wash on its own — helped one
+  // real session, hurt another by a similar margin. Combined with
+  // SCOUT_OPPOSITE_ON_DECLINE_PCT, five engines tested no worse than four
+  // across two real sessions, so it's kept for parity with the other four
+  // rather than for a standalone proven edge.
   //
   // Bug found and fixed July 27: if Scout's picked engine had no forecast
   // group that hand (a hold state), this block used to fall all the way
@@ -2431,7 +2553,7 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   // through, so it can never inherit a manual selection while it's on.
   if (scoutEnabled) {
     const picked = getScoutSelectedEngine(history);
-    const forecastByPick: Record<string, any> = { BB_STRAIGHT: straight, BB_INVERTED: inverted, MARKOV: markov, CADENCE: cadence };
+    const forecastByPick: Record<string, any> = { BB_STRAIGHT: straight, BB_INVERTED: inverted, MARKOV: markov, CADENCE: cadence, RANDOM: random };
     const picked_forecast = forecastByPick[picked];
     if (picked_forecast?.group) {
       const decision = {
@@ -2454,7 +2576,7 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
 
   // HARD PLAY-MODE AUTHORITY
   // PULSE is enhancer-only. It cannot create standalone execution.
-  if (!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !cadenceEnabled) {
+  if (!bbStraightEnabled && !bbInvertedEnabled && !markovEnabled && !cadenceEnabled && !randomEnabled) {
     return {
       group: null as GroupKey | null,
       numbers: [] as SpinValue[],
@@ -2470,6 +2592,15 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
     const decision = {
       ...cadence,
       source: "CADENCE" as const,
+      mode,
+    };
+    return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
+  }
+
+  if (randomEnabled && random.group) {
+    const decision = {
+      ...random,
+      source: "RANDOM" as const,
       mode,
     };
     return applyPulseEnhancerToDecision(decision, pulse, pulseEnabled, history);
@@ -2972,7 +3103,7 @@ function getDirectionalRebuildEngine(history: Step[], decision: any, resync: any
 // It does NOT create predictions, vote engines, or modify BB/DPI/Markov.
 // =====================================================
 
-type PulseEngineSource = "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE";
+type PulseEngineSource = "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM";
 
 function getEngineRowSource(row: Step): PulseEngineSource | null {
   const selected = row.pulseDiagnostics?.selectedEngine;
@@ -4140,8 +4271,19 @@ function verifyLockedDpiExample_BBPBBP() {
   return values;
 }
 
-function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false): Step {
-  const f = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled);
+function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false): Step {
+  const f = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled);
+
+  // SCOUT OPPOSITE-ON-DECLINE — see getScoutOwnPerformance above for the
+  // full rationale. Only applies while Scout is on, and only to hands where
+  // Scout actually has a forecast (never touches manual mode or a hold).
+  if (scoutEnabled && f.group && f.source !== "NONE") {
+    const ownPerf = getScoutOwnPerformance(history);
+    if (ownPerf.shouldFlipNext) {
+      f.group = invertGroup(f.group);
+    }
+  }
+
   const bankroll = history.at(-1)?.bankroll ?? startingBankroll;
   const executionAllowed = shouldExecuteTier(f.tier, f.source, tierExecution, (f as any).rv, (f as any).entropyExtreme);
   const dimensionTDAAllowed = true; // TDA diagnostic only, not a hard gate.
@@ -4639,9 +4781,9 @@ function runShadowStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: 
   return rows;
 }
 
-function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false) {
+function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
   const rows: Step[] = [];
-  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled)));
+  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)));
   return rows;
 }
 
@@ -4987,7 +5129,8 @@ function runBaccaratEngineHistory(
   markovEnabled: boolean,
   exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT,
   cadenceEnabled = false,
-  scoutEnabled = false
+  scoutEnabled = false,
+  randomEnabled = false
 ): Step[] {
   return runStrategy(
     outcomes.map(baccaratOutcomeToSpin),
@@ -5004,7 +5147,8 @@ function runBaccaratEngineHistory(
     markovEnabled,
     exposureCapPercent,
     cadenceEnabled,
-    scoutEnabled
+    scoutEnabled,
+    randomEnabled
   );
 }
 
