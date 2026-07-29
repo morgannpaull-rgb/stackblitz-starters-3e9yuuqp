@@ -2348,7 +2348,16 @@ function getScoutOwnPerformance(history: Step[]): { score: number; peak: number;
     rawRecentResults.push(rawWon);
     if (rawRecentResults.length > SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK) rawRecentResults.shift();
 
-    const declining = peak > 0 && score <= peak * (1 - SCOUT_OPPOSITE_ON_DECLINE_PCT);
+    // Fixed to work when peak is negative too: multiplying a negative peak
+    // by (1 - pct) makes it LESS negative, which is backwards — found via a
+    // real session where Scout's own score had been negative since hand 2
+    // and never recovered, so the old peak > 0 gate meant OOD could never
+    // trigger no matter how bad things got. This form (subtracting a
+    // proportional margin using the peak's magnitude) reduces to the exact
+    // same threshold as before whenever peak is positive, so it doesn't
+    // change behavior for any previously-tested case where peak did go
+    // positive — verified directly.
+    const declining = peak > -Infinity && score <= peak - Math.abs(peak) * SCOUT_OPPOSITE_ON_DECLINE_PCT;
     if (!flipping && declining) {
       flipping = true;
     } else if (flipping) {
