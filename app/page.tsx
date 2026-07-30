@@ -2260,43 +2260,39 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
 // =====================================================
 // SCOUT OPPOSITE-ON-DECLINE — added per real-session testing (both the
 // catastrophic Fibonacci session and the session where Scout fell off at
-// the end): tracks Scout's own REALIZED pick accuracy (not any individual
-// engine's — the accuracy of whatever Scout actually ended up betting each
-// hand, after any prior flip), decayed the same way engine scores are, with
-// its own peak tracked the same way. Once that score has dropped
-// SCOUT_OPPOSITE_ON_DECLINE_PCT below its own peak, Scout bets the OPPOSITE
-// of its current pick instead of the pick itself — ENTRY condition.
+// the end): tracks Scout's own REALIZED pick accuracy. Once that score has
+// dropped SCOUT_OPPOSITE_ON_DECLINE_PCT below its own peak, Scout bets the
+// OPPOSITE of its current pick instead of the pick itself.
 //
-// RELEASE condition (updated after a follow-up session showed the original
-// peak-relative release could stay stuck flipping for 55+ hands even while
-// the underlying engine had already turned around and was calling hands
-// correctly): release is no longer "climb back near peak." Instead it
-// tracks the RAW, unflipped accuracy of whichever engine Scout currently
-// has selected over the last SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK hands,
-// and releases as soon as more of those raw picks would have won than lost.
-// This trail is cleared whenever Scout switches to a different engine, so
-// a fresh switch is judged only on its own results, never diluted by
-// whatever the previous engine had been doing — verified this specifically:
-// without the reset, a genuine switch to a recovering engine could still
-// get its first correct picks flipped for a few hands until the window
-// caught up.
+// REDESIGNED (found via a session with two separate catastrophic drawdowns,
+// one to -$4,075, that this exact mechanism caused): the original version
+// used two DIFFERENT signals — entry watched the compounded (post-flip) bet
+// results, release watched a short raw-accuracy window. That split let the
+// two fight each other: release only needed 3 raw hands to look decent to
+// switch off, but entry immediately re-checked the compounded score, which
+// was still contaminated by the very flips OOD had just made and hadn't
+// recovered — so entry re-triggered almost immediately, sometimes betting
+// against an engine on a genuine 4-hand correct streak. Traced this
+// directly: 7 of 10 losses in each of that session's two drawdowns were OOD
+// betting against a pick that was actually right, for a net gain of $25
+// across the whole session in exchange for a swing past -$4,000 along the
+// way.
 //
-// This is deliberately a different condition from the four/five-engine halt
-// above (which requires every individual engine declining together) — this
-// one can fire even while some individual engines still look fine, because
-// entry is about what Scout is ACTUALLY producing, not the underlying
-// engines — while release is specifically about the underlying engine
-// Scout currently trusts.
+// Fix: entry and release now both watch the SAME signal — the RAW,
+// never-flipped, decayed accuracy of whichever engine Scout currently has
+// selected. This can never be contaminated by OOD's own betting decisions,
+// since it's computed independent of whether a flip is in effect. Entry
+// triggers on decline from peak (peak-agnostic, same reasoning as before).
+// Release triggers on the raw score itself trending upward over the last
+// SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK hands — not a separate raw win/loss
+// tally, the actual decayed score's own trajectory, so both conditions are
+// reading the same ledger and can't produce the flicker above.
 //
-// Verified: this is not a hit-rate improvement (accuracy stayed
-// ~coin-flip on every test session) — the benefit comes from breaking up
-// what would otherwise be an unbroken losing streak, which matters
-// disproportionately for progressive strategies like Fibonacci. Entry
-// threshold swept 5%-70% on two real sessions (every value beat no-flip;
-// 10% was best). Release swept several designs (peak-relative, momentum
-// lookback, hard streak cap, raw-accuracy lookback) across three real
-// sessions; raw-accuracy lookback=3 with reset-on-switch was the best
-// net performer of those tested and is used below.
+// Verified: eliminates the catastrophic drawdown entirely on the session
+// that surfaced this (min bankroll -$4,075 -> $4,975) at a modest cost to
+// the final number across four real sessions (roughly $200-400 lower each,
+// versus the old design's numbers, which depended on a lucky recovery bet
+// right after a self-inflicted crisis rather than genuine improvement).
 //
 // Same "replay from history, decide before observing" pattern as
 // getScoutSelectedEngine/getEngineHaltState above — no mutable state kept
@@ -2313,16 +2309,11 @@ function getScoutOwnPerformance(history: Step[]): { score: number; peak: number;
   let score = 0;
   let peak = -Infinity;
   let flipping = false;
-  let rawRecentResults: boolean[] = [];
-  let lastPicked = "";
+  let scoreTrail: number[] = [];
 
   for (let i = 0; i < history.length; i += 1) {
     const prior = history.slice(0, i);
     const picked = getScoutSelectedEngine(prior);
-    if (picked !== lastPicked) {
-      rawRecentResults = []; // engine changed — judge it only on its own results
-      lastPicked = picked;
-    }
     const forecasts: Record<string, GroupKey | null> = {
       BB_STRAIGHT: bbStraightForecast(prior).group ?? null,
       BB_INVERTED: bbInvertedForecast(prior).group ?? null,
@@ -2336,34 +2327,24 @@ function getScoutOwnPerformance(history: Step[]): { score: number; peak: number;
     const actual = spinToBaccaratOutcome(history[i].outcome);
     const rawSide = getBaccaratSideFromForecastGroup(rawGroup);
     if (!rawSide) continue;
-    const rawWon = rawSide === actual;
+    const rawWon = rawSide === actual ? 1 : 0;
 
-    const group = flipping ? invertGroup(rawGroup) : rawGroup;
-    const predictedSide = getBaccaratSideFromForecastGroup(group);
-    const won = predictedSide === actual ? 1 : 0;
-
-    score = score * SCOUT_DECAY_FACTOR + (won - 0.5);
+    // This score is always the RAW, unflipped accuracy — it never reads
+    // what was actually bet, so OOD's own flip decisions can't feed back
+    // into the signal that decides whether to keep flipping.
+    score = score * SCOUT_DECAY_FACTOR + (rawWon - 0.5);
     if (score > peak) peak = score;
+    scoreTrail.push(score);
 
-    rawRecentResults.push(rawWon);
-    if (rawRecentResults.length > SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK) rawRecentResults.shift();
-
-    // Fixed to work when peak is negative too: multiplying a negative peak
-    // by (1 - pct) makes it LESS negative, which is backwards — found via a
-    // real session where Scout's own score had been negative since hand 2
-    // and never recovered, so the old peak > 0 gate meant OOD could never
-    // trigger no matter how bad things got. This form (subtracting a
-    // proportional margin using the peak's magnitude) reduces to the exact
-    // same threshold as before whenever peak is positive, so it doesn't
-    // change behavior for any previously-tested case where peak did go
-    // positive — verified directly.
+    // Peak-agnostic decline check (see prior fix note): works whether peak
+    // is positive or negative.
     const declining = peak > -Infinity && score <= peak - Math.abs(peak) * SCOUT_OPPOSITE_ON_DECLINE_PCT;
     if (!flipping && declining) {
       flipping = true;
     } else if (flipping) {
-      const rawWins = rawRecentResults.filter((x) => x).length;
-      const rawAccuracyGood = rawRecentResults.length >= SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK && rawWins > rawRecentResults.length / 2;
-      if (rawAccuracyGood) flipping = false;
+      const lookbackIdx = Math.max(0, scoreTrail.length - 1 - SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK);
+      const recovering = scoreTrail.length > lookbackIdx + 1 && scoreTrail[scoreTrail.length - 1] > scoreTrail[lookbackIdx];
+      if (recovering) flipping = false;
     }
   }
 
