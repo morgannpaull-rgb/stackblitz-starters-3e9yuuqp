@@ -130,7 +130,16 @@ const DEFAULT_EXECUTE_WEAK = true;
 // Confirmed via testing: flipping this to false immediately restored real,
 // substantial Pulse sensitivity for those engines (13-76 of 80 hands
 // differing per trial, versus 0 every time before).
-const DEFAULT_EXECUTE_OBSERVATION = false;
+// Reverted back to true per explicit user preference (requested in an
+// earlier chat, reaffirmed here): default is "Observe OFF" — Pulse's hold
+// gate is bypassed by default. This means Straight is the only engine with
+// visible Pulse sensitivity out of the box (via its own spread-override
+// mechanism, unrelated to this setting); Inverted/Markov/Cadence/Random
+// only show a Pulse effect once "Observe" is turned ON manually in
+// Settings. That's the intended, deliberate behavior — not a bug — and is
+// separate from the Random-engine gate fix below, which is what makes
+// Random actually responsive to Pulse at all once Observe is turned on.
+const DEFAULT_EXECUTE_OBSERVATION = true;
 
 type TierExecutionSettings = {
   executeWeak: boolean;
