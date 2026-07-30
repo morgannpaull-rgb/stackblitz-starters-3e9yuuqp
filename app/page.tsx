@@ -4037,7 +4037,16 @@ function applyPulseEnhancerToDecision(decision: any, pulse: any, pulseEnabled: b
   const pulseConfidence = seven.confidence;
   const pulseTier = getPulseTierFromConfidence(pulseConfidence, seven.observe);
   const pulseObserve = seven.observe;
-  const spreadOverride = source === "BB_STRAIGHT" ? getBbStraightPulseSpreadOverride(history, pulseConfidence) : null;
+  // Extended to Cadence, Inverted, and Random per explicit request (Markov
+  // deliberately excluded — it has no DPI concept at all, unlike these
+  // three, so this mechanism has nothing to attach to for Markov). The
+  // underlying function only ever reads getDpiValue(history) and each row's
+  // stored confidence/outcome — both explicitly engine-agnostic (see
+  // getDpiValue's own "LOCKED GLOBAL DPI RULE" comment: not based on
+  // forecast side, engine, or Pulse mode) — so no engine-specific
+  // adaptation was needed, only widening which sources are allowed to use it.
+  const spreadOverrideEligible = source === "BB_STRAIGHT" || source === "CADENCE" || source === "BB_INVERTED" || source === "RANDOM";
+  const spreadOverride = spreadOverrideEligible ? getBbStraightPulseSpreadOverride(history, pulseConfidence) : null;
   const finalGroup = spreadOverride?.active && spreadOverride.group ? spreadOverride.group : rawGroup;
   const finalNumbers = finalGroup ? GROUPS[finalGroup] : rawNumbers;
 
