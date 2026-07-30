@@ -121,18 +121,8 @@ const DEFAULT_PER_NUMBER_LIMIT = 10000;
 const DEFAULT_EXPOSURE_CAP_PERCENT = 2;
 const MAX_ETR_C_RECOVERY_BET = 500;
 const MAX_ETR_C_RECOVERY_STEPS = 5;
-// Changed from true/true: with both defaulted to execute, Pulse's tier
-// downgrades (Controlled Prediction -> Weak Prediction) never actually held
-// a bet back, so the bankroll chart was bet-for-bet identical whether Pulse
-// was on or off (confirmed directly: 80-hand replay, same hands, same mode,
-// bankroll/net/session log byte-identical with only the Signal State panel
-// differing). Pulse's own stated purpose is to be able to force a hold -
-// with these defaulted to execute-everything, that lever was never used.
-// Users can still flip these back to true in Tier Execution Rules if they
-// want Pulse to stay purely advisory (confidence/tier display only, no
-// execution change) - this only changes the out-of-the-box default.
-const DEFAULT_EXECUTE_WEAK = false;
-const DEFAULT_EXECUTE_OBSERVATION = false;
+const DEFAULT_EXECUTE_WEAK = true;
+const DEFAULT_EXECUTE_OBSERVATION = true;
 
 type TierExecutionSettings = {
   executeWeak: boolean;
@@ -166,16 +156,7 @@ const DEFAULT_STRATEGY: Strategy = "Flat";
 const PERF_REPLAY_HAND_LIMIT = 120;
 const PERF_CHART_HAND_LIMIT = 120;
 const STORAGE_KEY = "edgelab_baccarat_native_pulse_terminal_v1";
-// Bumped v1 -> v2: DEFAULT_EXECUTE_WEAK/DEFAULT_EXECUTE_OBSERVATION changed
-// from true to true->false (see those constants). Any browser with a v1
-// blob saved from before that change would have executeWeak/executeObservation
-// baked in as true, and the load-on-mount effect below would silently
-// re-apply that saved true over the new false default on every page load -
-// meaning the Pulse-execution fix would appear not to work at all, even
-// though the file itself was correct. Bumping the key means old v1 blobs
-// are simply never read; everyone gets the new defaults fresh once, and can
-// re-save under v2 from that point on.
-const CONTROL_SETTINGS_KEY = "edgelab_baccarat_native_pulse_control_settings_v2";
+const CONTROL_SETTINGS_KEY = "edgelab_baccarat_native_pulse_control_settings_v1";
 const STRATEGIES: Strategy[] = [
   "Flat",
   "Martingale",
@@ -2317,29 +2298,6 @@ function getScoutSelectedEngine(history: Step[]): "BB_STRAIGHT" | "BB_INVERTED" 
 // getScoutSelectedEngine/getEngineHaltState above — no mutable state kept
 // between calls, just recomputed (and cached) from the outcome sequence.
 const SCOUT_OPPOSITE_ON_DECLINE_PCT = 0.1;
-// v6 fix (validated against 4 real sessions via settleSpin/getScoutSelectedEngine
-// replay, not a hand-rolled reimplementation): a pure percentage-of-peak
-// threshold is smaller than a single hand's natural score swing (~0.5-0.6)
-// whenever peak is under ~5-6, which is most of the time. That let ONE
-// ordinary loss cross the "decline" threshold even while the picked engine
-// was net-positive over the whole window - confirmed directly: in session 6,
-// the picked engine's raw score stayed between +2.0 and +3.5 for 32 straight
-// hands (never negative), yet shouldFlipNext flickered on almost every other
-// hand, and every flip inverted a correct call into an executed loss.
-// Fix: floor the decline requirement at an absolute minimum so a single
-// hand's noise can't trigger entry by itself - only a real, multi-hand
-// decline can. Swept 0.5-2.0 against all 4 sessions; 2.0 gave the best
-// total drawdown reduction (10700 -> 4350 total maxDD across sessions,
-// total final bankroll roughly flat) without any session collapsing the
-// way some interior values did (thresholds interact with Fibonacci sizing
-// in non-monotonic ways - a single flipped hand cascades through bet sizing
-// afterward, so nearby values were spot-checked, not just this one).
-// PCT itself is left at 0.1 - widening it alone (tested at 0.5) barely
-// changed sessions 3-5 at all, since 50% of a small peak is still smaller
-// than the noise floor; it only helped in the one session where the peak
-// was already large. The absolute floor is what actually fixes the
-// low-peak chattering that causes most of the drawdowns.
-const SCOUT_OPPOSITE_ON_DECLINE_MIN_ABS = 2.0;
 const SCOUT_OPPOSITE_ON_DECLINE_RAW_LOOKBACK = 3;
 const _scoutOwnPerfCache = new Map<string, { score: number; peak: number; shouldFlipNext: boolean }>();
 
@@ -2380,7 +2338,7 @@ function getScoutOwnPerformance(history: Step[]): { score: number; peak: number;
 
     // Peak-agnostic decline check (see prior fix note): works whether peak
     // is positive or negative.
-    const declining = peak > -Infinity && score <= peak - Math.max(Math.abs(peak) * SCOUT_OPPOSITE_ON_DECLINE_PCT, SCOUT_OPPOSITE_ON_DECLINE_MIN_ABS);
+    const declining = peak > -Infinity && score <= peak - Math.abs(peak) * SCOUT_OPPOSITE_ON_DECLINE_PCT;
     if (!flipping && declining) {
       flipping = true;
     } else if (flipping) {
