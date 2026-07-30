@@ -166,7 +166,16 @@ const DEFAULT_STRATEGY: Strategy = "Flat";
 const PERF_REPLAY_HAND_LIMIT = 120;
 const PERF_CHART_HAND_LIMIT = 120;
 const STORAGE_KEY = "edgelab_baccarat_native_pulse_terminal_v1";
-const CONTROL_SETTINGS_KEY = "edgelab_baccarat_native_pulse_control_settings_v1";
+// Bumped v1 -> v2: DEFAULT_EXECUTE_WEAK/DEFAULT_EXECUTE_OBSERVATION changed
+// from true to true->false (see those constants). Any browser with a v1
+// blob saved from before that change would have executeWeak/executeObservation
+// baked in as true, and the load-on-mount effect below would silently
+// re-apply that saved true over the new false default on every page load -
+// meaning the Pulse-execution fix would appear not to work at all, even
+// though the file itself was correct. Bumping the key means old v1 blobs
+// are simply never read; everyone gets the new defaults fresh once, and can
+// re-save under v2 from that point on.
+const CONTROL_SETTINGS_KEY = "edgelab_baccarat_native_pulse_control_settings_v2";
 const STRATEGIES: Strategy[] = [
   "Flat",
   "Martingale",
