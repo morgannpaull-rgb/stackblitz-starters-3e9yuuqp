@@ -122,7 +122,15 @@ const DEFAULT_EXPOSURE_CAP_PERCENT = 2;
 const MAX_ETR_C_RECOVERY_BET = 500;
 const MAX_ETR_C_RECOVERY_STEPS = 5;
 const DEFAULT_EXECUTE_WEAK = true;
-const DEFAULT_EXECUTE_OBSERVATION = true;
+// Changed to false per bug found July 30: with this at true (the old
+// default), Pulse's hold/observe gate was bypassed on every single hand for
+// every engine, which meant Pulse had no real effect at all for
+// Inverted/Markov/Cadence/Random (their only lever is the hold gate — the
+// spread-override that gives Straight an alternate path is Straight-only).
+// Confirmed via testing: flipping this to false immediately restored real,
+// substantial Pulse sensitivity for those engines (13-76 of 80 hands
+// differing per trial, versus 0 every time before).
+const DEFAULT_EXECUTE_OBSERVATION = false;
 
 type TierExecutionSettings = {
   executeWeak: boolean;
@@ -4000,7 +4008,12 @@ function applyPulseEnhancerToDecision(decision: any, pulse: any, pulseEnabled: b
   if (!pulseEnabled || !decision?.group || decision?.source === "NONE") return decision;
 
   const source = decision.source as PulseEngineSource;
-  if (source !== "BB_STRAIGHT" && source !== "BB_INVERTED" && source !== "MARKOV" && source !== "CADENCE") return decision;
+  // RANDOM added per bug found July 30 — this gate was written before Random
+  // existed as a fifth engine, so it silently excluded Random from Pulse
+  // entirely (confirmed via testing: zero Pulse effect across every trial,
+  // regardless of session data or the executeObservation setting, unlike
+  // Inverted/Markov/Cadence which just needed executeObservation off).
+  if (source !== "BB_STRAIGHT" && source !== "BB_INVERTED" && source !== "MARKOV" && source !== "CADENCE" && source !== "RANDOM") return decision;
 
   const rawGroup = decision.group as GroupKey;
   const rawNumbers = Array.isArray(decision.numbers) && decision.numbers.length ? decision.numbers : GROUPS[rawGroup];
