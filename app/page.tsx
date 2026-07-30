@@ -121,8 +121,18 @@ const DEFAULT_PER_NUMBER_LIMIT = 10000;
 const DEFAULT_EXPOSURE_CAP_PERCENT = 2;
 const MAX_ETR_C_RECOVERY_BET = 500;
 const MAX_ETR_C_RECOVERY_STEPS = 5;
-const DEFAULT_EXECUTE_WEAK = true;
-const DEFAULT_EXECUTE_OBSERVATION = true;
+// Changed from true/true: with both defaulted to execute, Pulse's tier
+// downgrades (Controlled Prediction -> Weak Prediction) never actually held
+// a bet back, so the bankroll chart was bet-for-bet identical whether Pulse
+// was on or off (confirmed directly: 80-hand replay, same hands, same mode,
+// bankroll/net/session log byte-identical with only the Signal State panel
+// differing). Pulse's own stated purpose is to be able to force a hold -
+// with these defaulted to execute-everything, that lever was never used.
+// Users can still flip these back to true in Tier Execution Rules if they
+// want Pulse to stay purely advisory (confidence/tier display only, no
+// execution change) - this only changes the out-of-the-box default.
+const DEFAULT_EXECUTE_WEAK = false;
+const DEFAULT_EXECUTE_OBSERVATION = false;
 
 type TierExecutionSettings = {
   executeWeak: boolean;
