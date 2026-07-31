@@ -2016,6 +2016,120 @@ function randomForecast(history: Step[]) {
   };
 }
 
+// ============================================================================
+// EXPERIMENTAL — ROLLING-LAG AUTOCORRELATION FORECAST
+// ============================================================================
+// Status as of implementation: UNVALIDATED. Standalone Python analysis (see
+// handoff §10) found no exploitable pattern across the 4 real sessions tested
+// — the one promising-looking result (a fixed-split 65% hit rate) got WEAKER,
+// not stronger, once re-tested with this exact rolling/expanding method,
+// dropping from the 98th to the 84th percentile of a random baseline. This is
+// implemented so it can keep being tested against real sessions going
+// forward, not because it has cleared any bar of proven edge. Per the agreed
+// plan: never added to Scout's candidate pool, and deliberately never routed
+// through Pulse's spread-override — it stays fully isolated so its own raw
+// accuracy can be measured without being confounded by either mechanism.
+//
+// Method: at every hand, using only PRIOR history (never the hand being
+// predicted — same "decide before observing" discipline used everywhere else
+// in this file), scan lags 1 through ROLLING_LAG_MAX. For each lag k with
+// enough comparisons available, compute the agreement rate between the
+// outcome sequence and itself shifted by k hands. 0.500 = no structure.
+// Whichever lag currently shows the strongest deviation from 0.500 (in
+// either direction) is used: agreement rate above 0.5 means "repeat the
+// outcome from k hands ago"; below 0.5 means "invert it."
+const ROLLING_LAG_MIN = 1;
+const ROLLING_LAG_MAX = 15; // matches the lag range used in the original discovery analysis
+// MIN SAMPLES PER LAG — deliberately just 1, not a flat conservative floor.
+// This matches the actual methodology validated in the separate autocorrelation
+// investigation thread (see handoff §10/11): a lag is "testable" the moment at
+// least one comparison exists for it (history.length > lag), so lag 1 starts
+// as early as hand 3, and larger lags become viable purely as a mechanical
+// consequence of needing more history — not from any extra threshold layered
+// on top. This means early hands can show maximum-looking confidence off a
+// single coin-flip comparison; that's intentional fidelity to what was
+// actually tested, not an oversight — the honest conclusion from that testing
+// was still "no exploitable pattern," measured against a random baseline run
+// through this exact same procedure (including this early-noise behavior), so
+// tightening this now would make this engine diverge from what was validated.
+const ROLLING_LAG_MIN_SAMPLES_PER_LAG = 1;
+
+function rollingLagForecast(history: Step[]) {
+  if (history.length < ROLLING_LAG_MIN + ROLLING_LAG_MIN_SAMPLES_PER_LAG) {
+    return {
+      group: null as GroupKey | null,
+      numbers: [] as SpinValue[],
+      confidence: 0,
+      tier: "No Prediction",
+      reason: `Rolling-lag needs at least ${ROLLING_LAG_MIN + ROLLING_LAG_MIN_SAMPLES_PER_LAG} hands before lag ${ROLLING_LAG_MIN} has a single comparison to test (have ${history.length}).`,
+    };
+  }
+
+  const bits = history.map((h) => (spinToBaccaratOutcome(h.outcome) === "P" ? 1 : 0));
+
+  let bestLag: number | null = null;
+  let bestRate = 0.5;
+  let bestDeviation = 0;
+
+  const maxLag = Math.min(ROLLING_LAG_MAX, bits.length - 1);
+  for (let lag = ROLLING_LAG_MIN; lag <= maxLag; lag += 1) {
+    let matches = 0;
+    let total = 0;
+    for (let i = lag; i < bits.length; i += 1) {
+      total += 1;
+      if (bits[i] === bits[i - lag]) matches += 1;
+    }
+    if (total < ROLLING_LAG_MIN_SAMPLES_PER_LAG) continue;
+    const rate = matches / total;
+    const deviation = Math.abs(rate - 0.5);
+    if (deviation > bestDeviation) {
+      bestDeviation = deviation;
+      bestLag = lag;
+      bestRate = rate;
+    }
+  }
+
+  if (bestLag === null) {
+    return {
+      group: null as GroupKey | null,
+      numbers: [] as SpinValue[],
+      confidence: 0,
+      tier: "No Prediction",
+      reason: `No lag in range ${ROLLING_LAG_MIN}-${ROLLING_LAG_MAX} has a comparison yet.`,
+    };
+  }
+
+  const referenceBit = bits[bits.length - bestLag];
+  const predictedBit = bestRate >= 0.5 ? referenceBit : 1 - referenceBit;
+  const predictedSide: BaccaratOutcome = predictedBit === 1 ? "P" : "B";
+  const group = baccaratSideToBaseGroup(predictedSide);
+  // A lag sitting right at 50% should read as a genuine no-signal state, not
+  // a coin-flip dressed up as a confident bet — confidence floors at 50 only
+  // once deviation clears a small noise threshold, same spirit as the other
+  // engines' confidence floors. Note this floor is about deviation == 0
+  // specifically (a lag with a perfectly balanced split at higher sample
+  // counts), not about small-sample lags generally — those are allowed
+  // through by design, per the comment above.
+  const confidence = bestDeviation < 0.02 ? 0 : Math.max(50, Math.min(85, Math.round(50 + bestDeviation * 300)));
+  if (confidence === 0) {
+    return {
+      group: null as GroupKey | null,
+      numbers: [] as SpinValue[],
+      confidence: 0,
+      tier: "No Prediction",
+      reason: `Best lag (${bestLag}) sits within noise of 50% agreement (${(bestRate * 100).toFixed(1)}%) — no usable signal this hand.`,
+    };
+  }
+  return {
+    group,
+    numbers: GROUPS[group],
+    confidence,
+    tier: confidence >= 70 ? "Active · Confirmed" : "Active · Caution",
+    dpi: Math.round((bestRate - 0.5) * 200),
+    reason: `Rolling lag ${bestLag} · agreement ${(bestRate * 100).toFixed(1)}% · ${bestRate >= 0.5 ? "repeat" : "invert"} hand -${bestLag}.`,
+  };
+}
+
 function bbStraightForecast(history: Step[]) {
   const divergence = getPulseBBStraightDivergence(history);
 
@@ -2552,6 +2666,7 @@ function markovForecast(history: Step[]) {
 
 function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
   const bbMode = randomEnabled ? "Random" : cadenceEnabled ? "Cadence" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted BB" : bbStraightEnabled ? "Straight BB" : "BB Off";
+  if (scoutEnabled && bbMode === "BB Off") return "SCOUT Armed / No Engine";
   if (scoutEnabled && pulseEnabled) return "SCOUT + PULSE";
   if (scoutEnabled) return "SCOUT";
   if (pulseEnabled && bbMode !== "BB Off") return `PULSE + ${bbMode}`;
@@ -2559,7 +2674,7 @@ function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, b
   return bbMode === "BB Off" ? "Disabled" : bbMode;
 }
 
-function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
+function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false, rollingLagEnabled = false) {
   const pulse = getNeuralCalibratedPulse(history);
   const straight = bbStraightForecast(history);
   const inverted = bbInvertedForecast(history);
@@ -2568,17 +2683,45 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   const random = randomForecast(history);
   const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled);
 
+  // EXPERIMENTAL ROLLING-LAG — checked before anything else and returned
+  // immediately. Deliberately isolated: never enhanced by Pulse, never part
+  // of Scout's candidate pool, never blended with a manually-selected
+  // engine. This is intentional — the whole point right now is measuring
+  // this engine's own raw accuracy against real sessions, uncontaminated by
+  // any other mechanism. See the function definition above for full
+  // rationale and current validation status (not yet proven).
+  if (rollingLagEnabled) {
+    const rollingLag = rollingLagForecast(history);
+    return {
+      ...rollingLag,
+      source: "ROLLING_LAG" as const,
+      mode: "ROLLING LAG (Experimental)",
+    };
+  }
+
   // SCOUT AUTHORITY
-  // Scout, when on, overrides manual Play Mode selection entirely — same
-  // precedence Pulse has in the roulette platform this was ported from.
-  // It picks whichever of the five engines currently has the highest
-  // cumulative-advantage score (see getScoutSelectedEngine) and uses that
-  // engine's own raw forecast, completely independent of what
+  // Scout, when on AND a Play Mode engine is also selected, overrides WHICH
+  // engine's forecast gets used — same precedence Pulse has in the roulette
+  // platform this was ported from. It picks whichever of the five engines
+  // currently has the highest cumulative-advantage score (see
+  // getScoutSelectedEngine) and uses that engine's own raw forecast,
+  // completely independent of WHICH of
   // bbStraightEnabled/bbInvertedEnabled/markovEnabled/cadenceEnabled/randomEnabled
-  // say — those flags are left untouched in state, so the Play Mode buttons
-  // keep showing whatever you last picked manually. If Baccarat's own Pulse
-  // (a separate, unrelated enhancer) is also on, it still enhances
+  // is on — those flags are left untouched in state, so the Play Mode
+  // buttons keep showing whatever you last picked manually. If Baccarat's
+  // own Pulse (a separate, unrelated enhancer) is also on, it still enhances
   // whichever engine Scout selects, exactly as it would for a manual pick.
+  //
+  // ACTIVATION GATE — added per explicit request: Scout now requires a Play
+  // Mode engine to also be selected before it does anything, exactly the
+  // same "enhancer needs an engine armed" gating Pulse already had. With
+  // Scout on and Play Mode at OFF, Scout is armed but inert (mirrors
+  // "PULSE Armed / No Engine") rather than running its own selection.
+  // Scout's actual engine-selection logic (getScoutSelectedEngine, the
+  // leader-gap/momentum-gap mechanism, OOD) is completely unchanged by
+  // this — it still freely picks among all 5 engines on its own once
+  // active; this gate only decides WHETHER Scout is active at all, never
+  // WHICH engine it lands on.
   //
   // Random added to the pool per testing: adding it alone (without the
   // opposite-on-decline mechanism below) was a wash on its own — helped one
@@ -2596,6 +2739,18 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   // Straight was the last manual pick, unrelated to Scout's own scoring).
   // Scout now always returns its OWN hold decision instead of falling
   // through, so it can never inherit a manual selection while it's on.
+  const anyEngineArmed = bbStraightEnabled || bbInvertedEnabled || markovEnabled || cadenceEnabled || randomEnabled;
+  if (scoutEnabled && !anyEngineArmed) {
+    return {
+      group: null as GroupKey | null,
+      numbers: [] as SpinValue[],
+      confidence: 0,
+      tier: "No Prediction",
+      reason: "Scout is armed but no Play Mode engine is selected — pick one to activate Scout.",
+      source: "NONE" as const,
+      mode,
+    };
+  }
   if (scoutEnabled) {
     const picked = getScoutSelectedEngine(history);
     const forecastByPick: Record<string, any> = { BB_STRAIGHT: straight, BB_INVERTED: inverted, MARKOV: markov, CADENCE: cadence, RANDOM: random };
@@ -3148,7 +3303,7 @@ function getDirectionalRebuildEngine(history: Step[], decision: any, resync: any
 // It does NOT create predictions, vote engines, or modify BB/DPI/Markov.
 // =====================================================
 
-type PulseEngineSource = "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM";
+type PulseEngineSource = "BB_STRAIGHT" | "BB_INVERTED" | "MARKOV" | "CADENCE" | "RANDOM" | "ROLLING_LAG";
 
 function getEngineRowSource(row: Step): PulseEngineSource | null {
   const selected = row.pulseDiagnostics?.selectedEngine;
@@ -4330,13 +4485,16 @@ function verifyLockedDpiExample_BBPBBP() {
   return values;
 }
 
-function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false): Step {
-  const f = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled);
+function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, startingBankroll: number, strategy: Strategy, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false, rollingLagEnabled = false): Step {
+  const f = getActiveDecision(history, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled);
 
   // SCOUT OPPOSITE-ON-DECLINE — see getScoutOwnPerformance above for the
   // full rationale. Only applies while Scout is on, and only to hands where
   // Scout actually has a forecast (never touches manual mode or a hold).
-  if (scoutEnabled && f.group && f.source !== "NONE") {
+  // Explicitly excludes ROLLING_LAG: if a user somehow has both Scout and
+  // the experimental rolling-lag toggle on at once, rolling-lag's isolation
+  // guarantee (never touched by Scout/Pulse) must hold regardless.
+  if (scoutEnabled && f.group && f.source !== "NONE" && f.source !== "ROLLING_LAG") {
     const ownPerf = getScoutOwnPerformance(history);
     if (ownPerf.shouldFlipNext) {
       f.group = invertGroup(f.group);
@@ -4354,8 +4512,14 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   // upward movement over the last ENGINE_RECOVERY_LOOKBACK hands, even if
   // it's still below its own peak — see getEngineHaltState.
   // Per request July 28: only allowed to trigger while Scout is on — it
-  // never activates in manual (non-Scout) mode.
-  const haltState = scoutEnabled ? getEngineHaltState(history) : { haltActive: false, allDeclining: false, anyRecovering: false };
+  // never activates in manual (non-Scout) mode. Also requires an armed
+  // engine (same gate as Scout's own activation above) — if Scout is on but
+  // idle with no Play Mode engine selected, there's nothing being bet, so
+  // the halt has nothing to pause. Also never applies while the isolated
+  // rolling-lag decision is the one actually active, for the same isolation
+  // reason as the OOD guard above.
+  const scoutArmedAndActive = scoutEnabled && f.source !== "ROLLING_LAG" && (bbStraightEnabled || bbInvertedEnabled || markovEnabled || cadenceEnabled || randomEnabled);
+  const haltState = scoutArmedAndActive ? getEngineHaltState(history) : { haltActive: false, allDeclining: false, anyRecovering: false };
   const sessionEnded = haltState.haltActive;
 
   const active =
@@ -4840,9 +5004,9 @@ function runShadowStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: 
   return rows;
 }
 
-function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
+function runStrategy(outcomes: SpinValue[], strategy: Strategy, baseUnit: number, startingBankroll: number, pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, executionMode: ExecutionMode = "Stream Direct", tableLimit = DEFAULT_TABLE_LIMIT, perNumberLimit = DEFAULT_PER_NUMBER_LIMIT, tierExecution: TierExecutionSettings = DEFAULT_TIER_EXECUTION, markovEnabled = false, exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false, rollingLagEnabled = false) {
   const rows: Step[] = [];
-  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)));
+  outcomes.forEach((o) => rows.push(settleSpin(rows, o, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)));
   return rows;
 }
 
@@ -5190,7 +5354,8 @@ function runBaccaratEngineHistory(
   exposureCapPercent = DEFAULT_EXPOSURE_CAP_PERCENT,
   cadenceEnabled = false,
   scoutEnabled = false,
-  randomEnabled = false
+  randomEnabled = false,
+  rollingLagEnabled = false
 ): Step[] {
   return runStrategy(
     outcomes.map(baccaratOutcomeToSpin),
@@ -5208,7 +5373,8 @@ function runBaccaratEngineHistory(
     exposureCapPercent,
     cadenceEnabled,
     scoutEnabled,
-    randomEnabled
+    randomEnabled,
+    rollingLagEnabled
   );
 }
 
@@ -5245,6 +5411,7 @@ export default function Page() {
   const [cadenceEnabled, setCadenceEnabled] = useState(false);
   const [randomEnabled, setRandomEnabled] = useState(false);
   const [scoutEnabled, setScoutEnabled] = useState(false);
+  const [rollingLagEnabled, setRollingLagEnabled] = useState(false);
   // Execution Mode UI removed for Baccarat; internal execution remains locked to direct Player/Banker settlement.
   const [executionMode, setExecutionMode] = useState<ExecutionMode>("Stream Direct");
   const [executeWeak, setExecuteWeak] = useState(DEFAULT_EXECUTE_WEAK);
@@ -5349,12 +5516,13 @@ export default function Page() {
       exposureCapPercent,
       cadenceEnabled,
       scoutEnabled,
-      randomEnabled
+      randomEnabled,
+      rollingLagEnabled
     );
-  }, [baccaratHistory, history, strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled]);
+  }, [baccaratHistory, history, strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled]);
 
   const displayHistory = activeReplayHistory.length ? activeReplayHistory : history;
-  const f = useMemo(() => getActiveDecision(displayHistory, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled), [displayHistory, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled]);
+  const f = useMemo(() => getActiveDecision(displayHistory, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled), [displayHistory, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled]);
   const wheelNeighbors = useMemo(() => getWheelNeighbors(f.group, f.source, executionMode), [f.group, f.source, executionMode]);
   const executionNumbers = useMemo(() => getExecutionNumbers(f.group, executionMode, f.source, f), [f.group, executionMode, f.source]);
   const wheelAlignment = useMemo(() => getWheelAlignment(f.group, executionMode, f.source), [f.group, executionMode, f.source]);
@@ -5454,9 +5622,9 @@ export default function Page() {
     }
   }, []);
 
-  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)]);
+  const addSpin = (value: SpinValue) => setHistory((h) => [...h, settleSpin(h, value, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)]);
   const rebuild = (start = startingBankroll, unit = baseUnit, nextStrategy = strategy, nextPulse = pulseEnabled) => {
-    setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled));
+    setHistory(runStrategy(history.map((h) => h.outcome), nextStrategy, unit, start, nextPulse, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled));
   };
 
   const replayBaccaratChartForMode = (
@@ -5467,7 +5635,8 @@ export default function Page() {
     nextExposureCapPercent = exposureCapPercent,
     nextCadence = cadenceEnabled,
     nextScout = scoutEnabled,
-    nextRandom = randomEnabled
+    nextRandom = randomEnabled,
+    nextRollingLag = rollingLagEnabled
   ) => {
     // LIVE CHART MODE-SWITCH REPLAY LOCK
     // The live chart must be rebuilt from raw outcomes every time the selected engine
@@ -5498,7 +5667,8 @@ export default function Page() {
         nextExposureCapPercent,
         nextCadence,
         nextScout,
-        nextRandom
+        nextRandom,
+        nextRollingLag
       )
     );
   };
@@ -5506,7 +5676,7 @@ export default function Page() {
   const applyPulseMode = () => {
     const nextPulse = !pulseEnabled;
     setPulseEnabled(nextPulse);
-    replayBaccaratChartForMode(nextPulse, bbStraightEnabled, bbInvertedEnabled, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled);
+    replayBaccaratChartForMode(nextPulse, bbStraightEnabled, bbInvertedEnabled, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled);
   };
 
 
@@ -5516,8 +5686,7 @@ export default function Page() {
     setMarkovEnabled(false);
     setCadenceEnabled(false);
     setRandomEnabled(false);
-    setScoutEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, nextStraight, nextInverted, false, exposureCapPercent, false, false, false);
+    replayBaccaratChartForMode(pulseEnabled, nextStraight, nextInverted, false, exposureCapPercent, false, scoutEnabled, false);
   };
 
   const applyMarkovMode = () => {
@@ -5526,8 +5695,7 @@ export default function Page() {
     setMarkovEnabled(true);
     setCadenceEnabled(false);
     setRandomEnabled(false);
-    setScoutEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, false, false, true, exposureCapPercent, false, false, false);
+    replayBaccaratChartForMode(pulseEnabled, false, false, true, exposureCapPercent, false, scoutEnabled, false);
   };
   const applyCadenceMode = () => {
     setBbStraightEnabled(false);
@@ -5535,8 +5703,7 @@ export default function Page() {
     setMarkovEnabled(false);
     setCadenceEnabled(true);
     setRandomEnabled(false);
-    setScoutEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, true, false, false);
+    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, true, scoutEnabled, false);
   };
   const applyRandomMode = () => {
     setBbStraightEnabled(false);
@@ -5544,8 +5711,7 @@ export default function Page() {
     setMarkovEnabled(false);
     setCadenceEnabled(false);
     setRandomEnabled(true);
-    setScoutEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, false, false, true);
+    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, false, scoutEnabled, true);
   };
 
   // SCOUT — read-only pick, used only to display an indicator (added below).
@@ -5756,7 +5922,7 @@ export default function Page() {
   const mergeSelected = () => {
     const sessions = savedSessions.filter((s) => selectedMerge.includes(s.name));
     let rows: Step[] = [];
-    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled))));
+    sessions.forEach((s) => s.history.forEach((h) => rows.push(settleSpin(rows, h.outcome, baseUnit, startingBankroll, strategy, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled))));
     setHistory(rows);
   };
 
@@ -6039,7 +6205,9 @@ export default function Page() {
       <button onClick={() => setScoutEnabled((v) => !v)} style={{ width: "100%", height: 34, borderRadius: 10, border: `1px solid ${scoutEnabled ? COLORS.amber : COLORS.red}`, background: scoutEnabled ? "rgba(245,158,11,0.16)" : "rgba(239,68,68,0.10)", color: scoutEnabled ? COLORS.amber : COLORS.red, fontWeight: 950, cursor: "pointer", marginBottom: scoutEnabled ? 4 : 8 }}>{scoutEnabled ? "SCOUT ON" : "SCOUT OFF"}</button>
       {scoutEnabled && (
         <div style={{ textAlign: "center", fontSize: 10, fontWeight: 900, color: COLORS.amber, letterSpacing: 0.4, marginBottom: 8 }}>
-          → {{ BB_STRAIGHT: "STRAIGHT", BB_INVERTED: "INVERTED", MARKOV: "MARKOV", CADENCE: "CADENCE", RANDOM: "RANDOM" }[scoutPick ?? "BB_STRAIGHT"]}
+          {bbStraightEnabled || bbInvertedEnabled || markovEnabled || cadenceEnabled || randomEnabled
+            ? `→ ${{ BB_STRAIGHT: "STRAIGHT", BB_INVERTED: "INVERTED", MARKOV: "MARKOV", CADENCE: "CADENCE", RANDOM: "RANDOM" }[scoutPick ?? "BB_STRAIGHT"]}`
+            : "ARMED · select an engine below"}
         </div>
       )}
       {displayHistory.at(-1)?.sessionEnded && (
@@ -6078,6 +6246,26 @@ export default function Page() {
         <div style={{ display: "flex", justifyContent: "space-between", fontSize: 11, color: t.subtext, fontWeight: 900 }}><span>PULSE Confidence</span><span>{pulseEnabled ? `${Math.round(f.confidence)}%` : "N/A"}</span></div>
         <div style={{ height: 10, borderRadius: 999, background: t.border, overflow: "hidden", marginTop: 7 }}><div style={{ width: pulseEnabled ? `${Math.round(f.confidence)}%` : "0%", height: "100%", background: f.confidence >= 78 ? COLORS.green : f.confidence >= 65 ? COLORS.cyan : f.confidence >= 50 ? COLORS.amber : COLORS.red }} /></div>
         <div style={{ textAlign: "center", marginTop: 10, color: t.subtext, fontSize: 12, fontWeight: 800 }}>{pulseEnabled ? (dimensionTDABlocked ? `TDA HOLD · Forecast Tier: ${forecastTierLabel}` : displayedTierLabel) : "Pulse Disabled"}</div>
+      </div>
+    </Panel>;
+  };
+  const ExperimentalPanel = () => {
+    const preview = useMemo(() => rollingLagForecast(displayHistory), [displayHistory]);
+    const previewSide = preview.group ? groupToBaccaratSide(preview.group) : null;
+    return <Panel title="Experimental · Rolling Lag (Unvalidated)">
+      <div style={{ fontSize: 11, color: t.subtext, fontWeight: 800, marginBottom: 10, lineHeight: 1.5 }}>
+        Standalone autocorrelation research engine — not yet shown to beat chance across real sessions. Deliberately isolated from Pulse, Scout, and the halt mechanism so its own raw accuracy can be measured cleanly.
+      </div>
+      <button onClick={() => setRollingLagEnabled((v) => !v)} style={{ width: "100%", height: 34, borderRadius: 10, border: `1px solid ${rollingLagEnabled ? "#a855f7" : t.borderStrong}`, background: rollingLagEnabled ? "rgba(168,85,247,0.14)" : t.input, color: rollingLagEnabled ? "#a855f7" : t.subtext, fontWeight: 950, cursor: "pointer", marginBottom: 10 }}>{rollingLagEnabled ? "ROLLING LAG ON" : "ROLLING LAG OFF"}</button>
+      {rollingLagEnabled && (
+        <div style={{ textAlign: "center", fontSize: 11, fontWeight: 900, color: "#a855f7", marginBottom: 10, lineHeight: 1.4 }}>
+          This is now the only thing driving Final Prediction — Pulse, Scout, and Play Mode are bypassed while it's on.
+        </div>
+      )}
+      <div style={{ border: `1px solid ${t.border}`, borderRadius: 12, background: t.panel2, padding: "9px 10px" }}>
+        <div style={{ fontSize: 10, color: t.subtext, fontWeight: 950, letterSpacing: 0.6, textTransform: "uppercase", marginBottom: 6 }}>Live Reading</div>
+        <div style={{ fontSize: 12, color: t.text, fontWeight: 800, lineHeight: 1.5 }}>{preview.reason}</div>
+        {previewSide && <div style={{ marginTop: 8, fontSize: 20, fontWeight: 950, color: previewSide === "P" ? COLORS.blue : COLORS.red }}>{baccaratOutcomeLabel(previewSide)}</div>}
       </div>
     </Panel>;
   };
@@ -7318,7 +7506,7 @@ const StreakAnalyticsPanel = () => {
 </div><span style={{ height: 20, width: 1, background: t.borderStrong }} /><span style={{ display: "inline-flex", alignItems: "center", color: headerAccent, fontFamily: "Sora, Arial, sans-serif", fontWeight: 300, letterSpacing: "0.14em", fontSize: 14, lineHeight: "20px", height: 20 }}>BACCARAT TERMINAL</span></div><div style={{ display: "grid", gridTemplateColumns: "repeat(4, auto)", gap: 18, alignItems: "center", color: t.subtext, fontSize: 11, fontWeight: 850, textTransform: "uppercase" }}><span>Last Result <b style={{ color: last?.result === "win" ? COLORS.green : last?.result === "loss" ? COLORS.red : t.text, marginLeft: 5 }}>{last?.result ?? "—"}</b></span><span>Last Side <b style={{ color: t.text, marginLeft: 5 }}>{last ? formatSpinAsBaccarat(last.outcome) : "—"}</b></span><span>Last Hand <b style={{ color: t.text, marginLeft: 5 }}>{last ? formatSpinAsBaccarat(last.outcome) : "—"}</b></span><span>Next <b style={{ color: headerAccent, marginLeft: 5 }}>Manual</b></span></div></header>;
   };
 
-  const Dashboard = () => <section style={{ display: "grid", gridTemplateColumns: "minmax(260px, 320px) minmax(0, 1fr) minmax(280px, 340px)", gap: 14, alignItems: "start", width: "100%", maxWidth: "100%", overflow: "hidden" }}><div style={{ display: "grid", gap: 14, minWidth: 0, maxWidth: "100%", overflow: "hidden", boxSizing: "border-box" }}><SignalPanel /><CompactMetrics /></div><div style={{ display: "grid", gap: 14, minWidth: 0, maxWidth: "100%", overflow: "hidden", boxSizing: "border-box" }}><BaccaratManualSimulator /><BankrollChart /><BaccaratTable /><StreamsPanel /><EngineStrip /></div><div style={{ display: "grid", gap: 14, minWidth: 0, maxWidth: "100%", overflow: "hidden", boxSizing: "border-box" }}><RecentLog />{isPulseOnlyMode ? null : <><DpiTerminalPanel /><SignalDpiSpreadPanel /></>}<AxisDirectionalAccuracyPanel /><ComparisonTable compact /></div></section>;
+  const Dashboard = () => <section style={{ display: "grid", gridTemplateColumns: "minmax(260px, 320px) minmax(0, 1fr) minmax(280px, 340px)", gap: 14, alignItems: "start", width: "100%", maxWidth: "100%", overflow: "hidden" }}><div style={{ display: "grid", gap: 14, minWidth: 0, maxWidth: "100%", overflow: "hidden", boxSizing: "border-box" }}><SignalPanel /><CompactMetrics /><ExperimentalPanel /></div><div style={{ display: "grid", gap: 14, minWidth: 0, maxWidth: "100%", overflow: "hidden", boxSizing: "border-box" }}><BaccaratManualSimulator /><BankrollChart /><BaccaratTable /><StreamsPanel /><EngineStrip /></div><div style={{ display: "grid", gap: 14, minWidth: 0, maxWidth: "100%", overflow: "hidden", boxSizing: "border-box" }}><RecentLog />{isPulseOnlyMode ? null : <><DpiTerminalPanel /><SignalDpiSpreadPanel /></>}<AxisDirectionalAccuracyPanel /><ComparisonTable compact /></div></section>;
   const Analytics = () => <section style={{ display: "grid", gap: 14 }}><LiveExecutionPerformancePanel /><RawSignalEngineAnalyticsPanel /><SpreadOverrideAnalyticsPanel /><CompactStreakAnalyticsPanel /><CollapsiblePanel id="advancedAnalyticsDiagnostics" title="Advanced Diagnostics"><div style={{ display: "grid", gap: 14 }}><EngineIntelligencePanel /><EngineSpecificPulseDiagnosticsPanel /></div></CollapsiblePanel></section>;
   const Reports = () => {
     const resolvedRows = displayHistory.filter((row) => row.result === "win" || row.result === "loss");
@@ -7486,7 +7674,7 @@ const StreakAnalyticsPanel = () => {
 
   return <div style={{ minHeight: "100vh", background: t.appBg, color: t.text, fontFamily: "Sora, Arial, sans-serif", display: "grid", gridTemplateColumns: "82px minmax(0, 1fr)" }}>
     <Modal open={showSave}><div style={{ fontSize: 20, fontWeight: 950, marginBottom: 10 }}>Save Current Session</div><Input type="text" value={sessionName} onChange={(e: any) => setSessionName(e.target.value)} placeholder="Session name" /><div style={{ display: "flex", gap: 10, justifyContent: "center", marginTop: 16 }}><div style={{ width: 130 }}><Button variant="secondary" onClick={() => setShowSave(false)}>Cancel</Button></div><div style={{ width: 130 }}><Button onClick={saveSession}>Save</Button></div></div></Modal>
-    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><NumericInput value={tableLimit} min={1} onCommit={(n: number) => { setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Hand Limit</div><NumericInput value={perNumberLimit} min={1} onCommit={(n: number) => { setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Exposure Cap %</div><NumericInput value={exposureCapPercent} min={0.1} max={100} allowDecimal={true} onCommit={(n: number) => { setExposureCapPercent(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, n, cadenceEnabled, scoutEnabled, randomEnabled)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Exposure Cap default is 2% of current bankroll and can be increased here. Limits are enforced on every strategy replay. Unit bet is capped by both the per-hand limit and the total table limit across the active Baccarat side.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${!executeObservation ? COLORS.green : t.borderStrong}`, background: !executeObservation ? "rgba(34,197,94,0.13)" : t.input, color: !executeObservation ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe {!executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe OFF.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
+    <Modal open={showSettings}><div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12, marginBottom: 12 }}><div><div style={{ fontSize: 22, fontWeight: 950 }}>Settings</div><div style={{ fontSize: 13, color: t.subtext, marginTop: 4 }}>Terminal display preferences and table limits.</div></div><button onClick={() => setShowSettings(false)} style={{ border: 0, background: "transparent", fontSize: 24, fontWeight: 900, cursor: "pointer", color: t.subtext }}>×</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><button onClick={() => setAppearance("light")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "light" ? COLORS.blue : t.borderStrong}`, background: "#fff", color: "#0f172a", fontWeight: 950 }}>Light</button><button onClick={() => setAppearance("dark")} style={{ height: 42, borderRadius: 10, border: `2px solid ${appearance === "dark" ? COLORS.cyan : t.borderStrong}`, background: "#020617", color: "#fff", fontWeight: 950 }}>Dark</button></div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 14 }}><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Table Limit</div><NumericInput value={tableLimit} min={1} onCommit={(n: number) => { setTableLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, n, perNumberLimit, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Per Hand Limit</div><NumericInput value={perNumberLimit} min={1} onCommit={(n: number) => { setPerNumberLimit(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, n, tierExecution, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)); }} /></div><div><div style={{ fontSize: 11, color: t.subtext, marginBottom: 5, fontWeight: 900 }}>Exposure Cap %</div><NumericInput value={exposureCapPercent} min={0.1} max={100} allowDecimal={true} onCommit={(n: number) => { setExposureCapPercent(n); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, tierExecution, markovEnabled, n, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)); }} /></div></div><div style={{ marginTop: 10, color: t.subtext, fontSize: 11, fontWeight: 800, lineHeight: 1.45 }}>Exposure Cap default is 2% of current bankroll and can be increased here. Limits are enforced on every strategy replay. Unit bet is capped by both the per-hand limit and the total table limit across the active Baccarat side.</div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Tier Execution Rules</div><div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 8 }}><button onClick={() => { const next = !executeWeak; setExecuteWeak(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeWeak: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${executeWeak ? COLORS.green : t.borderStrong}`, background: executeWeak ? "rgba(34,197,94,0.13)" : t.input, color: executeWeak ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Weak {executeWeak ? "ON" : "OFF"}</button><button onClick={() => { const next = !executeObservation; setExecuteObservation(next); setHistory(runStrategy(history.map((h) => h.outcome), strategy, baseUnit, startingBankroll, pulseEnabled, bbStraightEnabled, bbInvertedEnabled, executionMode, tableLimit, perNumberLimit, { ...tierExecution, executeObservation: next }, markovEnabled, exposureCapPercent, cadenceEnabled, scoutEnabled, randomEnabled, rollingLagEnabled)); }} style={{ height: 38, borderRadius: 10, border: `1px solid ${!executeObservation ? COLORS.green : t.borderStrong}`, background: !executeObservation ? "rgba(34,197,94,0.13)" : t.input, color: !executeObservation ? COLORS.green : t.subtext, fontWeight: 950, cursor: "pointer" }}>Observe {!executeObservation ? "ON" : "OFF"}</button></div><div style={{ marginTop: 9, color: t.subtext, fontSize: 11, fontWeight: 800 }}>Default: Weak ON, Observe OFF.</div></div><div style={{ marginTop: 14, border: `1px solid ${t.border}`, background: t.panel2, borderRadius: 12, padding: 12 }}><div style={{ fontSize: 12, fontWeight: 950, color: t.text, marginBottom: 8 }}>Saved Control Settings</div><div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}><Button onClick={saveControlSettings}>Save Controls</Button><Button variant="secondary" onClick={clearSavedControlSettings}>Clear Saved</Button></div>{settingsSavedNotice ? <div style={{ marginTop: 9, color: COLORS.green, fontSize: 11, fontWeight: 900 }}>{settingsSavedNotice}</div> : null}</div><div style={{ display: "flex", justifyContent: "center", marginTop: 18 }}><div style={{ width: 130 }}><Button onClick={() => setShowSettings(false)}>Done</Button></div></div></Modal>
     {showGlossary ? <div
       style={{ position: "fixed", inset: 0, background: "rgba(2,6,23,0.72)", zIndex: 9998, padding: 20, display: "flex", alignItems: "center", justifyContent: "center" }}
       onClick={() => setShowGlossary(false)}
