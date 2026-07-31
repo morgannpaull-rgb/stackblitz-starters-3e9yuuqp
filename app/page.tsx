@@ -2552,7 +2552,6 @@ function markovForecast(history: Step[]) {
 
 function getEngineModeLabel(pulseEnabled: boolean, bbStraightEnabled: boolean, bbInvertedEnabled: boolean, markovEnabled = false, cadenceEnabled = false, scoutEnabled = false, randomEnabled = false) {
   const bbMode = randomEnabled ? "Random" : cadenceEnabled ? "Cadence" : markovEnabled ? "Markov" : bbStraightEnabled && bbInvertedEnabled ? "Inverted BB" : bbStraightEnabled ? "Straight BB" : "BB Off";
-  if (scoutEnabled && bbMode === "BB Off") return "SCOUT Armed / No Engine";
   if (scoutEnabled && pulseEnabled) return "SCOUT + PULSE";
   if (scoutEnabled) return "SCOUT";
   if (pulseEnabled && bbMode !== "BB Off") return `PULSE + ${bbMode}`;
@@ -2570,28 +2569,16 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   const mode = getEngineModeLabel(pulseEnabled, bbStraightEnabled, bbInvertedEnabled, markovEnabled, cadenceEnabled, scoutEnabled, randomEnabled);
 
   // SCOUT AUTHORITY
-  // Scout, when on AND a Play Mode engine is also selected, overrides WHICH
-  // engine's forecast gets used — same precedence Pulse has in the roulette
-  // platform this was ported from. It picks whichever of the five engines
-  // currently has the highest cumulative-advantage score (see
-  // getScoutSelectedEngine) and uses that engine's own raw forecast,
-  // completely independent of WHICH of
+  // Scout, when on, overrides manual Play Mode selection entirely — same
+  // precedence Pulse has in the roulette platform this was ported from.
+  // It picks whichever of the five engines currently has the highest
+  // cumulative-advantage score (see getScoutSelectedEngine) and uses that
+  // engine's own raw forecast, completely independent of what
   // bbStraightEnabled/bbInvertedEnabled/markovEnabled/cadenceEnabled/randomEnabled
-  // is on — those flags are left untouched in state, so the Play Mode
-  // buttons keep showing whatever you last picked manually. If Baccarat's
-  // own Pulse (a separate, unrelated enhancer) is also on, it still enhances
+  // say — those flags are left untouched in state, so the Play Mode buttons
+  // keep showing whatever you last picked manually. If Baccarat's own Pulse
+  // (a separate, unrelated enhancer) is also on, it still enhances
   // whichever engine Scout selects, exactly as it would for a manual pick.
-  //
-  // ACTIVATION GATE — added per explicit request: Scout now requires a Play
-  // Mode engine to also be selected before it does anything, exactly the
-  // same "enhancer needs an engine armed" gating Pulse already had. With
-  // Scout on and Play Mode at OFF, Scout is armed but inert (mirrors
-  // "PULSE Armed / No Engine") rather than running its own selection.
-  // Scout's actual engine-selection logic (getScoutSelectedEngine, the
-  // leader-gap/momentum-gap mechanism, OOD) is completely unchanged by
-  // this — it still freely picks among all 5 engines on its own once
-  // active; this gate only decides WHETHER Scout is active at all, never
-  // WHICH engine it lands on.
   //
   // Random added to the pool per testing: adding it alone (without the
   // opposite-on-decline mechanism below) was a wash on its own — helped one
@@ -2609,18 +2596,6 @@ function getActiveDecision(history: Step[], pulseEnabled: boolean, bbStraightEna
   // Straight was the last manual pick, unrelated to Scout's own scoring).
   // Scout now always returns its OWN hold decision instead of falling
   // through, so it can never inherit a manual selection while it's on.
-  const anyEngineArmed = bbStraightEnabled || bbInvertedEnabled || markovEnabled || cadenceEnabled || randomEnabled;
-  if (scoutEnabled && !anyEngineArmed) {
-    return {
-      group: null as GroupKey | null,
-      numbers: [] as SpinValue[],
-      confidence: 0,
-      tier: "No Prediction",
-      reason: "Scout is armed but no Play Mode engine is selected — pick one to activate Scout.",
-      source: "NONE" as const,
-      mode,
-    };
-  }
   if (scoutEnabled) {
     const picked = getScoutSelectedEngine(history);
     const forecastByPick: Record<string, any> = { BB_STRAIGHT: straight, BB_INVERTED: inverted, MARKOV: markov, CADENCE: cadence, RANDOM: random };
@@ -4379,12 +4354,8 @@ function settleSpin(history: Step[], outcome: SpinValue, baseUnit: number, start
   // upward movement over the last ENGINE_RECOVERY_LOOKBACK hands, even if
   // it's still below its own peak — see getEngineHaltState.
   // Per request July 28: only allowed to trigger while Scout is on — it
-  // never activates in manual (non-Scout) mode. Also requires an armed
-  // engine (same gate as Scout's own activation above) — if Scout is on but
-  // idle with no Play Mode engine selected, there's nothing being bet, so
-  // the halt has nothing to pause.
-  const scoutArmedAndActive = scoutEnabled && (bbStraightEnabled || bbInvertedEnabled || markovEnabled || cadenceEnabled || randomEnabled);
-  const haltState = scoutArmedAndActive ? getEngineHaltState(history) : { haltActive: false, allDeclining: false, anyRecovering: false };
+  // never activates in manual (non-Scout) mode.
+  const haltState = scoutEnabled ? getEngineHaltState(history) : { haltActive: false, allDeclining: false, anyRecovering: false };
   const sessionEnded = haltState.haltActive;
 
   const active =
@@ -5545,7 +5516,8 @@ export default function Page() {
     setMarkovEnabled(false);
     setCadenceEnabled(false);
     setRandomEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, nextStraight, nextInverted, false, exposureCapPercent, false, scoutEnabled, false);
+    setScoutEnabled(false);
+    replayBaccaratChartForMode(pulseEnabled, nextStraight, nextInverted, false, exposureCapPercent, false, false, false);
   };
 
   const applyMarkovMode = () => {
@@ -5554,7 +5526,8 @@ export default function Page() {
     setMarkovEnabled(true);
     setCadenceEnabled(false);
     setRandomEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, false, false, true, exposureCapPercent, false, scoutEnabled, false);
+    setScoutEnabled(false);
+    replayBaccaratChartForMode(pulseEnabled, false, false, true, exposureCapPercent, false, false, false);
   };
   const applyCadenceMode = () => {
     setBbStraightEnabled(false);
@@ -5562,7 +5535,8 @@ export default function Page() {
     setMarkovEnabled(false);
     setCadenceEnabled(true);
     setRandomEnabled(false);
-    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, true, scoutEnabled, false);
+    setScoutEnabled(false);
+    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, true, false, false);
   };
   const applyRandomMode = () => {
     setBbStraightEnabled(false);
@@ -5570,7 +5544,8 @@ export default function Page() {
     setMarkovEnabled(false);
     setCadenceEnabled(false);
     setRandomEnabled(true);
-    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, false, scoutEnabled, true);
+    setScoutEnabled(false);
+    replayBaccaratChartForMode(pulseEnabled, false, false, false, exposureCapPercent, false, false, true);
   };
 
   // SCOUT — read-only pick, used only to display an indicator (added below).
@@ -6064,9 +6039,7 @@ export default function Page() {
       <button onClick={() => setScoutEnabled((v) => !v)} style={{ width: "100%", height: 34, borderRadius: 10, border: `1px solid ${scoutEnabled ? COLORS.amber : COLORS.red}`, background: scoutEnabled ? "rgba(245,158,11,0.16)" : "rgba(239,68,68,0.10)", color: scoutEnabled ? COLORS.amber : COLORS.red, fontWeight: 950, cursor: "pointer", marginBottom: scoutEnabled ? 4 : 8 }}>{scoutEnabled ? "SCOUT ON" : "SCOUT OFF"}</button>
       {scoutEnabled && (
         <div style={{ textAlign: "center", fontSize: 10, fontWeight: 900, color: COLORS.amber, letterSpacing: 0.4, marginBottom: 8 }}>
-          {bbStraightEnabled || bbInvertedEnabled || markovEnabled || cadenceEnabled || randomEnabled
-            ? `→ ${{ BB_STRAIGHT: "STRAIGHT", BB_INVERTED: "INVERTED", MARKOV: "MARKOV", CADENCE: "CADENCE", RANDOM: "RANDOM" }[scoutPick ?? "BB_STRAIGHT"]}`
-            : "ARMED · select an engine below"}
+          → {{ BB_STRAIGHT: "STRAIGHT", BB_INVERTED: "INVERTED", MARKOV: "MARKOV", CADENCE: "CADENCE", RANDOM: "RANDOM" }[scoutPick ?? "BB_STRAIGHT"]}
         </div>
       )}
       {displayHistory.at(-1)?.sessionEnded && (
